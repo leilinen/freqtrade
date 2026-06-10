@@ -1,0 +1,50 @@
+services:
+  price-action-1h:
+    image: freqtrade-pa:latest
+    container_name: price-action-1h
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+    volumes:
+      - ./user_data:/freqtrade/user_data
+    command: >
+      trade
+      --config /freqtrade/user_data/price_action_config_1h.json
+      --strategy PriceActionMonitor
+    networks:
+      - panwatch_default
+
+  price-action-4h:
+    image: freqtrade-pa:latest
+    container_name: price-action-4h
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+    volumes:
+      - ./user_data:/freqtrade/user_data
+    command: >
+      trade
+      --config /freqtrade/user_data/price_action_config_4h.json
+      --strategy PriceActionMonitor
+    networks:
+      - panwatch_default
+
+  tg-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.tg
+    image: freqtrade-tg-bot:latest
+    container_name: freqtrade-tg-bot
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      TG_TOKEN: "8441181173:AAFK_tBevMSYZjxrTHYVsCRBur-C5KsyYgI"
+      TG_CHAT_ID: "7724425342"
+      DB_URL: "postgresql://postgres:postgres@postgres:5432/freqtrade_monitor"
+      API_PORT: "8090"
+    networks:
+      - panwatch_default
+
+networks:
+  panwatch_default:
+    external: true

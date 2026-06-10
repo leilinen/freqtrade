@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir \
+    python-telegram-bot \
+    sqlalchemy \
+    psycopg2-binary \
+    aiohttp
+
+WORKDIR /app
+COPY tg_bot.py .
+
+CMD ["python", "tg_bot.py"]
