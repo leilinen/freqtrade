@@ -648,6 +648,7 @@
             "type": "string",
             "enum": [
               "StaticPairList",
+              "DatabasePairList",
               "VolumePairList",
               "PercentChangePairList",
               "ProducerPairList",
