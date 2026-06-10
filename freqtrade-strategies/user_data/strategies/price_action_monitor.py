@@ -25,7 +25,7 @@ import pandas as pd
 from pandas import DataFrame
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Float, Boolean, DateTime,
-    UniqueConstraint, create_engine, func,
+    UniqueConstraint, create_engine, func, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session, sessionmaker
 
@@ -104,6 +104,28 @@ class PaSignal(_Base):
             "symbol", "timeframe", "candle_time", "signal_type", "direction",
             name="ux_pa_signal_identity",
         ),
+    )
+
+
+class PaKline(_Base):
+    """盯盘 K 线原始 OHLCV 记录表"""
+    __tablename__ = "pa_kline"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    symbol: Mapped[str] = mapped_column(String, nullable=False)
+    timeframe: Mapped[str] = mapped_column(String, nullable=False)
+    candle_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low: Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float] = mapped_column(Float)
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "timeframe", "candle_time", name="ux_pa_kline_identity"),
     )
 
 
@@ -241,6 +263,7 @@ class PriceActionMonitor(IStrategy):
             else:
                 logger.debug("Scan %s %s: no signal", pair, self.timeframe)
             self._check_and_notify(pair, last)
+            self._persist_kline(pair, dataframe)
 
         return dataframe
 
@@ -559,6 +582,60 @@ class PriceActionMonitor(IStrategy):
         except Exception:
             # 唯一约束冲突 = 已写入，忽略
             logger.debug("Signal already exists or write failed for %s", pair)
+
+    def _persist_kline(self, pair: str, dataframe: DataFrame) -> None:
+        """持久化最新已收盘 K 线到 PostgreSQL（UPSERT）。"""
+        if not self._pg_session_factory or len(dataframe) == 0:
+            return
+
+        # 当前 timeframe 周期的开盘时间（UTC，floor 到频率）
+        # date < 周期开盘 的 K 线视为已收盘
+        now_utc = pd.Timestamp.now(tz="UTC")
+        period_start = now_utc.floor(self.timeframe)
+
+        closed = dataframe[dataframe["date"] < period_start]
+        if len(closed) == 0:
+            return
+
+        last = closed.iloc[-1]  # 最新一根已收盘 K 线
+        candle_time = last["date"]
+        ct = (
+            candle_time.to_pydatetime()
+            if hasattr(candle_time, "to_pydatetime")
+            else candle_time
+        )
+
+        try:
+            with self._pg_session_factory() as session:
+                session.execute(
+                    text("""
+                        INSERT INTO pa_kline
+                            (symbol, timeframe, candle_time,
+                             open, high, low, close, volume)
+                        VALUES
+                            (:symbol, :timeframe, :candle_time,
+                             :open, :high, :low, :close, :volume)
+                        ON CONFLICT (symbol, timeframe, candle_time) DO UPDATE SET
+                            open = EXCLUDED.open,
+                            high = EXCLUDED.high,
+                            low = EXCLUDED.low,
+                            close = EXCLUDED.close,
+                            volume = EXCLUDED.volume
+                    """),
+                    {
+                        "symbol": pair,
+                        "timeframe": self.timeframe,
+                        "candle_time": ct,
+                        "open": float(last["open"]),
+                        "high": float(last["high"]),
+                        "low": float(last["low"]),
+                        "close": float(last["close"]),
+                        "volume": float(last["volume"]),
+                    },
+                )
+                session.commit()
+        except Exception:
+            logger.debug("K-line write failed for %s", pair)
 
     # ================================================================
     # TG Bot 通知 (HTTP POST)
