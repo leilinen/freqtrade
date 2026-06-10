@@ -109,18 +109,43 @@ def db_get_signals(limit: int = 10) -> list[dict]:
 # ================================================================
 
 async def handle_signal(request: web.Request) -> web.Response:
-    """HTTP POST /signal — 接收 freqtrade 推送的信号并转发到 TG。"""
+    """HTTP POST /signal — 接收 freqtrade 推送的信号 + K线图表并转发到 TG。"""
+    chart_bytes = None
+    payload_str = None
+
+    # 支持 multipart/form-data（带图表）和 JSON（纯文字，向后兼容）
+    content_type = request.content_type
+    if content_type and "multipart" in content_type:
+        reader = await request.multipart()
+        async for part in reader:
+            if part.name == "payload":
+                payload_str = await part.text()
+            elif part.name == "chart":
+                chart_bytes = await part.read()
+    else:
+        try:
+            payload_str = await request.text()
+        except Exception:
+            return web.json_response({"error": "invalid request"}, status=400)
+
     try:
-        data = await request.json()
+        data = json.loads(payload_str) if payload_str else {}
     except Exception:
         return web.json_response({"error": "invalid json"}, status=400)
 
     msg = format_signal_message(data)
     try:
-        await request.app["tg_bot"].bot.send_message(
-            chat_id=TG_CHAT_ID,
-            text=msg,
-        )
+        if chart_bytes:
+            await request.app["tg_bot"].bot.send_photo(
+                chat_id=TG_CHAT_ID,
+                photo=chart_bytes,
+                caption=msg,
+            )
+        else:
+            await request.app["tg_bot"].bot.send_message(
+                chat_id=TG_CHAT_ID,
+                text=msg,
+            )
         logger.info("Signal pushed to TG: %s %s %s", data.get("symbol"), data.get("direction"), data.get("quality"))
     except Exception:
         logger.exception("Failed to push signal to TG")
@@ -396,23 +421,23 @@ async def main() -> None:
     try:
         while True:
             await asyncio.sleep(1)
-            # Health check every 30 minutes
+            # Health check: 每小时 05 分检查上一根 K 线是否已落入 pa_kline
             now = datetime.now(timezone.utc)
-            if now.minute == 0 and now.second < 2 and (
+            if now.minute == 5 and now.second < 2 and (
                 last_health_alert is None or (now - last_health_alert).total_seconds() > 1800
             ):
                 has_alert = False
                 with db_engine.connect() as conn:
                     rows = conn.execute(text(
                         "SELECT timeframe, MAX(candle_time) as last_candle "
-                        "FROM pa_signal GROUP BY timeframe"
+                        "FROM pa_kline GROUP BY timeframe"
                     )).fetchall()
                 for r in rows:
                     tf, last_candle = r[0], r[1]
                     if last_candle.tzinfo is None:
                         last_candle = last_candle.replace(tzinfo=timezone.utc)
                     age_hours = (now - last_candle).total_seconds() / 3600
-                    threshold = 3 if tf == "1h" else (12 if tf == "4h" else 24)
+                    threshold = 2 if tf == "1h" else (5 if tf == "4h" else 24)
                     if age_hours > threshold:
                         has_alert = True
                         break

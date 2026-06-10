@@ -4,6 +4,7 @@ Unit tests for PriceActionMonitor._persist_kline and PaKline model.
 Run from repo root with the project venv:
   .venv/bin/pytest freqtrade-strategies/tests/test_price_action_monitor.py -v
 """
+import json
 import logging
 import sys
 from datetime import datetime, timezone
@@ -62,6 +63,7 @@ def _make_ohlcv_df(rows, timeframe="1h", last_date=None):
             "low": close_vals - 1.0,
             "close": close_vals,
             "volume": 1000.0 * rng.random(rows),
+            "ema20": close_vals,  # simplisitic: ema20 ≈ close
         }
     )
 
@@ -285,3 +287,158 @@ class TestPopulateEntryTrendKline:
             result = s.populate_entry_trend(df, {"pair": "BTC/USDT"})
 
         assert result is df
+
+
+# ===================================================================
+# Tests: _generate_chart
+# ===================================================================
+
+
+class TestGenerateChart:
+    """Unit tests for PriceActionMonitor._generate_chart."""
+
+    def test_returns_png_bytes(self):
+        """Should return non-empty PNG bytes."""
+        s = _make_strategy()
+        df = _make_ohlcv_df(25)
+
+        result = s._generate_chart("BTC/USDT", df)
+
+        assert isinstance(result, bytes)
+        assert len(result) > 0
+        # PNG magic bytes
+        assert result[:4] == b"\x89PNG"
+
+    def test_handles_fewer_than_20_rows(self):
+        """Should work with fewer than 20 candles (uses all available)."""
+        s = _make_strategy()
+        df = _make_ohlcv_df(5)
+
+        result = s._generate_chart("ETH/USDT", df)
+
+        assert isinstance(result, bytes)
+        assert result[:4] == b"\x89PNG"
+
+    def test_uses_last_20_candles(self):
+        """Should use only the last 20 candles from a larger dataframe."""
+        s = _make_strategy()
+        df = _make_ohlcv_df(50)
+
+        # Just verify it doesn't crash and returns valid PNG
+        result = s._generate_chart("BTC/USDT", df)
+        assert result[:4] == b"\x89PNG"
+
+
+# ===================================================================
+# Tests: _notify_tg_bot with chart
+# ===================================================================
+
+
+class TestNotifyTgBotChart:
+    """Tests for _notify_tg_bot multipart POST with chart."""
+
+    def _make_signal_row(self):
+        """Create a mock signal row (pd.Series)."""
+        return pd.Series({
+            "signal_direction": "long",
+            "signal_quality": "good",
+            "body_pct": 0.8,
+            "close_location": 0.9,
+            "body_ratio": 1.5,
+            "above_ema20": True,
+            "ema_gap": 0.5,
+            "bull_strength_5": 0.7,
+            "close": 42000.0,
+            "low": 41800.0,
+            "high": 42100.0,
+            "is_inside": False,
+            "is_engulfing": False,
+            "is_surprise": False,
+            "is_2k_reversal": False,
+            "is_doji": False,
+        })
+
+    @patch("price_action_monitor.http_requests.post")
+    @patch.object(PriceActionMonitor, "_generate_chart", return_value=b"\x89PNG_fake")
+    def test_posts_multipart_with_chart(self, mock_chart, mock_post):
+        """Should POST multipart with chart file and payload JSON."""
+        s = _make_strategy()
+        s.config = {"tg_api_url": "http://tg-bot:8090"}
+        df = _make_ohlcv_df(25)
+        row = self._make_signal_row()
+
+        s._notify_tg_bot("BTC/USDT", row, df)
+
+        # Verify chart was generated
+        mock_chart.assert_called_once_with("BTC/USDT", df)
+
+        # Verify POST was called with multipart
+        mock_post.assert_called_once()
+        call_kwargs = mock_post.call_args
+        assert call_kwargs[0][0] == "http://tg-bot:8090/signal"
+        assert "files" in call_kwargs[1]
+        assert "chart" in call_kwargs[1]["files"]
+        assert "data" in call_kwargs[1]
+
+        # Verify payload contains expected fields
+        payload_json = call_kwargs[1]["data"]["payload"]
+        payload = json.loads(payload_json)
+        assert payload["symbol"] == "BTC/USDT"
+        assert payload["direction"] == "long"
+        assert payload["quality"] == "good"
+        assert payload["entry_price"] == 42000.0
+        assert payload["stop_loss"] == 41800.0
+
+    @patch("price_action_monitor.http_requests.post", side_effect=Exception("timeout"))
+    @patch.object(PriceActionMonitor, "_generate_chart", return_value=b"\x89PNG_fake")
+    def test_handles_http_error_gracefully(self, mock_chart, mock_post):
+        """HTTP errors should be caught, not propagated."""
+        s = _make_strategy()
+        s.config = {"tg_api_url": "http://tg-bot:8090"}
+        df = _make_ohlcv_df(25)
+        row = self._make_signal_row()
+
+        # Must not raise
+        s._notify_tg_bot("BTC/USDT", row, df)
+
+    @patch("price_action_monitor.http_requests.post")
+    @patch.object(PriceActionMonitor, "_generate_chart", return_value=b"\x89PNG_fake")
+    def test_posts_to_default_url_when_no_config(self, mock_chart, mock_post):
+        """Should POST to default URL when tg_api_url is not in config."""
+        s = _make_strategy()
+        s.config = {}  # no tg_api_url
+        df = _make_ohlcv_df(25)
+        row = self._make_signal_row()
+
+        s._notify_tg_bot("BTC/USDT", row, df)
+
+        mock_post.assert_called_once()
+        assert mock_post.call_args[0][0] == "http://tg-bot:8090/signal"
+
+
+# ===================================================================
+# Tests: _check_and_notify passes dataframe
+# ===================================================================
+
+
+class TestCheckAndNotifyDataframe:
+    """Verify _check_and_notify passes dataframe through to _notify_tg_bot."""
+
+    @patch.object(PriceActionMonitor, "_notify_tg_bot")
+    @patch.object(PriceActionMonitor, "_save_signal")
+    def test_passes_dataframe_to_notify(self, mock_save, mock_notify):
+        """_check_and_notify should pass dataframe to _notify_tg_bot."""
+        s = _make_strategy()
+        df = _make_ohlcv_df(25)
+        # Make the last row a "good long" signal that passes EMA filter
+        last = df.iloc[-1].copy()
+        last["signal_quality"] = "good"
+        last["signal_direction"] = "long"
+        last["above_ema20"] = True
+        last["bull_strength_5"] = 0.8
+
+        s._check_and_notify("BTC/USDT", last, df)
+
+        mock_notify.assert_called_once()
+        # Third argument should be the dataframe
+        assert mock_notify.call_args[0][2] is df

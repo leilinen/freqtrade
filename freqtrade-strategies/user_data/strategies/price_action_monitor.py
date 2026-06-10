@@ -15,6 +15,7 @@
 
 import json
 import logging
+import io
 import atexit
 from datetime import datetime, timezone
 
@@ -262,7 +263,7 @@ class PriceActionMonitor(IStrategy):
                 logger.info("Scan %s %s: %s %s", pair, self.timeframe, direction, quality)
             else:
                 logger.debug("Scan %s %s: no signal", pair, self.timeframe)
-            self._check_and_notify(pair, last)
+            self._check_and_notify(pair, last, dataframe)
             self._persist_kline(pair, dataframe)
 
         return dataframe
@@ -471,7 +472,7 @@ class PriceActionMonitor(IStrategy):
         else:
             return (not above_ema) and bull_strength <= self.BULL_STRENGTH_SHORT_MAX
 
-    def _check_and_notify(self, pair: str, last: pd.Series) -> None:
+    def _check_and_notify(self, pair: str, last: pd.Series, dataframe: DataFrame) -> None:
         """检查最新K线，写入 PG 并 POST 通知到 tg-bot。EMA20 背景过滤。"""
         quality = last.get("signal_quality", "none")
         direction = last.get("signal_direction", "none")
@@ -499,7 +500,7 @@ class PriceActionMonitor(IStrategy):
         if should_notify:
             msg = self._format_signal_message(pair, last)
             self._save_signal(pair, last, msg)
-            self._notify_tg_bot(pair, last)
+            self._notify_tg_bot(pair, last, dataframe)
 
     def _get_bar_types(self, row: pd.Series) -> list[str]:
         """收集当前K线的特殊类型标签。"""
@@ -638,11 +639,45 @@ class PriceActionMonitor(IStrategy):
             logger.debug("K-line write failed for %s", pair)
 
     # ================================================================
+    # K 线图表生成
+    # ================================================================
+
+    def _generate_chart(self, pair: str, dataframe: DataFrame) -> bytes:
+        """生成最近 20 根 K 线蜡烛图 + EMA20，返回 PNG bytes。"""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import mplfinance as mpf
+
+        df = dataframe.tail(20).copy()
+        df = df.set_index("date")
+        df.index = pd.DatetimeIndex(df.index)
+
+        apds = [mpf.make_addplot(df["ema20"], color="orange", width=1.5)]
+
+        fig, _ = mpf.plot(
+            df,
+            type="candle",
+            style="charles",
+            volume=False,
+            addplot=apds,
+            returnfig=True,
+            figratio=(16, 9),
+            figscale=1.2,
+            title=f"\n{pair} {self.timeframe}",
+        )
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        return buf.getvalue()
+
+    # ================================================================
     # TG Bot 通知 (HTTP POST)
     # ================================================================
 
-    def _notify_tg_bot(self, pair: str, row: pd.Series) -> None:
-        """POST 信号数据到独立 tg-bot 的 HTTP API。"""
+    def _notify_tg_bot(self, pair: str, row: pd.Series, dataframe: DataFrame) -> None:
+        """POST 信号数据 + K线图表到独立 tg-bot 的 HTTP API。"""
         tg_api = self.config.get("tg_api_url", "http://tg-bot:8090")
         direction = row.get("signal_direction", "none")
         quality = row.get("signal_quality", "none")
@@ -672,8 +707,16 @@ class PriceActionMonitor(IStrategy):
             risk = payload["stop_loss"] - payload["entry_price"]
             payload["target_price"] = payload["entry_price"] - 2 * risk if risk > 0 else payload["entry_price"]
 
+        # 生成蜡烛图
+        chart_png = self._generate_chart(pair, dataframe)
+
         try:
-            http_requests.post(f"{tg_api}/signal", json=payload, timeout=5)
+            http_requests.post(
+                f"{tg_api}/signal",
+                files={"chart": ("chart.png", chart_png, "image/png")},
+                data={"payload": json.dumps(payload)},
+                timeout=10,
+            )
             logger.info("Signal notified to tg-bot: %s %s %s", pair, direction, quality)
         except Exception:
             logger.debug("Failed to notify tg-bot for %s", pair)
