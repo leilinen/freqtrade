@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import asyncio
+from datetime import datetime, timezone, timedelta
 
 from aiohttp import web
 from sqlalchemy import create_engine, text
@@ -246,10 +247,16 @@ async def pa_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not signals:
         await update.message.reply_text("暂无信号记录")
         return
+    tz_shanghai = timezone(timedelta(hours=8))
     lines = [f"最近 {len(signals)} 条信号:"]
     for s in signals:
         ct = s["candle_time"]
-        time_str = ct.strftime("%m/%d %H:%M") if ct else "?"
+        if ct:
+            if ct.tzinfo is None:
+                ct = ct.replace(tzinfo=timezone.utc)
+            time_str = ct.astimezone(tz_shanghai).strftime("%m/%d %H:%M")
+        else:
+            time_str = "?"
         dir_cn = "多" if s["direction"] == "long" else "空"
         lines.append(
             f"{time_str} {s['symbol']} {s['timeframe']} "
@@ -268,8 +275,63 @@ async def pa_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/pa_add <标的> — 添加标的 (例: /pa_add DOGE/USDT)\n"
         "/pa_remove <标的> — 禁用标的\n"
         "/pa_signals [N] — 最近信号 (默认10条)\n"
+        "/pa_status — 服务健康状态\n"
         "/pa_help — 帮助信息"
     )
+
+
+async def pa_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """检查服务健康状态：各 timeframe 最后信号时间，超时告警。"""
+    if not authorized(update):
+        return
+    now = datetime.now(timezone.utc)
+    lines = ["服务状态:"]
+    has_alert = False
+
+    with db_engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT timeframe, MAX(candle_time) as last_candle "
+            "FROM pa_signal GROUP BY timeframe ORDER BY timeframe"
+        )).fetchall()
+
+    tz_shanghai = timezone(timedelta(hours=8))
+    for r in rows:
+        tf = r[0]
+        last_candle = r[1]
+        if last_candle.tzinfo is None:
+            last_candle = last_candle.replace(tzinfo=timezone.utc)
+        age_hours = (now - last_candle).total_seconds() / 3600
+        local_str = last_candle.astimezone(tz_shanghai).strftime("%m/%d %H:%M")
+
+        # 根据 timeframe 判断是否异常
+        if tf == "1h":
+            threshold = 3
+        elif tf == "4h":
+            threshold = 12
+        else:
+            threshold = 24
+
+        if age_hours > threshold:
+            status = f"⚠ 超过 {age_hours:.0f}h 无信号"
+            has_alert = True
+        else:
+            status = "正常"
+        lines.append(f"  {tf}: 最后信号 {local_str} ({status})")
+
+    # 检查信号总数
+    with db_engine.connect() as conn:
+        total = conn.execute(text("SELECT COUNT(*) FROM pa_signal")).scalar()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    with db_engine.connect() as conn:
+        today_count = conn.execute(text(
+            "SELECT COUNT(*) FROM pa_signal WHERE created_at >= :ts"
+        ), {"ts": today_start}).scalar()
+    lines.append(f"\n今日信号: {today_count} | 总计: {total}")
+
+    if has_alert:
+        lines.append("\n建议检查 freqtrade 容器是否正常运行")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 # ================================================================
@@ -283,6 +345,7 @@ async def main() -> None:
     app_tg.add_handler(CommandHandler("pa_add", pa_add))
     app_tg.add_handler(CommandHandler("pa_remove", pa_remove))
     app_tg.add_handler(CommandHandler("pa_signals", pa_signals))
+    app_tg.add_handler(CommandHandler("pa_status", pa_status))
     app_tg.add_handler(CommandHandler("pa_help", pa_help))
 
     # HTTP API
@@ -303,7 +366,17 @@ async def main() -> None:
             await app_tg.initialize()
             await app_tg.start()
             await app_tg.updater.start_polling(drop_pending_updates=True)
-            logger.info("TG bot polling started successfully")
+            # 注册 Bot Commands 菜单
+            from telegram import BotCommand
+            await app_tg.bot.set_my_commands([
+                BotCommand("pa_watch", "查看监控标的"),
+                BotCommand("pa_add", "添加标的"),
+                BotCommand("pa_remove", "禁用标的"),
+                BotCommand("pa_signals", "最近信号"),
+                BotCommand("pa_status", "服务健康状态"),
+                BotCommand("pa_help", "帮助信息"),
+            ])
+            logger.info("TG bot polling started, commands registered")
             break
         except Exception as e:
             wait = min(30, 5 * (attempt + 1))
@@ -318,10 +391,42 @@ async def main() -> None:
     else:
         logger.error("Failed to start TG polling after 10 attempts, running HTTP API only")
 
-    # Keep running
+    # Keep running + health monitor
+    last_health_alert = None
     try:
         while True:
             await asyncio.sleep(1)
+            # Health check every 30 minutes
+            now = datetime.now(timezone.utc)
+            if now.minute == 0 and now.second < 2 and (
+                last_health_alert is None or (now - last_health_alert).total_seconds() > 1800
+            ):
+                has_alert = False
+                with db_engine.connect() as conn:
+                    rows = conn.execute(text(
+                        "SELECT timeframe, MAX(candle_time) as last_candle "
+                        "FROM pa_signal GROUP BY timeframe"
+                    )).fetchall()
+                for r in rows:
+                    tf, last_candle = r[0], r[1]
+                    if last_candle.tzinfo is None:
+                        last_candle = last_candle.replace(tzinfo=timezone.utc)
+                    age_hours = (now - last_candle).total_seconds() / 3600
+                    threshold = 3 if tf == "1h" else (12 if tf == "4h" else 24)
+                    if age_hours > threshold:
+                        has_alert = True
+                        break
+                if has_alert:
+                    last_health_alert = now
+                    tz_shanghai = timezone(timedelta(hours=8))
+                    local_str = now.astimezone(tz_shanghai).strftime("%H:%M")
+                    try:
+                        await app_tg.bot.send_message(
+                            chat_id=TG_CHAT_ID,
+                            text=f"⚠ [{local_str}] 健康检查: 超过阈值时间未收到信号，请检查 freqtrade 容器状态",
+                        )
+                    except Exception:
+                        logger.exception("Failed to send health alert")
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:

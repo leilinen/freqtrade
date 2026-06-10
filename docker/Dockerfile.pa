@@ -20,5 +20,9 @@ COPY . .
 RUN pip install --no-cache-dir -e .
 RUN pip install --no-cache-dir psycopg2-binary
 
+# Patch ccxt keysort to handle None keys from OKX API (ccxt 4.5.56 bug)
+RUN sed -i 's/return dict(sorted(dictionary.items()))/return dict(sorted((k, v) for k, v in dictionary.items() if k is not None))/' \
+    /usr/local/lib/python3.12/site-packages/ccxt/base/exchange.py
+
 ENTRYPOINT ["freqtrade"]
 CMD ["trade"]

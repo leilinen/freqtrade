@@ -6,11 +6,17 @@ services:
     environment:
       TZ: "Asia/Shanghai"
     volumes:
-      - ./user_data:/freqtrade/user_data
+      - /Users/lilin/Documents/code/ai/code/PriceDog/freqtrade/freqtrade-strategies/user_data:/freqtrade/user_data
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_1h.json
       --strategy PriceActionMonitor
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os; [exit(0) for p in os.listdir('/proc') if p.isdigit() and 'freqtrade' in open(f'/proc/{p}/cmdline').read()] or exit(1)\""]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     networks:
       - panwatch_default
 
@@ -21,11 +27,17 @@ services:
     environment:
       TZ: "Asia/Shanghai"
     volumes:
-      - ./user_data:/freqtrade/user_data
+      - /Users/lilin/Documents/code/ai/code/PriceDog/freqtrade/freqtrade-strategies/user_data:/freqtrade/user_data
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_4h.json
       --strategy PriceActionMonitor
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os; [exit(0) for p in os.listdir('/proc') if p.isdigit() and 'freqtrade' in open(f'/proc/{p}/cmdline').read()] or exit(1)\""]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     networks:
       - panwatch_default
 
