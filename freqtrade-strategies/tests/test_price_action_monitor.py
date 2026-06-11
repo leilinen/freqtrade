@@ -44,15 +44,20 @@ from price_action_monitor import (  # noqa: E402
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_ohlcv_df(rows, timeframe="1h", last_date=None):
+def _make_ohlcv_df(rows, timeframe="1h", last_date=None, tz_naive=False):
     """Build a minimal OHLCV DataFrame.
 
     `rows` is the number of candles.  Dates are hourly going back from
     `last_date` (defaults to 2025-01-15 10:00 UTC).
+
+    When `tz_naive=True`, dates are tz-naive (like freqtrade/Binance returns).
+    When `tz_naive=False`, dates are tz-aware with UTC (like A-share sources).
     """
     if last_date is None:
         last_date = pd.Timestamp("2025-01-15 10:00", tz="UTC")
     dates = pd.date_range(end=last_date, periods=rows, freq=timeframe)
+    if tz_naive:
+        dates = dates.tz_localize(None)
     rng = np.random.default_rng(42)
     close_vals = 100 + rng.random(rows).cumsum()
     return pd.DataFrame(
@@ -147,13 +152,13 @@ class TestPersistKline:
         """Should UPSERT the last closed candle (date < current period start)."""
         s = _make_strategy(timeframe="1h")
 
-        # 5 hourly candles ending at 10:00 UTC.
-        # Pretend "now" is 10:30 UTC → period_start = 10:00.
+        # 5 hourly candles ending at 10:00 — tz-naive (like Binance/freqtrade).
+        # Pretend "now" is 10:30 → period_start = 10:00.
         # Candles at 06:00-09:00 are closed; 10:00 is current (not closed).
-        df = _make_ohlcv_df(5, "1h", pd.Timestamp("2025-01-15 10:00", tz="UTC"))
+        df = _make_ohlcv_df(5, "1h", pd.Timestamp("2025-01-15 10:00"), tz_naive=True)
 
         fake_now = pd.Timestamp("2025-01-15 10:30", tz="UTC")
-        with patch("price_action_monitor.pd.Timestamp.now", return_value=fake_now):
+        with patch("price_action_monitor.pd.Timestamp.utcnow", return_value=fake_now):
             s._persist_kline("BTC/USDT", df)
 
         # session factory was entered once
@@ -172,35 +177,69 @@ class TestPersistKline:
         assert params["symbol"] == "BTC/USDT"
         assert params["timeframe"] == "1h"
         # The latest closed candle should be the one at 09:00 (index 3)
-        assert params["candle_time"] == pd.Timestamp("2025-01-15 09:00", tz="UTC")
+        assert params["candle_time"] == pd.Timestamp("2025-01-15 09:00")
         assert params["close"] == pytest.approx(df.iloc[3]["close"])
+
+    def test_writes_with_tz_naive_dataframe(self):
+        """Should work with tz-naive dataframe dates (like freqtrade/Binance returns).
+
+        This is the core bug fix: pd.Timestamp.utcnow() in pandas 3 returns
+        tz-aware timestamps. Adding .tz_localize(None) makes it tz-naive so
+        comparison with tz-naive dataframe dates doesn't raise TypeError.
+        """
+        s = _make_strategy(timeframe="1h")
+
+        # tz-naive dates — this is what freqtrade returns from Binance
+        df = _make_ohlcv_df(
+            5, "1h",
+            pd.Timestamp("2025-01-15 10:00"),  # tz-naive
+            tz_naive=True,
+        )
+
+        # pd.Timestamp.utcnow() in pandas 3 returns tz-aware like 10:30+00:00
+        # .tz_localize(None) strips tz → tz-naive 10:30
+        # The mock returns a tz-aware timestamp to simulate real behavior
+        fake_now = pd.Timestamp("2025-01-15 10:30", tz="UTC")
+        with patch("price_action_monitor.pd.Timestamp.utcnow", return_value=fake_now):
+            # This would raise TypeError if .tz_localize(None) were missing
+            s._persist_kline("BTC/USDT", df)
+
+        # Verify the write succeeded
+        s._pg_session_factory.assert_called_once()
+        session = s._pg_session_factory.return_value.__enter__.return_value
+        session.execute.assert_called_once()
+        session.commit.assert_called_once()
+
+        params = session.execute.call_args[0][1]
+        assert params["symbol"] == "BTC/USDT"
+        assert params["timeframe"] == "1h"
 
     def test_skips_when_all_candles_are_current(self):
         """If no candle is older than period_start, nothing should be written."""
         s = _make_strategy(timeframe="1h")
 
-        # Candle at 10:00 UTC, "now" is 10:05 → period_start = 10:00
+        # Candle at 10:00, "now" is 10:05 → period_start = 10:00
         # The candle at 10:00 is NOT < 10:00, so nothing is closed.
-        df = _make_ohlcv_df(1, "1h", pd.Timestamp("2025-01-15 10:00", tz="UTC"))
+        df = _make_ohlcv_df(1, "1h", pd.Timestamp("2025-01-15 10:00"), tz_naive=True)
 
         fake_now = pd.Timestamp("2025-01-15 10:05", tz="UTC")
-        with patch("price_action_monitor.pd.Timestamp.now", return_value=fake_now):
+        with patch("price_action_monitor.pd.Timestamp.utcnow", return_value=fake_now):
             s._persist_kline("BTC/USDT", df)
 
         s._pg_session_factory.assert_not_called()
 
     def test_handles_db_exception_gracefully(self, caplog):
         """DB errors should be caught and logged, not propagated."""
-        caplog.set_level(logging.DEBUG)
+        caplog.set_level(logging.WARNING)
         s = _make_strategy(timeframe="1h")
-        df = _make_ohlcv_df(5, "1h", pd.Timestamp("2025-01-15 10:00", tz="UTC"))
+        df = _make_ohlcv_df(5, "1h", pd.Timestamp("2025-01-15 10:00"), tz_naive=True)
 
         # Make session.execute raise
         session = s._pg_session_factory.return_value.__enter__.return_value
         session.execute.side_effect = Exception("connection lost")
 
         fake_now = pd.Timestamp("2025-01-15 10:30", tz="UTC")
-        with patch("price_action_monitor.pd.Timestamp.now", return_value=fake_now):
+        with patch("price_action_monitor.pd.Timestamp.utcnow", return_value=fake_now):
             # Must not raise
             s._persist_kline("BTC/USDT", df)
 
@@ -209,10 +248,10 @@ class TestPersistKline:
     def test_uses_strategy_timeframe(self):
         """The timeframe in the UPSERT params must match self.timeframe."""
         s = _make_strategy(timeframe="4h")
-        df = _make_ohlcv_df(5, "4h", pd.Timestamp("2025-01-15 12:00", tz="UTC"))
+        df = _make_ohlcv_df(5, "4h", pd.Timestamp("2025-01-15 12:00"), tz_naive=True)
 
         fake_now = pd.Timestamp("2025-01-15 13:00", tz="UTC")
-        with patch("price_action_monitor.pd.Timestamp.now", return_value=fake_now):
+        with patch("price_action_monitor.pd.Timestamp.utcnow", return_value=fake_now):
             s._persist_kline("ETH/USDT", df)
 
         session = s._pg_session_factory.return_value.__enter__.return_value

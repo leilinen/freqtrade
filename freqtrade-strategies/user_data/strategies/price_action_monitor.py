@@ -591,7 +591,7 @@ class PriceActionMonitor(IStrategy):
 
         # 当前 timeframe 周期的开盘时间（UTC，floor 到频率）
         # date < 周期开盘 的 K 线视为已收盘
-        now_utc = pd.Timestamp.utcnow()
+        now_utc = pd.Timestamp.utcnow().tz_localize(None)
         period_start = now_utc.floor(self.timeframe)
 
         closed = dataframe[dataframe["date"] < period_start]
