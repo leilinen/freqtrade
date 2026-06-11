@@ -117,7 +117,7 @@ class Ashare(Exchange):
             code, exchange_suffix = _parse_pair(pair)
             self._markets[pair] = {
                 "base": code,
-                "quote": exchange_suffix,
+                "quote": "CNY",
                 "symbol": pair,
                 "active": True,
                 "spot": True,
@@ -262,7 +262,7 @@ def _fetch_tencent_daily(pair: str, count: int = 500, adjust: str = "qfq") -> Da
     if not bars:
         return None
 
-    df = pd.DataFrame(bars, columns=["date", "open", "close", "high", "low", "volume"])
+    df = pd.DataFrame([b[:6] for b in bars], columns=["date", "open", "close", "high", "low", "volume"])
     df = df[["date", "open", "high", "low", "close", "volume"]]
     df["date"] = pd.to_datetime(df["date"], utc=True)
     for col in ["open", "high", "low", "close", "volume"]:
