@@ -9,6 +9,9 @@ from freqtrade.exchange.common import MAP_EXCHANGE_CHILDCLASS, SUPPORTED_EXCHANG
 
 logger = logging.getLogger(__name__)
 
+# Non-ccxt exchanges that are registered as custom plugins
+CUSTOM_EXCHANGES = {"ashare"}
+
 
 def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
     """
@@ -39,7 +42,7 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
             f"{', '.join(available_exchanges())}"
         )
 
-    if not is_exchange_known_ccxt(exchange):
+    if exchange not in CUSTOM_EXCHANGES and not is_exchange_known_ccxt(exchange):
         raise OperationalException(
             f'Exchange "{exchange}" is not known to the ccxt library '
             f"and therefore not available for the bot.\n"
@@ -47,16 +50,21 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
             f"{', '.join(available_exchanges())}"
         )
 
-    valid, reason, _, _ = validate_exchange(exchange)
-    if not valid:
-        if check_for_bad:
-            raise OperationalException(
-                f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}.'
-            )
-        else:
-            logger.warning(f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}.')
+    if exchange not in CUSTOM_EXCHANGES:
+        valid, reason, _, _ = validate_exchange(exchange)
+        if not valid:
+            if check_for_bad:
+                raise OperationalException(
+                    f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}.'
+                )
+            else:
+                logger.warning(
+                    f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}.'
+                )
 
-    if MAP_EXCHANGE_CHILDCLASS.get(exchange, exchange) in SUPPORTED_EXCHANGES:
+    if exchange in CUSTOM_EXCHANGES:
+        logger.info(f'Exchange "{exchange}" is a custom exchange plugin.')
+    elif MAP_EXCHANGE_CHILDCLASS.get(exchange, exchange) in SUPPORTED_EXCHANGES:
         logger.info(
             f'Exchange "{exchange}" is officially supported by the Freqtrade development team.'
         )

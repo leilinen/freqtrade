@@ -1,0 +1,6 @@
+FROM freqtrade-pa:latest
+
+RUN pip install --no-cache-dir httpx
+
+ENTRYPOINT ["freqtrade"]
+CMD ["trade"]
