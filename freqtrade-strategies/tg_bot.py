@@ -430,7 +430,9 @@ async def main() -> None:
                 with db_engine.connect() as conn:
                     rows = conn.execute(text(
                         "SELECT timeframe, MAX(candle_time) as last_candle "
-                        "FROM pa_kline GROUP BY timeframe"
+                        "FROM pa_kline "
+                        "WHERE symbol NOT LIKE '%/SZ' AND symbol NOT LIKE '%/SH' "
+                        "GROUP BY timeframe"
                     )).fetchall()
                 for r in rows:
                     tf, last_candle = r[0], r[1]
