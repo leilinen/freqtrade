@@ -594,7 +594,12 @@ class PriceActionMonitor(IStrategy):
         now_utc = pd.Timestamp.utcnow().tz_localize(None)
         period_start = now_utc.floor(self.timeframe)
 
-        closed = dataframe[dataframe["date"] < period_start]
+        # Normalize date column to tz-naive for comparison
+        dates = dataframe["date"]
+        if dates.dt.tz is not None:
+            dates = dates.dt.tz_localize(None)
+
+        closed = dataframe[dates < period_start]
         if len(closed) == 0:
             return
 
