@@ -426,7 +426,7 @@ async def main() -> None:
             if now.minute == 5 and now.second < 2 and (
                 last_health_alert is None or (now - last_health_alert).total_seconds() > 1800
             ):
-                has_alert = False
+                alert_items = []
                 with db_engine.connect() as conn:
                     rows = conn.execute(text(
                         "SELECT timeframe, MAX(candle_time) as last_candle "
@@ -439,18 +439,18 @@ async def main() -> None:
                     if last_candle.tzinfo is None:
                         last_candle = last_candle.replace(tzinfo=timezone.utc)
                     age_hours = (now - last_candle).total_seconds() / 3600
-                    threshold = 2 if tf == "1h" else (5 if tf == "4h" else 24)
+                    threshold = 2 if tf == "1h" else (9 if tf == "4h" else 24)
                     if age_hours > threshold:
-                        has_alert = True
-                        break
-                if has_alert:
+                        alert_items.append(f"{tf} K线已 {age_hours:.1f}h 未更新（阈值 {threshold}h）")
+                if alert_items:
                     last_health_alert = now
                     tz_shanghai = timezone(timedelta(hours=8))
                     local_str = now.astimezone(tz_shanghai).strftime("%H:%M")
+                    detail = "\n".join(alert_items)
                     try:
                         await app_tg.bot.send_message(
                             chat_id=TG_CHAT_ID,
-                            text=f"⚠ [{local_str}] 健康检查: 超过阈值时间未收到信号，请检查 freqtrade 容器状态",
+                            text=f"⚠ [{local_str}] 健康检查:\n{detail}\n请检查 freqtrade 容器状态",
                         )
                     except Exception:
                         logger.exception("Failed to send health alert")
