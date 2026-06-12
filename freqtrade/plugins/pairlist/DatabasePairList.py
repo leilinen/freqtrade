@@ -69,12 +69,19 @@ class DatabasePairList(IPairList):
         return self._pairlist
 
     def _load_from_db(self) -> list[str]:
-        """Query watch_pair table for enabled symbols."""
+        """Query watch_pair table for enabled symbols, filtered by market."""
+        exchange_name = self._config.get("exchange", {}).get("name", "")
+        market = "ashare" if exchange_name == "ashare" else "crypto"
+
         try:
             engine = create_engine(self._db_url)
             with engine.connect() as conn:
                 result = conn.execute(
-                    text("SELECT symbol FROM watch_pair WHERE enabled = true ORDER BY id")
+                    text(
+                        "SELECT symbol FROM watch_pair "
+                        "WHERE enabled = true AND market = :market ORDER BY id"
+                    ),
+                    {"market": market},
                 )
                 pairs = [row[0] for row in result]
             engine.dispose()
