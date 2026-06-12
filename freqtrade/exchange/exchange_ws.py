@@ -231,6 +231,16 @@ class ExchangeWS:
                 self._klines_scheduled.discard((pair, timeframe, candle_type))
             self._pop_history((pair, timeframe, candle_type))
 
+            # WS 异常退出时自动重连
+            if result == "error" and hasattr(self, "_loop") and not self._loop.is_closed():
+                logger.warning(
+                    "WS connection lost for %s, %s, reconnecting in 30s...",
+                    pair, timeframe,
+                )
+                self._loop.call_later(
+                    30, lambda: self.schedule_ohlcv(pair, timeframe, candle_type)
+                )
+
     async def _continuously_async_watch_ohlcv(
         self, pair: str, timeframe: str, candle_type: CandleType
     ) -> None:
