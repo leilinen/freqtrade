@@ -10,7 +10,7 @@
   "tg_api_url": "http://tg-bot:8090",
   "exchange": {
     "name": "ashare",
-    "pair_whitelist": ["000300/SZ", "159934/SZ", "588290/SH", "160644/SZ", "513650/SH", "513390/SH"]
+    "pair_whitelist": ["510300/SH", "159934/SZ", "588290/SH", "160644/SZ", "513650/SH", "513390/SH"]
   },
   "pairlists": [
     {
