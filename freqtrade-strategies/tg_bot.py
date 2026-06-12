@@ -49,16 +49,20 @@ def db_get_watch_pairs() -> list[dict]:
     return [{"symbol": r[0], "enabled": r[1], "market": r[2]} for r in rows]
 
 
+VALID_MARKETS = {"crypto", "ashare", "usstock"}
+
+
 def _detect_market(symbol: str) -> str:
-    """根据标的符号判断市场类型。"""
+    """根据标的符号自动判断市场类型。"""
     if symbol.endswith("/SH") or symbol.endswith("/SZ"):
         return "ashare"
-    return "crypto"
+    if "/" in symbol:
+        return "crypto"
+    return "usstock"
 
 
-def db_add_pair(symbol: str) -> str:
+def db_add_pair(symbol: str, market: str) -> str:
     symbol = symbol.upper()
-    market = _detect_market(symbol)
     with db_engine.begin() as conn:
         existing = conn.execute(
             text("SELECT enabled FROM watch_pair WHERE symbol = :s"), {"s": symbol}
@@ -144,11 +148,18 @@ async def handle_signal(request: web.Request) -> web.Response:
     msg = format_signal_message(data)
     try:
         if chart_bytes:
-            await request.app["tg_bot"].bot.send_photo(
-                chat_id=TG_CHAT_ID,
-                photo=chart_bytes,
-                caption=msg,
-            )
+            try:
+                await request.app["tg_bot"].bot.send_photo(
+                    chat_id=TG_CHAT_ID,
+                    photo=chart_bytes,
+                    caption=msg,
+                )
+            except Exception:
+                logger.warning("send_photo failed, falling back to text for %s", data.get("symbol"))
+                await request.app["tg_bot"].bot.send_message(
+                    chat_id=TG_CHAT_ID,
+                    text=msg,
+                )
         else:
             await request.app["tg_bot"].bot.send_message(
                 chat_id=TG_CHAT_ID,
@@ -249,10 +260,23 @@ async def pa_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
     if not context.args:
-        await update.message.reply_text("用法: /pa_add BTC/USDT")
+        await update.message.reply_text(
+            "用法: /pa_add <标的> [市场]\n"
+            "市场: crypto(默认) / ashare / usstock\n"
+            "例: /pa_add BTC/USDT\n"
+            "    /pa_add 510300/SH\n"
+            "    /pa_add AAPL"
+        )
         return
     symbol = context.args[0].upper()
-    msg = db_add_pair(symbol)
+    if len(context.args) > 1:
+        market = context.args[1].lower()
+        if market not in VALID_MARKETS:
+            await update.message.reply_text(f"无效市场: {market}\n可选: {', '.join(sorted(VALID_MARKETS))}")
+            return
+    else:
+        market = _detect_market(symbol)
+    msg = db_add_pair(symbol, market)
     await update.message.reply_text(msg + "\n提示: 等待缓存刷新生效，或发送 /reload_config 立即生效")
 
 
@@ -306,7 +330,9 @@ async def pa_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "价格行为信号盯盘 命令:\n"
         "/pa_watch — 查看监控标的\n"
-        "/pa_add <标的> — 添加标的 (例: /pa_add DOGE/USDT 或 /pa_add 510300/SH)\n"
+        "/pa_add <标的> [市场] — 添加标的\n"
+        "  自动识别: BTC/USDT→crypto, 510300/SH→ashare, AAPL→usstock\n"
+        "  手动指定: /pa_add AAPL usstock\n"
         "/pa_remove <标的> — 禁用标的\n"
         "/pa_signals [N] — 最近信号 (默认10条)\n"
         "/pa_status — 服务健康状态\n"
