@@ -719,19 +719,30 @@ class PriceActionMonitor(IStrategy):
             risk = payload["stop_loss"] - payload["entry_price"]
             payload["target_price"] = payload["entry_price"] - 2 * risk if risk > 0 else payload["entry_price"]
 
-        # 生成蜡烛图
-        chart_png = self._generate_chart(pair, dataframe)
+        # 生成蜡烛图（失败不阻断通知）
+        chart_png = None
+        try:
+            chart_png = self._generate_chart(pair, dataframe)
+        except Exception:
+            logger.warning("Failed to generate chart for %s", pair, exc_info=True)
 
         try:
-            http_requests.post(
-                f"{tg_api}/signal",
-                files={"chart": ("chart.png", chart_png, "image/png")},
-                data={"payload": json.dumps(payload)},
-                timeout=10,
-            )
+            if chart_png:
+                http_requests.post(
+                    f"{tg_api}/signal",
+                    files={"chart": ("chart.png", chart_png, "image/png")},
+                    data={"payload": json.dumps(payload)},
+                    timeout=10,
+                )
+            else:
+                http_requests.post(
+                    f"{tg_api}/signal",
+                    data={"payload": json.dumps(payload)},
+                    timeout=10,
+                )
             logger.info("Signal notified to tg-bot: %s %s %s", pair, direction, quality)
         except Exception:
-            logger.debug("Failed to notify tg-bot for %s", pair)
+            logger.warning("Failed to notify tg-bot for %s", pair, exc_info=True)
 
     # ================================================================
     # 消息格式化
