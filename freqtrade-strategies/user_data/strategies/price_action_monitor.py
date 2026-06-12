@@ -226,14 +226,21 @@ class PriceActionMonitor(IStrategy):
             self._pg_engine.dispose()
 
     def _init_default_pairs(self) -> None:
-        """如果 watch_pair 表为空，插入默认标的。"""
+        """将默认标的写入 watch_pair 表（如不存在）。"""
+        exchange_name = self.config.get("exchange", {}).get("name", "")
+        if exchange_name == "ashare":
+            pairs = self.config.get("exchange", {}).get("pair_whitelist", [])
+            market = "ashare"
+        else:
+            pairs = DEFAULT_PAIRS
+            market = "crypto"
+
         with self._pg_session_factory() as session:
-            count = session.query(WatchPair).count()
-            if count == 0:
-                for symbol in DEFAULT_PAIRS:
-                    session.add(WatchPair(symbol=symbol, enabled=True, market="crypto"))
-                session.commit()
-                logger.info("Initialized default watch pairs: %s", DEFAULT_PAIRS)
+            for symbol in pairs:
+                existing = session.query(WatchPair).filter_by(symbol=symbol).first()
+                if not existing:
+                    session.add(WatchPair(symbol=symbol, enabled=True, market=market))
+            session.commit()
 
     # ================================================================
     # 策略接口

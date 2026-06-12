@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time
 
 from aiohttp import web
 from sqlalchemy import create_engine, text
@@ -49,8 +49,16 @@ def db_get_watch_pairs() -> list[dict]:
     return [{"symbol": r[0], "enabled": r[1], "market": r[2]} for r in rows]
 
 
+def _detect_market(symbol: str) -> str:
+    """根据标的符号判断市场类型。"""
+    if symbol.endswith("/SH") or symbol.endswith("/SZ"):
+        return "ashare"
+    return "crypto"
+
+
 def db_add_pair(symbol: str) -> str:
     symbol = symbol.upper()
+    market = _detect_market(symbol)
     with db_engine.begin() as conn:
         existing = conn.execute(
             text("SELECT enabled FROM watch_pair WHERE symbol = :s"), {"s": symbol}
@@ -61,10 +69,10 @@ def db_add_pair(symbol: str) -> str:
             conn.execute(text("UPDATE watch_pair SET enabled = true WHERE symbol = :s"), {"s": symbol})
             return f"{symbol} re-enabled"
         conn.execute(
-            text("INSERT INTO watch_pair (symbol, enabled, market) VALUES (:s, true, 'crypto')"),
-            {"s": symbol},
+            text("INSERT INTO watch_pair (symbol, enabled, market) VALUES (:s, true, :m)"),
+            {"s": symbol, "m": market},
         )
-    return f"{symbol} added"
+    return f"{symbol} added ({market})"
 
 
 def db_remove_pair(symbol: str) -> str:
@@ -232,7 +240,8 @@ async def pa_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["监控标的列表:"]
     for p in pairs:
         status = "开" if p["enabled"] else "关"
-        lines.append(f"  {p['symbol']} [{status}]")
+        market = p.get("market") or "crypto"
+        lines.append(f"  {p['symbol']} [{status}] ({market})")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -297,7 +306,7 @@ async def pa_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "价格行为信号盯盘 命令:\n"
         "/pa_watch — 查看监控标的\n"
-        "/pa_add <标的> — 添加标的 (例: /pa_add DOGE/USDT)\n"
+        "/pa_add <标的> — 添加标的 (例: /pa_add DOGE/USDT 或 /pa_add 510300/SH)\n"
         "/pa_remove <标的> — 禁用标的\n"
         "/pa_signals [N] — 最近信号 (默认10条)\n"
         "/pa_status — 服务健康状态\n"
@@ -313,35 +322,55 @@ async def pa_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["服务状态:"]
     has_alert = False
 
+    # 按 market + timeframe 分组检查
     with db_engine.connect() as conn:
         rows = conn.execute(text(
-            "SELECT timeframe, MAX(candle_time) as last_candle "
-            "FROM pa_signal GROUP BY timeframe ORDER BY timeframe"
+            "SELECT market, timeframe, MAX(candle_time) as last_candle "
+            "FROM pa_signal GROUP BY market, timeframe ORDER BY market, timeframe"
         )).fetchall()
 
     tz_shanghai = timezone(timedelta(hours=8))
     for r in rows:
-        tf = r[0]
-        last_candle = r[1]
+        market, tf = r[0], r[1]
+        last_candle = r[2]
         if last_candle.tzinfo is None:
             last_candle = last_candle.replace(tzinfo=timezone.utc)
         age_hours = (now - last_candle).total_seconds() / 3600
         local_str = last_candle.astimezone(tz_shanghai).strftime("%m/%d %H:%M")
 
-        # 根据 timeframe 判断是否异常
-        if tf == "1h":
-            threshold = 3
-        elif tf == "4h":
-            threshold = 12
+        # A 股非交易时段不算异常
+        if market == "ashare":
+            local_now = now.astimezone(tz_shanghai)
+            weekday = local_now.weekday()
+            t = local_now.time()
+            is_trading = weekday < 5 and (
+                dt_time(9, 30) <= t <= dt_time(11, 30)
+                or dt_time(13, 0) <= t <= dt_time(15, 0)
+            )
+            if not is_trading:
+                threshold = 72  # 非交易时段放宽到 72 小时
+            elif tf == "1h":
+                threshold = 5
+            elif tf == "1d":
+                threshold = 36
+            else:
+                threshold = 48
         else:
-            threshold = 24
+            # crypto 阈值
+            if tf == "1h":
+                threshold = 3
+            elif tf == "4h":
+                threshold = 12
+            else:
+                threshold = 24
 
         if age_hours > threshold:
             status = f"⚠ 超过 {age_hours:.0f}h 无信号"
             has_alert = True
         else:
             status = "正常"
-        lines.append(f"  {tf}: 最后信号 {local_str} ({status})")
+        market_tag = "A股" if market == "ashare" else "Crypto"
+        lines.append(f"  [{market_tag}] {tf}: 最后信号 {local_str} ({status})")
 
     # 检查信号总数
     with db_engine.connect() as conn:
@@ -429,17 +458,20 @@ async def main() -> None:
                 alert_items = []
                 with db_engine.connect() as conn:
                     rows = conn.execute(text(
-                        "SELECT timeframe, MAX(candle_time) as last_candle "
+                        "SELECT symbol, timeframe, MAX(candle_time) as last_candle "
                         "FROM pa_kline "
-                        "WHERE symbol NOT LIKE '%/SZ' AND symbol NOT LIKE '%/SH' "
-                        "GROUP BY timeframe"
+                        "GROUP BY symbol, timeframe"
                     )).fetchall()
                 for r in rows:
-                    tf, last_candle = r[0], r[1]
+                    symbol, tf, last_candle = r[0], r[1], r[2]
+                    is_ashare = symbol.endswith("/SZ") or symbol.endswith("/SH")
                     if last_candle.tzinfo is None:
                         last_candle = last_candle.replace(tzinfo=timezone.utc)
                     age_hours = (now - last_candle).total_seconds() / 3600
-                    threshold = 2 if tf == "1h" else (9 if tf == "4h" else 24)
+                    if is_ashare:
+                        threshold = 9 if tf == "1h" else 48
+                    else:
+                        threshold = 2 if tf == "1h" else (9 if tf == "4h" else 24)
                     if age_hours > threshold:
                         alert_items.append(f"{tf} K线已 {age_hours:.1f}h 未更新（阈值 {threshold}h）")
                 if alert_items:
