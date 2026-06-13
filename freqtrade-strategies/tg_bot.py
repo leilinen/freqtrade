@@ -155,7 +155,7 @@ async def handle_signal(request: web.Request) -> web.Response:
                     caption=msg,
                 )
             except Exception:
-                logger.warning("send_photo failed, falling back to text for %s", data.get("symbol"))
+                logger.warning("send_photo failed, falling back to text for %s", data.get("symbol"), exc_info=True)
                 await request.app["tg_bot"].bot.send_message(
                     chat_id=TG_CHAT_ID,
                     text=msg,
@@ -484,22 +484,26 @@ async def main() -> None:
                 alert_items = []
                 with db_engine.connect() as conn:
                     rows = conn.execute(text(
-                        "SELECT symbol, timeframe, MAX(candle_time) as last_candle "
+                        "SELECT timeframe, MAX(candle_time) as last_candle, "
+                        "COUNT(DISTINCT symbol) as pair_count "
                         "FROM pa_kline "
-                        "GROUP BY symbol, timeframe"
+                        "GROUP BY timeframe"
                     )).fetchall()
                 for r in rows:
-                    symbol, tf, last_candle = r[0], r[1], r[2]
-                    is_ashare = symbol.endswith("/SZ") or symbol.endswith("/SH")
+                    tf, last_candle, pair_count = r[0], r[1], r[2]
                     if last_candle.tzinfo is None:
                         last_candle = last_candle.replace(tzinfo=timezone.utc)
                     age_hours = (now - last_candle).total_seconds() / 3600
-                    if is_ashare:
-                        threshold = 9 if tf == "1h" else 48
+                    if tf == "1h":
+                        threshold = 2
+                    elif tf == "4h":
+                        threshold = 9
                     else:
-                        threshold = 2 if tf == "1h" else (9 if tf == "4h" else 24)
+                        threshold = 24
                     if age_hours > threshold:
-                        alert_items.append(f"{tf} K线已 {age_hours:.1f}h 未更新（阈值 {threshold}h）")
+                        alert_items.append(
+                            f"{tf} K线已 {age_hours:.1f}h 未更新 ({pair_count}个标的, 阈值 {threshold}h)"
+                        )
                 if alert_items:
                     last_health_alert = now
                     tz_shanghai = timezone(timedelta(hours=8))
