@@ -178,6 +178,10 @@ async def handle_signal(request: web.Request) -> web.Response:
     msg = format_signal_message(data)
     try:
         if chart_bytes:
+            logger.info(
+                "DEBUG chart_bytes: type=%s, len=%d, repr_head=%r",
+                type(chart_bytes).__name__, len(chart_bytes), chart_bytes[:50],
+            )
             try:
                 await request.app["tg_bot"].bot.send_photo(
                     chat_id=TG_CHAT_ID,
