@@ -61,6 +61,36 @@ def _detect_market(symbol: str) -> str:
     return "usstock"
 
 
+def _health_threshold(market: str, tf: str, now_utc: datetime) -> tuple[int, str]:
+    """根据市场和当前时间返回健康检查阈值（小时）及说明。
+
+    A 股在非交易时段（周末、夜间）放宽阈值，避免误报；
+    crypto 全天交易，使用固定阈值。
+    """
+    if market == "ashare":
+        tz_sh = timezone(timedelta(hours=8))
+        local_now = now_utc.astimezone(tz_sh)
+        weekday = local_now.weekday()
+        t = local_now.time()
+        is_trading = weekday < 5 and (
+            dt_time(9, 30) <= t <= dt_time(11, 30)
+            or dt_time(13, 0) <= t <= dt_time(15, 0)
+        )
+        if not is_trading:
+            return 72, "非交易时段"
+        if tf == "1h":
+            return 5, ""
+        if tf == "1d":
+            return 36, ""
+        return 48, ""
+    # crypto
+    if tf == "1h":
+        return 2, ""
+    if tf == "4h":
+        return 9, ""
+    return 24, ""
+
+
 def db_add_pair(symbol: str, market: str) -> str:
     symbol = symbol.upper()
     with db_engine.begin() as conn:
@@ -484,25 +514,26 @@ async def main() -> None:
                 alert_items = []
                 with db_engine.connect() as conn:
                     rows = conn.execute(text(
-                        "SELECT timeframe, MAX(candle_time) as last_candle, "
-                        "COUNT(DISTINCT symbol) as pair_count "
+                        "SELECT "
+                        "  CASE WHEN symbol LIKE '%/SH' OR symbol LIKE '%/SZ' "
+                        "       THEN 'ashare' ELSE 'crypto' END AS market, "
+                        "  timeframe, MAX(candle_time) as last_candle, "
+                        "  COUNT(DISTINCT symbol) as pair_count "
                         "FROM pa_kline "
-                        "GROUP BY timeframe"
+                        "GROUP BY market, timeframe"
                     )).fetchall()
                 for r in rows:
-                    tf, last_candle, pair_count = r[0], r[1], r[2]
+                    market, tf, last_candle, pair_count = r[0], r[1], r[2], r[3]
                     if last_candle.tzinfo is None:
                         last_candle = last_candle.replace(tzinfo=timezone.utc)
                     age_hours = (now - last_candle).total_seconds() / 3600
-                    if tf == "1h":
-                        threshold = 2
-                    elif tf == "4h":
-                        threshold = 9
-                    else:
-                        threshold = 24
+                    threshold, note = _health_threshold(market, tf, now)
                     if age_hours > threshold:
+                        tag = "A股" if market == "ashare" else "Crypto"
+                        suffix = f", {note}" if note else ""
                         alert_items.append(
-                            f"{tf} K线已 {age_hours:.1f}h 未更新 ({pair_count}个标的, 阈值 {threshold}h)"
+                            f"[{tag}] {tf} K线已 {age_hours:.1f}h 未更新 "
+                            f"({pair_count}个标的{suffix}, 阈值 {threshold}h)"
                         )
                 if alert_items:
                     last_health_alert = now
