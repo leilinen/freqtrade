@@ -257,8 +257,11 @@ def _fetch_tencent_daily(pair: str, count: int = 500, adjust: str = "qfq") -> Da
         resp = client.get(TENCENT_KLINE_URL, params=params)
         data = resp.json()
 
+    # 腾讯 API 对不同标的返回的 key 不一致（大盘 ETF→qfqday，科创板/创业板 ETF→day），
+    # 先取预期 key，空则 fallback 到另一个，保证覆盖所有情况。
     key = "qfqday" if adjust == "qfq" else "day"
-    bars = data.get("data", {}).get(symbol, {}).get(key, [])
+    raw = data.get("data", {}).get(symbol, {})
+    bars = raw.get(key, []) or raw.get("day", []) or raw.get("qfqday", [])
     if not bars:
         return None
 
