@@ -17,8 +17,10 @@ import json
 import logging
 import os
 import asyncio
+import threading
 from datetime import datetime, timezone, timedelta, time as dt_time
 
+import httpx
 from aiohttp import web
 from sqlalchemy import create_engine, text
 from telegram import Update
@@ -61,23 +63,107 @@ def _detect_market(symbol: str) -> str:
     return "usstock"
 
 
+# ================================================================
+# A-share trade-day calendar (sourced from sh000001 daily kline)
+# ================================================================
+
+ASHARE_INDEX_SYMBOL = "sh000001"
+ASHARE_CALENDAR_TZ = timezone(timedelta(hours=8))  # Beijing
+
+# A-share trade-day set, refreshed once per Beijing-day from sh000001 daily kline.
+# On fetch failure, keeps the last successful cache (or empty set on first run).
+_trade_days_cache: set[str] = set()         # {"YYYY-MM-DD", ...}
+_trade_days_fetched_for: str | None = None  # Beijing date we last refreshed for
+_trade_days_lock = threading.Lock()
+
+
+def _refresh_trade_days(force: bool = False) -> set[str]:
+    """Refresh and return the A-share trade-day set from Tencent sh000001 daily kline.
+
+    Cached per Beijing-day; thread-safe. The returned dates are the trade
+    calendar itself (weekends and holidays are absent, 调休 days are present).
+    On error, returns the last successful cache (or empty set if never fetched) —
+    callers must treat an empty set as 'unknown, fall back to weekday logic'.
+
+    :param force: bypass the per-day cache and refetch
+    :return: set of "YYYY-MM-DD" trade-day strings (may be empty on failure)
+    """
+    global _trade_days_cache, _trade_days_fetched_for
+    today_bj = datetime.now(ASHARE_CALENDAR_TZ).strftime("%Y-%m-%d")
+    with _trade_days_lock:
+        if _trade_days_fetched_for == today_bj and not force and _trade_days_cache:
+            return _trade_days_cache
+    try:
+        with httpx.Client(follow_redirects=True, timeout=10) as client:
+            resp = client.get(
+                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                params={"param": f"{ASHARE_INDEX_SYMBOL},day,,,500,qfq"},
+            )
+            data = resp.json().get("data", {}).get(ASHARE_INDEX_SYMBOL, {})
+            # 腾讯对不同标的返回的 key 不一致（大盘→qfqday，科创板/创业板→day），与 ashare.py 保持一致
+            bars = data.get("qfqday", []) or data.get("day", [])
+            days = {b[0] for b in bars if b and b[0]}
+        if days:
+            with _trade_days_lock:
+                _trade_days_cache = days
+                _trade_days_fetched_for = today_bj
+            logger.info(
+                "A-share trade calendar refreshed: %d trading days (last=%s)",
+                len(days),
+                max(days),
+            )
+    except Exception:
+        logger.warning(
+            "Failed to refresh A-share trade calendar, using cached %d days",
+            len(_trade_days_cache),
+            exc_info=True,
+        )
+    return _trade_days_cache
+
+
+def is_ashare_trading_day(now_utc: datetime) -> tuple[bool, str]:
+    """Determine whether now (Beijing) falls on an A-share trading day.
+
+    :param now_utc: current time in UTC
+    :return: (is_trading_day, reason) where reason is one of:
+        "trading-day"     — calendar confirms today is a trade day
+        "休市日"           — weekday holiday (calendar knows it's closed)
+        "周末"             — Saturday/Sunday (calendar agrees)
+        "fallback-weekday" — calendar unavailable, weekday<5 used as best guess
+    """
+    today_bj = now_utc.astimezone(ASHARE_CALENDAR_TZ).strftime("%Y-%m-%d")
+    days = _refresh_trade_days()
+    if days and today_bj in days:
+        return True, "trading-day"
+    if not days:
+        # Calendar unavailable — fall back to plain weekday check (old behavior)
+        is_wd = now_utc.astimezone(ASHARE_CALENDAR_TZ).weekday() < 5
+        return is_wd, "fallback-weekday"
+    # Today not in trade-day set
+    wd = now_utc.astimezone(ASHARE_CALENDAR_TZ).weekday()
+    return False, "休市日" if wd < 5 else "周末"
+
+
 def _health_threshold(market: str, tf: str, now_utc: datetime) -> tuple[int, str]:
     """根据市场和当前时间返回健康检查阈值（小时）及说明。
 
-    A 股在非交易时段（周末、夜间）放宽阈值，避免误报；
+    A 股：用 sh000001 交易日历判定是否交易日；非交易日放宽阈值，避免误报。
     crypto 全天交易，使用固定阈值。
     """
     if market == "ashare":
         tz_sh = timezone(timedelta(hours=8))
         local_now = now_utc.astimezone(tz_sh)
-        weekday = local_now.weekday()
         t = local_now.time()
-        is_trading = weekday < 5 and (
+        is_trade_day, day_reason = is_ashare_trading_day(now_utc)
+        is_trading = is_trade_day and (
             dt_time(9, 30) <= t <= dt_time(11, 30)
             or dt_time(13, 0) <= t <= dt_time(15, 0)
         )
         if not is_trading:
-            return 72, "非交易时段"
+            # 非交易时段：用日历的 day_reason（休市日 / 周末 / fallback-weekday）
+            # 作为说明，方便从告警里看出到底是节假日还是普通盘后
+            note = day_reason if day_reason != "trading-day" else "非交易时段"
+            return 72, note
         if tf == "1h":
             return 5, ""
         if tf == "1d":
@@ -506,6 +592,8 @@ async def main() -> None:
         logger.error("Failed to start TG polling after 10 attempts, running HTTP API only")
 
     # Keep running + health monitor
+    # Warm the A-share trade-day calendar so the first hourly check has it populated
+    _refresh_trade_days(force=True)
     last_health_alert = None
     try:
         while True:
