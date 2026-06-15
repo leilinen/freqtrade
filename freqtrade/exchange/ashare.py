@@ -267,7 +267,13 @@ def _fetch_tencent_daily(pair: str, count: int = 500, adjust: str = "qfq") -> Da
 
     df = pd.DataFrame([b[:6] for b in bars], columns=["date", "open", "close", "high", "low", "volume"])
     df = df[["date", "open", "high", "low", "close", "volume"]]
-    df["date"] = pd.to_datetime(df["date"], utc=True)
+    # 腾讯返回的日期为北京日期（"YYYY-MM-DD"）；按 Asia/Shanghai 本地化后转 UTC，
+    # 避免直接 utc=True 把北京时间错标成 UTC（虚高 8 小时）。
+    df["date"] = (
+        pd.to_datetime(df["date"], format="%Y-%m-%d")
+        .dt.tz_localize("Asia/Shanghai")
+        .dt.tz_convert("UTC")
+    )
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -300,7 +306,13 @@ def _fetch_sina_1h(pair: str, count: int = 500) -> DataFrame | None:
     df = pd.DataFrame(bars)
     df = df[["day", "open", "high", "low", "close", "volume"]]
     df = df.rename(columns={"day": "date"})
-    df["date"] = pd.to_datetime(df["date"], utc=True)
+    # 新浪返回的时间为北京时间（"YYYY-MM-DD HH:MM:SS"）；按 Asia/Shanghai 本地化后转 UTC，
+    # 避免直接 utc=True 把北京时间错标成 UTC（虚高 8 小时）。
+    df["date"] = (
+        pd.to_datetime(df["date"], format="%Y-%m-%d %H:%M:%S")
+        .dt.tz_localize("Asia/Shanghai")
+        .dt.tz_convert("UTC")
+    )
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
