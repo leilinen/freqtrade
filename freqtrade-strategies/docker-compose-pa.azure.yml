@@ -1,7 +1,7 @@
 services:
   price-action-1h:
     build:
-      context: ../..
+      context: ..
       dockerfile: docker/Dockerfile.pa
     image: freqtrade-pa:latest
     container_name: price-action-1h
@@ -34,7 +34,7 @@ services:
 
   ashare-1h:
     build:
-      context: ../..
+      context: ..
       dockerfile: Dockerfile
     image: freqtrade-ashare:latest
     container_name: ashare-1h
