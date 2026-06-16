@@ -715,9 +715,15 @@ class PriceActionMonitor(IStrategy):
             if wp:
                 display_name = wp.display_name
 
+        # 信号 K 线时间（与 _save_signal 取值逻辑一致）
+        candle_time = row.get("date", None)
+        if candle_time is None:
+            candle_time = datetime.now(timezone.utc)
+
         payload = {
             "symbol": pair,
             "display_name": display_name,
+            "signal_time": candle_time.isoformat(),
             "timeframe": self.timeframe,
             "direction": direction,
             "quality": quality,

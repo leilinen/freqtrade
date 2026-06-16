@@ -361,6 +361,20 @@ def format_signal_message(data: dict) -> str:
     tf = data.get("timeframe", "?")
     display_name = data.get("display_name")
     label = f"{display_name}({symbol})" if display_name else symbol
+    # 信号 K 线时间 → 北京时间显示
+    time_str = ""
+    raw_time = data.get("signal_time")
+    if raw_time:
+        try:
+            ct = datetime.fromisoformat(str(raw_time))
+            if ct.tzinfo is None:
+                ct = ct.replace(tzinfo=timezone.utc)
+            time_str = ct.astimezone(timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
+        except (ValueError, TypeError):
+            time_str = ""
+    header = f"{arrow} {label} {tf}"
+    if time_str:
+        header += f" @{time_str}"
     price = data.get("entry_price", 0)
     sl = data.get("stop_loss", 0)
     tp = data.get("target_price", 0)
@@ -375,7 +389,7 @@ def format_signal_message(data: dict) -> str:
             return f"{v:.6f}"
 
     lines = [
-        f"{arrow} {label} {tf}",
+        header,
         f"{dir_cn} [{q_str}] 当前价格: {fmt_price(price)}",
         f"实体占比={data.get('body_pct', 0):.2f} "
         f"收盘位置={data.get('close_location', 0):.2f} "
