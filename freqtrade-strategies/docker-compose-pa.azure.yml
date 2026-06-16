@@ -1,5 +1,8 @@
 services:
   price-action-1h:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.pa
     image: freqtrade-pa:latest
     container_name: price-action-1h
     restart: unless-stopped
@@ -30,6 +33,9 @@ services:
       - pricedog_default
 
   ashare-1h:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
     image: freqtrade-ashare:latest
     container_name: ashare-1h
     restart: unless-stopped

@@ -47,7 +47,8 @@ COPY --chown=ftuser:ftuser . /freqtrade/
 RUN pip install -e . --user --no-cache-dir \
   && pip install --user --no-cache-dir psycopg2-binary matplotlib mplfinance \
   && mkdir /freqtrade/user_data/ \
-  && freqtrade install-ui
+  && freqtrade install-ui \
+  && pip uninstall -y pyarrow
 
 ENTRYPOINT ["freqtrade"]
 # Default to trade mode

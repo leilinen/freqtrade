@@ -1,6 +1,6 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm AS builder
 
-# System deps (TA-Lib C library)
+# Build-time deps only (not carried into runtime image)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential wget autoconf automake libtool && \
     cd /tmp && wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && \
@@ -8,7 +8,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     autoreconf -fi && \
     ./configure --prefix=/usr && make && make install && \
     rm -rf /tmp/ta-lib* && \
-    apt-get remove -y wget autoconf automake libtool && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /freqtrade
@@ -19,6 +18,21 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 RUN pip install --no-cache-dir -e .
 RUN pip install --no-cache-dir psycopg2-binary mplfinance
+# Remove pyarrow: this project uses json + PostgreSQL, never feather format.
+# feather handler is lazily imported so this is safe; saves ~153MB.
+RUN pip uninstall -y pyarrow
+
+
+FROM python:3.12-slim-bookworm AS runtime
+
+# Runtime: only the TA-Lib shared library (compiled in builder)
+COPY --from=builder /usr/lib/libta_lib.so* /usr/lib/
+RUN ldconfig
+
+WORKDIR /freqtrade
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /freqtrade /freqtrade
 
 # Patch ccxt keysort to handle None keys from OKX API (ccxt 4.5.56 bug)
 RUN sed -i 's/return dict(sorted(dictionary.items()))/return dict(sorted((k, v) for k, v in dictionary.items() if k is not None))/' \
