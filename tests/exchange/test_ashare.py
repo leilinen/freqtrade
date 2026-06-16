@@ -17,6 +17,7 @@ from freqtrade.exchange.ashare import (
     _parse_pair,
     _to_sina_symbol,
     _to_tencent_symbol,
+    fetch_ashare_name,
 )
 from tests.conftest import EXMS, get_patched_exchange
 
@@ -406,3 +407,71 @@ class TestCheckExchangeCustomExchange:
         default_conf["exchange"]["name"] = "ashare"
         result = check_exchange(default_conf, check_for_bad=False)
         assert result is True
+
+
+# ======================================================================
+# fetch_ashare_name (Sina primary + Tencent fallback)
+# ======================================================================
+
+
+class _FakeResp:
+    def __init__(self, text):
+        self.text = text
+
+
+class TestFetchAshareName:
+    """fetch_ashare_name: Sina primary, Tencent fallback, None on failure."""
+
+    @patch("freqtrade.exchange.ashare._name_from_sina", return_value="平安银行")
+    @patch("freqtrade.exchange.ashare._name_from_tencent", return_value="UNUSED")
+    def test_sina_primary_returned(self, mock_tencent, mock_sina):
+        assert fetch_ashare_name("000001/SZ") == "平安银行"
+        mock_tencent.assert_not_called()
+
+    @patch("freqtrade.exchange.ashare._name_from_sina", return_value=None)
+    @patch("freqtrade.exchange.ashare._name_from_tencent", return_value="平安银行")
+    def test_tencent_fallback(self, mock_tencent, mock_sina):
+        assert fetch_ashare_name("000001/SZ") == "平安银行"
+
+    @patch("freqtrade.exchange.ashare._name_from_sina", return_value=None)
+    @patch("freqtrade.exchange.ashare._name_from_tencent", return_value=None)
+    def test_both_fail_returns_none(self, mock_tencent, mock_sina):
+        assert fetch_ashare_name("000001/SZ") is None
+
+    @patch("freqtrade.exchange.ashare.httpx.Client")
+    def test_sina_parses_name(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get.return_value = _FakeResp('var hq_str_sz000001="平安银行,12.34,12.5,12.1";')
+        mock_client_cls.return_value = mock_client
+        from freqtrade.exchange.ashare import _name_from_sina
+        assert _name_from_sina("000001/SZ") == "平安银行"
+
+    @patch("freqtrade.exchange.ashare.httpx.Client")
+    def test_sina_empty_content_returns_none(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get.return_value = _FakeResp('var hq_str_sz999999="";')
+        mock_client_cls.return_value = mock_client
+        from freqtrade.exchange.ashare import _name_from_sina
+        assert _name_from_sina("999999/SZ") is None
+
+    @patch("freqtrade.exchange.ashare.httpx.Client")
+    def test_tencent_parses_name(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.get.return_value = _FakeResp('v_sz000001="51~平安银行~000001~12.34~";')
+        mock_client_cls.return_value = mock_client
+        from freqtrade.exchange.ashare import _name_from_tencent
+        assert _name_from_tencent("000001/SZ") == "平安银行"
+
+    @patch("freqtrade.exchange.ashare.httpx.Client")
+    def test_sina_network_error_returns_none(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(side_effect=RuntimeError("boom"))
+        mock_client_cls.return_value = mock_client
+        from freqtrade.exchange.ashare import _name_from_sina
+        assert _name_from_sina("000001/SZ") is None

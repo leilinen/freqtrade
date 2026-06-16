@@ -47,8 +47,13 @@ db_engine = create_engine(DB_URL)
 
 def db_get_watch_pairs() -> list[dict]:
     with db_engine.connect() as conn:
-        rows = conn.execute(text("SELECT symbol, enabled, market FROM watch_pair ORDER BY id")).fetchall()
-    return [{"symbol": r[0], "enabled": r[1], "market": r[2]} for r in rows]
+        rows = conn.execute(
+            text("SELECT symbol, enabled, market, display_name FROM watch_pair ORDER BY id")
+        ).fetchall()
+    return [
+        {"symbol": r[0], "enabled": r[1], "market": r[2], "display_name": r[3]}
+        for r in rows
+    ]
 
 
 VALID_MARKETS = {"crypto", "ashare", "usstock"}
@@ -61,6 +66,50 @@ def _detect_market(symbol: str) -> str:
     if "/" in symbol:
         return "crypto"
     return "usstock"
+
+
+def _fetch_ashare_name(symbol: str) -> str | None:
+    """获取 A 股中文显示名称，新浪为主、腾讯兜底。
+
+    tg_bot 容器不安装 freqtrade，无法 import ashare.py，按现有 _refresh_trade_days
+    直接打 HTTP 接口的模式独立实现。
+    """
+    parts = symbol.split("/")
+    if len(parts) != 2:
+        return None
+    code, exch = parts[0], parts[1].lower()
+    sina_symbol = f"{exch}{code}"
+
+    # --- 新浪 ---
+    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": "Mozilla/5.0"}
+    try:
+        with httpx.Client(follow_redirects=True, timeout=10, headers=headers) as client:
+            text = client.get(f"https://hq.sinajs.cn/list={sina_symbol}").text
+        start = text.index('"') + 1
+        end = text.rindex('"')
+        content = text[start:end]
+        if content:
+            name = content.split(",")[0]
+            if name:
+                return name
+    except Exception:
+        logger.warning("Sina name lookup failed for %s", symbol, exc_info=True)
+
+    # --- 腾讯兜底 ---
+    headers = {"Referer": "https://gu.qq.com/", "User-Agent": "Mozilla/5.0"}
+    try:
+        with httpx.Client(follow_redirects=True, timeout=10, headers=headers) as client:
+            text = client.get(f"https://qt.gtimg.cn/q={sina_symbol}").text
+        start = text.index('"') + 1
+        end = text.rindex('"')
+        content = text[start:end]
+        if content:
+            fields = content.split("~")
+            if len(fields) >= 2 and fields[1]:
+                return fields[1]
+    except Exception:
+        logger.warning("Tencent name lookup failed for %s", symbol, exc_info=True)
+    return None
 
 
 # ================================================================
@@ -188,11 +237,18 @@ def db_add_pair(symbol: str, market: str) -> str:
                 return f"{symbol} already watching"
             conn.execute(text("UPDATE watch_pair SET enabled = true WHERE symbol = :s"), {"s": symbol})
             return f"{symbol} re-enabled"
+        display_name = None
+        if market == "ashare":
+            display_name = _fetch_ashare_name(symbol)
         conn.execute(
-            text("INSERT INTO watch_pair (symbol, enabled, market) VALUES (:s, true, :m)"),
-            {"s": symbol, "m": market},
+            text(
+                "INSERT INTO watch_pair (symbol, enabled, market, display_name) "
+                "VALUES (:s, true, :m, :dn)"
+            ),
+            {"s": symbol, "m": market, "dn": display_name},
         )
-    return f"{symbol} added ({market})"
+    suffix = f" ({display_name})" if display_name else f" ({market})"
+    return f"{symbol} added{suffix}"
 
 
 def db_remove_pair(symbol: str) -> str:
@@ -303,6 +359,8 @@ def format_signal_message(data: dict) -> str:
     arrow = "+" if direction == "long" else "-"
     symbol = data.get("symbol", "?")
     tf = data.get("timeframe", "?")
+    display_name = data.get("display_name")
+    label = f"{display_name}({symbol})" if display_name else symbol
     price = data.get("entry_price", 0)
     sl = data.get("stop_loss", 0)
     tp = data.get("target_price", 0)
@@ -317,7 +375,7 @@ def format_signal_message(data: dict) -> str:
             return f"{v:.6f}"
 
     lines = [
-        f"{arrow} {symbol} {tf}",
+        f"{arrow} {label} {tf}",
         f"{dir_cn} [{q_str}] 当前价格: {fmt_price(price)}",
         f"实体占比={data.get('body_pct', 0):.2f} "
         f"收盘位置={data.get('close_location', 0):.2f} "
@@ -372,7 +430,9 @@ async def pa_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for p in pairs:
         status = "开" if p["enabled"] else "关"
         market = p.get("market") or "crypto"
-        lines.append(f"  {p['symbol']} [{status}] ({market})")
+        name = p.get("display_name")
+        label = f"{name}({p['symbol']})" if name else p["symbol"]
+        lines.append(f"  {label} [{status}] ({market})")
     await update.message.reply_text("\n".join(lines))
 
 

@@ -36,6 +36,7 @@ _mock_ft_strategy.IStrategy = _FakeIStrategy
 from price_action_monitor import (  # noqa: E402
     PaKline,
     PriceActionMonitor,
+    WatchPair,
     _Base,
 )
 
@@ -80,6 +81,8 @@ def _make_strategy(**overrides):
 
     # Mock _pg_session_factory so we can inspect calls
     mock_session = MagicMock()
+    # Default: query().filter_by().first() returns None (no rows)
+    mock_session.query.return_value.filter_by.return_value.first.return_value = None
     mock_ctx = MagicMock()
     mock_ctx.__enter__ = MagicMock(return_value=mock_session)
     mock_ctx.__exit__ = MagicMock(return_value=False)
@@ -118,6 +121,26 @@ class TestPaKlineModel:
             "open", "high", "low", "close", "volume",
         }
         assert expected == col_names
+
+
+# ===================================================================
+# Tests: WatchPair model
+# ===================================================================
+
+
+class TestWatchPairModel:
+    """Verify the WatchPair ORM model includes display_name column."""
+
+    def test_table_name(self):
+        assert WatchPair.__tablename__ == "watch_pair"
+
+    def test_display_name_column_exists(self):
+        col_names = {c.name for c in WatchPair.__table__.columns}
+        assert "display_name" in col_names
+
+    def test_display_name_is_nullable(self):
+        col = {c.name: c for c in WatchPair.__table__.columns}["display_name"]
+        assert col.nullable is True
 
 
 # ===================================================================

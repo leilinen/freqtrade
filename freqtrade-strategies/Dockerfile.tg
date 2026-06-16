@@ -4,7 +4,8 @@ RUN pip install --no-cache-dir \
     python-telegram-bot \
     sqlalchemy \
     psycopg2-binary \
-    aiohttp
+    aiohttp \
+    httpx
 
 WORKDIR /app
 COPY tg_bot.py .

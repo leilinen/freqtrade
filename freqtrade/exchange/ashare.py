@@ -46,6 +46,12 @@ SINA_KLINE_URL = (
     "https://quotes.sina.cn/cn/api/jsonp_v2.php/callback/CN_MarketDataService.getKLineData"
 )
 
+# 新浪实时行情 API（用于获取股票名称）
+SINA_QUOTE_URL = "https://hq.sinajs.cn/list="
+
+# 腾讯实时行情 API（兜底获取股票名称）
+TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
+
 # 支持的 timeframe
 SUPPORTED_TIMEFRAMES = {"1h", "1d"}
 
@@ -229,6 +235,59 @@ def _to_sina_symbol(pair: str) -> str:
     """将 freqtrade pair 转为新浪 API 格式: '000001/SZ' → 'sz000001'"""
     code, exchange = _parse_pair(pair)
     return f"{exchange.lower()}{code}"
+
+
+def fetch_ashare_name(pair: str) -> str | None:
+    """获取 A 股中文显示名称，新浪为主、腾讯兜底。
+
+    :param pair: freqtrade pair, e.g. "000001/SZ"
+    :return: 股票名称（如"平安银行"），均失败返回 None
+    """
+    name = _name_from_sina(pair)
+    if name:
+        return name
+    return _name_from_tencent(pair)
+
+
+def _name_from_sina(pair: str) -> str | None:
+    """新浪实时行情：var hq_str_sz000001="平安银行,12.34,..."。"""
+    symbol = _to_sina_symbol(pair)
+    headers = {"Referer": "https://finance.sina.com.cn/", "User-Agent": "Mozilla/5.0"}
+    try:
+        with httpx.Client(follow_redirects=True, timeout=10, headers=headers) as client:
+            text = client.get(f"{SINA_QUOTE_URL}{symbol}").text
+        start = text.index('"') + 1
+        end = text.rindex('"')
+        content = text[start:end]
+        if not content:
+            return None
+        name = content.split(",")[0]
+        return name if name else None
+    except Exception:
+        logger.warning("Sina name lookup failed for %s", pair, exc_info=True)
+        return None
+
+
+def _name_from_tencent(pair: str) -> str | None:
+    """腾讯实时行情：v_sz000001="51~平安银行~000001~12.34~..."。名称是第 2 个 ~ 字段。"""
+    symbol = _to_tencent_symbol(pair)
+    headers = {"Referer": "https://gu.qq.com/", "User-Agent": "Mozilla/5.0"}
+    try:
+        with httpx.Client(follow_redirects=True, timeout=10, headers=headers) as client:
+            text = client.get(f"{TENCENT_QUOTE_URL}{symbol}").text
+        start = text.index('"') + 1
+        end = text.rindex('"')
+        content = text[start:end]
+        if not content:
+            return None
+        parts = content.split("~")
+        # parts[0]=市场代码, parts[1]=名称
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+        return None
+    except Exception:
+        logger.warning("Tencent name lookup failed for %s", pair, exc_info=True)
+        return None
 
 
 def _is_market_open() -> bool:

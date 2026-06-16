@@ -17,6 +17,7 @@ import json
 import logging
 import io
 import atexit
+import time as _time
 from datetime import datetime, timezone
 
 import requests as http_requests
@@ -51,6 +52,7 @@ class WatchPair(_Base):
     symbol: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     market: Mapped[str] = mapped_column(String, default="crypto")
+    display_name: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -239,7 +241,19 @@ class PriceActionMonitor(IStrategy):
             for symbol in pairs:
                 existing = session.query(WatchPair).filter_by(symbol=symbol).first()
                 if not existing:
-                    session.add(WatchPair(symbol=symbol, enabled=True, market=market))
+                    display_name = None
+                    if market == "ashare":
+                        from freqtrade.exchange.ashare import fetch_ashare_name
+                        display_name = fetch_ashare_name(symbol)
+                        _time.sleep(1)
+                    session.add(
+                        WatchPair(
+                            symbol=symbol,
+                            enabled=True,
+                            market=market,
+                            display_name=display_name,
+                        )
+                    )
             session.commit()
 
     # ================================================================
@@ -694,8 +708,16 @@ class PriceActionMonitor(IStrategy):
         direction = row.get("signal_direction", "none")
         quality = row.get("signal_quality", "none")
 
+        # 查询标的显示名称（A 股为中文名，其余为空）
+        display_name = None
+        with self._pg_session_factory() as session:
+            wp = session.query(WatchPair).filter_by(symbol=pair).first()
+            if wp:
+                display_name = wp.display_name
+
         payload = {
             "symbol": pair,
+            "display_name": display_name,
             "timeframe": self.timeframe,
             "direction": direction,
             "quality": quality,
