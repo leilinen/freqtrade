@@ -174,7 +174,8 @@ def test_telegram_init(default_conf, mocker, caplog) -> None:
         "['pause', 'stopbuy', 'stopentry'], ['whitelist'], ['blacklist'], "
         "['bl_delete', 'blacklist_delete'], "
         "['logs'], ['health'], ['help'], ['version'], ['marketdir'], "
-        "['order'], ['list_custom_data'], ['tg_info'], ['profit_long'], ['profit_short']]"
+        "['order'], ['quote'], ['list_custom_data'], ['tg_info'], "
+        "['profit_long'], ['profit_short']]"
     )
 
     assert log_has(message_str, caplog)
@@ -3064,3 +3065,83 @@ async def test__tg_info(default_conf_usdt, mocker, update):
     content = context.bot.send_message.call_args[1]["text"]
     assert "Freqtrade Bot Info:\n" in content
     assert '"chat_id": "1235"' in content
+
+
+async def test_quote_usage_message(default_conf, update, mocker):
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    context = MagicMock()
+    context.args = []
+    await telegram._quote(update=update, context=context)
+    assert msg_mock.call_count == 1
+    msg = msg_mock.call_args_list[0][0][0]
+    assert "Usage:" in msg
+    assert "/quote" in msg
+
+
+async def test_quote_invalid_candle_count(default_conf, update, mocker):
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    context = MagicMock()
+    context.args = ["ETH/BTC", "5m", "not-a-number"]
+    await telegram._quote(update=update, context=context)
+    assert msg_mock.call_count == 1
+    assert "Invalid candle count" in msg_mock.call_args_list[0][0][0]
+
+
+async def test_quote_out_of_range(default_conf, update, mocker):
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    context = MagicMock()
+    context.args = ["ETH/BTC", "5m", "500"]
+    await telegram._quote(update=update, context=context)
+    assert msg_mock.call_count == 1
+    assert "between 1 and 200" in msg_mock.call_args_list[0][0][0]
+
+
+async def test_quote_calls_rpc_and_sends_photo(default_conf, update, mocker):
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+
+    rpc_result = {
+        "pair": "ETH/BTC",
+        "timeframe": "5m",
+        "num_candles": 20,
+        "chart_png": b"\x89PNG-fake",
+        "ohlcv_text": "O:1.0 C:1.1",
+        "error": None,
+    }
+    mocker.patch.object(telegram._rpc, "_rpc_quote", return_value=rpc_result)
+    send_photo_mock = AsyncMock()
+    mocker.patch.object(telegram, "_send_photo", send_photo_mock)
+
+    context = MagicMock()
+    context.args = ["ETH/BTC"]
+    await telegram._quote(update=update, context=context)
+
+    assert send_photo_mock.call_count == 1
+    assert send_photo_mock.call_args[1]["photo"] == b"\x89PNG-fake"
+    caption = send_photo_mock.call_args[1]["caption"]
+    assert "ETH/BTC" in caption
+    assert "5m" in caption
+    # On success _send_msg is NOT called.
+    assert msg_mock.call_count == 0
+
+
+async def test_quote_rpc_error_sends_text(default_conf, update, mocker):
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    rpc_result = {
+        "pair": "SCAM/BTC",
+        "timeframe": "5m",
+        "num_candles": 20,
+        "chart_png": None,
+        "ohlcv_text": "",
+        "error": "not in the bot whitelist",
+    }
+    mocker.patch.object(telegram._rpc, "_rpc_quote", return_value=rpc_result)
+    send_photo_mock = AsyncMock()
+    mocker.patch.object(telegram, "_send_photo", send_photo_mock)
+
+    context = MagicMock()
+    context.args = ["SCAM/BTC"]
+    await telegram._quote(update=update, context=context)
+
+    assert msg_mock.call_count == 1
+    assert "not in the bot whitelist" in msg_mock.call_args_list[0][0][0]
+    assert send_photo_mock.call_count == 0
