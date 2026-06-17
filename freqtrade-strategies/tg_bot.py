@@ -433,6 +433,84 @@ def authorized(update: Update) -> bool:
     return update.effective_chat and update.effective_chat.id == TG_CHAT_ID
 
 
+# ---- /quote 路由表: (market, timeframe) -> (容器名, HTTP 端口) ----
+# 每个 freqtrade 容器只缓存自己 timeframe 的 OHLCV。
+CHART_ROUTES = {
+    ("crypto", "1h"): ("price-action-1h", 8091),
+    ("crypto", "4h"): ("price-action-4h", 8092),
+    ("ashare", "1h"): ("ashare-1h", 8093),
+    ("ashare", "1d"): ("ashare-1d", 8094),
+}
+
+
+def _route_chart(symbol: str, timeframe: str) -> tuple[str, int] | None:
+    """根据 symbol 后缀 + timeframe 找到对应的 freqtrade 容器。
+
+    :return: (host, port) 或 None(不支持的路由)
+    """
+    is_ashare = symbol.endswith("/SH") or symbol.endswith("/SZ")
+    market = "ashare" if is_ashare else "crypto"
+    return CHART_ROUTES.get((market, timeframe))
+
+
+async def quote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler for /quote <pair> [timeframe] [n] — 从 freqtrade 容器拉 K 线图。"""
+    if not authorized(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "用法: /quote <标的> [周期] [数量]\n"
+            "默认: 周期=1h, 数量=20 根\n"
+            "例: /quote BTC/USDT\n"
+            "    /quote BTC/USDT 4h 50\n"
+            "    /quote 510300/SH 1d\n"
+            "支持: crypto(1h/4h) · A股(1h/1d)"
+        )
+        return
+
+    pair = context.args[0].upper()
+    timeframe = context.args[1] if len(context.args) > 1 else "1h"
+    try:
+        n = int(context.args[2]) if len(context.args) > 2 else 20
+    except ValueError:
+        await update.message.reply_text("数量必须是整数")
+        return
+    if n < 1 or n > 200:
+        await update.message.reply_text("数量必须在 1-200 之间")
+        return
+
+    route = _route_chart(pair, timeframe)
+    if route is None:
+        await update.message.reply_text(
+            f"不支持的周期: {timeframe}\n"
+            "crypto 支持 1h/4h, A股 支持 1h/1d"
+        )
+        return
+    host, port = route
+    url = f"http://{host}:{port}/quote"
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(url, params={"pair": pair, "tf": timeframe, "n": n})
+    except Exception as e:
+        await update.message.reply_text(f"图表服务连接失败: {e}")
+        return
+
+    if resp.status_code != 200:
+        try:
+            err = resp.json().get("error", resp.text)
+        except Exception:
+            err = resp.text
+        await update.message.reply_text(f"{pair} {timeframe}: {err}")
+        return
+
+    caption = f"{pair} {timeframe} · {n} 根 K 线"
+    try:
+        await update.message.reply_photo(photo=resp.content, caption=caption)
+    except Exception:
+        logger.warning("reply_photo failed for %s, falling back to text", pair, exc_info=True)
+        await update.message.reply_text(f"{caption}\n(图片发送失败,见日志)")
+
+
 async def pa_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
@@ -529,6 +607,9 @@ async def pa_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  手动指定: /pa_add AAPL usstock\n"
         "/pa_remove <标的> — 禁用标的\n"
         "/pa_signals [N] — 最近信号 (默认10条)\n"
+        "/quote <标的> [周期] [N] — K线图 (默认 1h、20 根)\n"
+        "  crypto: 1h/4h · A股: 1h/1d\n"
+        "  例: /quote BTC/USDT 4h 50\n"
         "/pa_status — 服务健康状态\n"
         "/pa_help — 帮助信息"
     )
@@ -621,6 +702,7 @@ async def main() -> None:
     app_tg.add_handler(CommandHandler("pa_signals", pa_signals))
     app_tg.add_handler(CommandHandler("pa_status", pa_status))
     app_tg.add_handler(CommandHandler("pa_help", pa_help))
+    app_tg.add_handler(CommandHandler("quote", quote))
 
     # HTTP API
     app_http = web.Application()
@@ -647,6 +729,7 @@ async def main() -> None:
                 BotCommand("pa_add", "添加标的"),
                 BotCommand("pa_remove", "禁用标的"),
                 BotCommand("pa_signals", "最近信号"),
+                BotCommand("quote", "查 K 线图"),
                 BotCommand("pa_status", "服务健康状态"),
                 BotCommand("pa_help", "帮助信息"),
             ])

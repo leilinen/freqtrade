@@ -8,6 +8,7 @@
   "timeframe": "1d",
   "pa_db_url": "postgresql://postgres:postgres@postgres:5432/freqtrade_monitor",
   "tg_api_url": "http://tg-bot:8090",
+  "pa_chart_port": 8094,
   "exchange": {
     "name": "ashare",
     "pair_whitelist": ["510300/SH", "159934/SZ", "588290/SH", "160644/SZ", "513650/SH", "513390/SH"]

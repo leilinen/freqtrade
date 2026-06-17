@@ -304,7 +304,6 @@ class Telegram(RPCHandler):
             CommandHandler("version", self._version),
             CommandHandler("marketdir", self._changemarketdir),
             CommandHandler("order", self._order),
-            CommandHandler("quote", self._quote),
             CommandHandler("list_custom_data", self._list_custom_data),
             CommandHandler("tg_info", self._tg_info),
             CommandHandler("profit_long", self._profit_long),
@@ -2205,78 +2204,6 @@ class Telegram(RPCHandler):
         except TelegramError as telegram_err:
             logger.warning("TelegramError: %s! Giving up on that message.", telegram_err.message)
 
-    async def _send_photo(self, photo: bytes, caption: str = "") -> None:
-        """Send a PNG photo to the configured chat. Falls back silently on error.
-
-        :param photo: PNG image bytes.
-        :param caption: Optional markdown caption.
-        """
-        if not self._app:
-            return
-        try:
-            try:
-                await self._app.bot.send_photo(
-                    chat_id=self._config["telegram"]["chat_id"],
-                    photo=photo,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    message_thread_id=self._config["telegram"].get("topic_id"),
-                )
-            except NetworkError as network_err:
-                logger.warning(
-                    "Telegram NetworkError: %s! Trying one more time.", network_err.message
-                )
-                await self._app.bot.send_photo(
-                    chat_id=self._config["telegram"]["chat_id"],
-                    photo=photo,
-                    caption=caption,
-                    parse_mode=ParseMode.MARKDOWN,
-                    message_thread_id=self._config["telegram"].get("topic_id"),
-                )
-        except TelegramError as telegram_err:
-            logger.warning("TelegramError: %s! Giving up on sending photo.", telegram_err.message)
-
-    @authorized_only
-    async def _quote(self, update: Update, context: CallbackContext) -> None:
-        """Handler for /quote <pair> [timeframe] [n].
-
-        Returns a candlestick + volume + EMA20 chart image plus a compact
-        OHLCV text table. Pair must be in the bot whitelist.
-        """
-        if not context.args:
-            await self._send_msg(
-                "Usage: `/quote <pair> [timeframe] [n]`\n"
-                "Default timeframe = bot config; default n = 20 candles."
-            )
-            return
-
-        pair = context.args[0]
-        timeframe = context.args[1] if len(context.args) > 1 else None
-        try:
-            num_candles = int(context.args[2]) if len(context.args) > 2 else 20
-        except ValueError:
-            await self._send_msg("Invalid candle count. Must be an integer.")
-            return
-        if num_candles < 1 or num_candles > 200:
-            await self._send_msg("Candle count must be between 1 and 200.")
-            return
-
-        try:
-            result = self._rpc._rpc_quote(pair, timeframe, num_candles)
-        except RPCException as e:
-            await self._send_msg(str(e))
-            return
-
-        if result["error"]:
-            await self._send_msg(result["error"])
-            return
-
-        caption = (
-            f"*{result['pair']}* `{result['timeframe']}` "
-            f"· last {result['num_candles']} candles\n\n{result['ohlcv_text']}"
-        )
-        await self._send_photo(photo=result["chart_png"], caption=caption)
-
     @authorized_only
     async def _changemarketdir(self, update: Update, context: CallbackContext) -> None:
         """
@@ -2356,3 +2283,4 @@ class Telegram(RPCHandler):
             )
         except TelegramError as telegram_err:
             logger.warning("TelegramError: %s! Giving up on that message.", telegram_err.message)
+

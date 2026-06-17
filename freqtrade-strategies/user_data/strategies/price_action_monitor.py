@@ -17,8 +17,11 @@ import json
 import logging
 import io
 import atexit
+import threading
 import time as _time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 import requests as http_requests
 
@@ -201,6 +204,7 @@ class PriceActionMonitor(IStrategy):
         super().__init__(config)
         self._pg_engine = None
         self._pg_session_factory = None
+        self._chart_http_server = None
 
     # ================================================================
     # 生命周期回调
@@ -223,9 +227,91 @@ class PriceActionMonitor(IStrategy):
 
         logger.info("PG persistence initialized: %s", db_url)
 
+        # 启动 /quote HTTP server（供 tg-bot 调用获取 K 线图）
+        chart_port = self.config.get("pa_chart_port")
+        if chart_port:
+            try:
+                self._start_chart_http_server(int(chart_port))
+            except Exception:
+                logger.warning("Failed to start chart HTTP server on port %s", chart_port, exc_info=True)
+
     def _cleanup(self) -> None:
+        if self._chart_http_server is not None:
+            try:
+                self._chart_http_server.shutdown()
+            except Exception:
+                logger.warning("Failed to shutdown chart HTTP server", exc_info=True)
+            self._chart_http_server = None
         if self._pg_engine:
             self._pg_engine.dispose()
+
+    # ================================================================
+    # Chart HTTP server (/quote endpoint)
+    # ================================================================
+
+    def _start_chart_http_server(self, port: int) -> None:
+        """启动 HTTP server 在后台线程，提供 GET /quote 返回 PNG。"""
+        strategy_ref = self
+
+        class _QuoteHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):  # 静默默认 access log
+                pass
+
+            def _send_json(self, code: int, msg: str) -> None:
+                body = json.dumps({"error": msg}).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                parsed = urlparse(self.path)
+                if parsed.path != "/quote":
+                    self._send_json(404, "Not found")
+                    return
+                qs = parse_qs(parsed.query)
+                pair = (qs.get("pair", [""])[0] or "").upper()
+                tf = qs.get("tf", [""])[0] or strategy_ref.timeframe
+                try:
+                    n = int(qs.get("n", ["20"])[0])
+                except ValueError:
+                    self._send_json(400, "n must be integer")
+                    return
+                if not pair:
+                    self._send_json(400, "pair is required")
+                    return
+                if n < 1 or n > 200:
+                    self._send_json(400, "n must be 1-200")
+                    return
+
+                try:
+                    df = strategy_ref.dp.get_pair_dataframe(pair, tf) if strategy_ref.dp else None
+                except Exception:
+                    df = None
+                if df is None or df.empty:
+                    self._send_json(404, f"No data for {pair} {tf}")
+                    return
+
+                try:
+                    png = strategy_ref._generate_chart(pair, tf, df, n)
+                except ValueError as e:
+                    self._send_json(404, str(e))
+                    return
+                except Exception as e:
+                    self._send_json(500, f"chart error: {e}")
+                    return
+
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(png)))
+                self.end_headers()
+                self.wfile.write(png)
+
+        server = ThreadingHTTPServer(("0.0.0.0", port), _QuoteHandler)
+        self._chart_http_server = server
+        threading.Thread(target=server.serve_forever, daemon=True, name="chart-http").start()
+        logger.info("Chart HTTP server listening on port %d (/quote)", port)
 
     def _init_default_pairs(self) -> None:
         """将默认标的写入 watch_pair 表（如不存在）。"""
@@ -668,15 +754,24 @@ class PriceActionMonitor(IStrategy):
     # K 线图表生成
     # ================================================================
 
-    def _generate_chart(self, pair: str, dataframe: DataFrame) -> bytes:
-        """生成最近 20 根 K 线蜡烛图 + EMA20，返回 PNG bytes。"""
+    def _generate_chart(self, pair: str, timeframe: str, dataframe: DataFrame, num_candles: int = 20) -> bytes:
+        """生成最近 num_candles 根 K 线蜡烛图 + EMA20 + 成交量，返回 PNG bytes。
+
+        EMA 在完整 dataframe 上算完再切片，避免边界 warmup 失真。
+        """
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import mplfinance as mpf
 
-        df = dataframe.tail(20).copy()
-        df = df.set_index("date")
+        if len(dataframe) < num_candles:
+            raise ValueError(
+                f"Not enough candles for {pair}: have {len(dataframe)}, need {num_candles}"
+            )
+
+        df = dataframe.copy()
+        df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+        df = df.tail(num_candles).set_index("date")
         df.index = pd.DatetimeIndex(df.index)
 
         apds = [mpf.make_addplot(df["ema20"], color="orange", width=1.5)]
@@ -685,12 +780,12 @@ class PriceActionMonitor(IStrategy):
             df,
             type="candle",
             style="charles",
-            volume=False,
+            volume=True,
             addplot=apds,
             returnfig=True,
             figratio=(16, 9),
             figscale=1.2,
-            title=f"\n{pair} {self.timeframe}",
+            title=f"\n{pair} {timeframe}",
         )
 
         buf = io.BytesIO()
@@ -750,7 +845,7 @@ class PriceActionMonitor(IStrategy):
         # 生成蜡烛图（失败不阻断通知）
         chart_png = None
         try:
-            chart_png = self._generate_chart(pair, dataframe)
+            chart_png = self._generate_chart(pair, self.timeframe, dataframe)
         except Exception:
             logger.warning("Failed to generate chart for %s", pair, exc_info=True)
 

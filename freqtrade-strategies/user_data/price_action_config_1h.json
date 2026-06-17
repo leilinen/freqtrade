@@ -8,6 +8,7 @@
   "timeframe": "1h",
   "pa_db_url": "postgresql://postgres:postgres@postgres:5432/freqtrade_monitor",
   "tg_api_url": "http://tg-bot:8090",
+  "pa_chart_port": 8091,
   "exchange": {
     "name": "okx",
     "key": "",
