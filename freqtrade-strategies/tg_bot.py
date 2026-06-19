@@ -58,14 +58,74 @@ def db_get_watch_pairs() -> list[dict]:
 
 VALID_MARKETS = {"crypto", "ashare", "usstock"}
 
+# 稳定币报价后缀(用于识别无斜杠的 crypto 写法,如 BTCUSDT)
+STABLECOIN_QUOTES = ("USDT", "USDC", "TUSD", "DAI", "FDUSD", "USD")
 
-def _detect_market(symbol: str) -> str:
-    """根据标的符号自动判断市场类型。"""
-    if symbol.endswith("/SH") or symbol.endswith("/SZ"):
-        return "ashare"
-    if "/" in symbol:
-        return "crypto"
-    return "usstock"
+# A 股交易所后缀:沪 /SH、深 /SZ、北 /BJ
+ASHARE_SUFFIXES = ("/SH", "/SZ", "/BJ")
+
+
+def _normalize_ashare_code(code: str) -> str | None:
+    """按 A 股代码前缀补 /SH、/SZ 或 /BJ 后缀。
+
+    :param code: 6 位股票/基金代码(纯数字)
+    :return: 'CODE/SH' / 'CODE/SZ' / 'CODE/BJ',无法识别前缀返回 None
+    """
+    if not code.isdigit() or len(code) != 6:
+        return None
+    # 沪市:6x 主板/科创板,5x ETF/基金(含科创板 ETF 588xxx)
+    if code[0] in ("6", "5"):
+        return f"{code}/SH"
+    # 深市:0x 主板,3x 创业板,1x ETF/基金
+    if code[0] in ("0", "3", "1"):
+        return f"{code}/SZ"
+    # 北交所:8x / 4x
+    if code[0] in ("8", "4"):
+        return f"{code}/BJ"
+    return None
+
+
+def _detect_market(symbol: str) -> tuple[str, str]:
+    """根据标的符号自动判断市场类型并归一化。
+
+    规则(按判定顺序):
+      - 空 → unknown
+      - 已带 /SH /SZ /BJ 后缀 → ashare
+      - 含 / 且 quote 是稳定币(USDT/USDC/...) → crypto
+      - 含 / 但 quote 非稳定币 → unknown(避免 588290/SS 这种误判)
+      - 纯数字 6 位 → ashare,按前缀补 /SH //SZ /BJ
+      - 以稳定币结尾无斜杠(如 BTCUSDT)→ crypto
+      - 以字母开头(允许含点/横线,如 BRK.B / BRK-B)→ usstock
+      - 其他 → unknown
+
+    :return: (market, normalized_symbol)
+    """
+    s = symbol.strip().upper()
+    if not s:
+        return ("unknown", symbol)
+    # 已带 A 股交易所后缀
+    if any(s.endswith(suf) for suf in ASHARE_SUFFIXES):
+        return ("ashare", s)
+    # 含 / 的标的:quote 必须是稳定币才算 crypto,否则判 unknown
+    if "/" in s:
+        quote = s.rsplit("/", 1)[1]
+        if quote in STABLECOIN_QUOTES:
+            return ("crypto", s)
+        return ("unknown", symbol)
+    # 纯数字 6 位 → A 股,按前缀补后缀
+    if s.isdigit() and len(s) == 6:
+        norm = _normalize_ashare_code(s)
+        if norm:
+            return ("ashare", norm)
+        return ("unknown", symbol)
+    # 以稳定币结尾(无斜杠的 crypto 写法,如 BTCUSDT)
+    for q in STABLECOIN_QUOTES:
+        if s.endswith(q) and len(s) > len(q):
+            return ("crypto", s)
+    # 以字母开头 → 美股。允许后续含字母/点/横线(如 BRK.B、BRK-B),不允许数字。
+    if s[0].isalpha() and all(c.isalpha() or c in ".-" for c in s):
+        return ("usstock", s)
+    return ("unknown", symbol)
 
 
 def _fetch_ashare_name(symbol: str) -> str | None:
@@ -110,6 +170,70 @@ def _fetch_ashare_name(symbol: str) -> str | None:
     except Exception:
         logger.warning("Tencent name lookup failed for %s", symbol, exc_info=True)
     return None
+
+
+def _verify_ashare_symbol(symbol: str) -> bool:
+    """校验 A 股标的是否存在(查得到中文名即视为存在)。"""
+    return _fetch_ashare_name(symbol) is not None
+
+
+def _verify_crypto_symbol(symbol: str) -> bool:
+    """校验 crypto 标的是否存在,查询 Binance 24h ticker。
+
+    Binance 对无效 symbol 返回 400,有效返回价格 JSON。
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        with httpx.Client(follow_redirects=True, timeout=10, headers=headers) as client:
+            resp = client.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": symbol.replace("/", "").upper()},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return bool(data.get("symbol") and data.get("price"))
+            logger.warning(
+                "Binance verify failed for %s: HTTP %s %s",
+                symbol, resp.status_code, resp.text[:200],
+            )
+    except Exception:
+        logger.warning("Crypto symbol verify failed for %s", symbol, exc_info=True)
+    return False
+
+
+def _verify_usstock_symbol(symbol: str) -> bool:
+    """校验美股标的是否存在,使用 Yahoo Finance quoteSummary 接口。
+
+    Yahoo 返回 200 + 非空 JSON 即视为存在;404/400 视为不存在。
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        with httpx.Client(follow_redirects=True, timeout=10, headers=headers) as client:
+            resp = client.get(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                result = data.get("chart", {}).get("result")
+                return bool(result)
+            logger.warning(
+                "Yahoo verify failed for %s: HTTP %s",
+                symbol, resp.status_code,
+            )
+    except Exception:
+        logger.warning("US stock symbol verify failed for %s", symbol, exc_info=True)
+    return False
+
+
+def _verify_symbol(market: str, symbol: str) -> bool:
+    """按 market 调用对应 API 校验标的真实性。"""
+    if market == "ashare":
+        return _verify_ashare_symbol(symbol)
+    if market == "crypto":
+        return _verify_crypto_symbol(symbol)
+    if market == "usstock":
+        return _verify_usstock_symbol(symbol)
+    return False
 
 
 # ================================================================
@@ -534,22 +658,47 @@ async def pa_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text(
             "用法: /pa_add <标的> [市场]\n"
-            "市场: crypto(默认) / ashare / usstock\n"
+            "市场: crypto / ashare / usstock(留空自动判定)\n"
+            "自动判定规则:\n"
+            "  纯数字(6位)→ A股(自动补/SH或/SZ)\n"
+            "  纯字母 → 美股\n"
+            "  含 / 或以 USDT/USDC 结尾 → 加密货币\n"
             "例: /pa_add BTC/USDT\n"
-            "    /pa_add 510300/SH\n"
+            "    /pa_add 588290\n"
             "    /pa_add AAPL"
         )
         return
-    symbol = context.args[0].upper()
+    raw = context.args[0]
+    explicit_market = None
     if len(context.args) > 1:
-        market = context.args[1].lower()
-        if market not in VALID_MARKETS:
-            await update.message.reply_text(f"无效市场: {market}\n可选: {', '.join(sorted(VALID_MARKETS))}")
+        explicit_market = context.args[1].lower()
+        if explicit_market not in VALID_MARKETS:
+            valid = ", ".join(sorted(VALID_MARKETS))
+            await update.message.reply_text(f"无效市场: {explicit_market}\n可选: {valid}")
             return
+    # 自动判定:得到 (market, 归一化后的 symbol)
+    detected_market, normalized = _detect_market(raw)
+    if explicit_market:
+        market = explicit_market
+        # 用户显式指定市场时,沿用归一化结果或原始输入(大写)
+        symbol = normalized if detected_market != "unknown" else raw.upper()
     else:
-        market = _detect_market(symbol)
+        if detected_market == "unknown":
+            await update.message.reply_text(
+                f"无法识别 {raw} 的市场类型\n"
+                "请用 /pa_add <标的> <crypto|ashare|usstock> 显式指定"
+            )
+            return
+        market = detected_market
+        symbol = normalized
+    # 校验标的真实存在
+    if not _verify_symbol(market, symbol):
+        await update.message.reply_text(f"标的 {symbol} 在 {market} 市场未找到,请检查代码")
+        return
     msg = db_add_pair(symbol, market)
-    await update.message.reply_text(msg + "\n提示: 等待缓存刷新生效，或发送 /reload_config 立即生效")
+    await update.message.reply_text(
+        msg + "\n提示: 等待缓存刷新生效，或发送 /reload_config 立即生效"
+    )
 
 
 async def pa_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
