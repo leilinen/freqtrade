@@ -355,6 +355,7 @@ class PriceActionMonitor(IStrategy):
         dataframe = self._detect_special_bars(dataframe)
         dataframe = self._classify_signal_quality(dataframe)
         dataframe = self._evaluate_context(dataframe)
+        dataframe = self._detect_ema20_cross(dataframe)
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -373,6 +374,12 @@ class PriceActionMonitor(IStrategy):
             else:
                 logger.debug("Scan %s %s: no signal", pair, self.timeframe)
             self._check_and_notify(pair, last, dataframe)
+
+            # EMA20 穿越检测(独立于 signal_bar,可同根 K 线并存)
+            cross = last.get("ema20_cross", "none")
+            if cross != "none":
+                self._notify_ema_cross(pair, last, dataframe, cross)
+
             self._persist_kline(pair, dataframe)
 
         return dataframe
@@ -557,6 +564,27 @@ class PriceActionMonitor(IStrategy):
 
         return df
 
+    def _detect_ema20_cross(self, df: DataFrame) -> DataFrame:
+        """标记 EMA20 穿越:上穿(long)/ 下穿(short)/ 无(none)。
+
+        上穿:前一根 close < ema20,当前 close > ema20
+        下穿:前一根 close > ema20,当前 close < ema20
+        首行因 shift(1) 产生 NaN,被视为无穿越。
+        """
+        # shift(1) 首行 NaN,NaN > x 返回 False,~False 会误判为 True。
+        # 用 fillna(False) 让首行 prev_above=False,且后续逻辑通过 & curr_above
+        # 要求 prev 必须明确为 True 或 False 才算穿越。
+        prev_above = (df["close"].shift(1) > df["ema20"].shift(1)).fillna(False)
+        prev_below = (df["close"].shift(1) < df["ema20"].shift(1)).fillna(False)
+        curr_above = df["close"] > df["ema20"]
+        curr_below = df["close"] < df["ema20"]
+        df["ema20_cross"] = "none"
+        # 上穿:prev 明确在下方 + curr 明确在上方
+        df.loc[prev_below & curr_above, "ema20_cross"] = "long"
+        # 下穿:prev 明确在上方 + curr 明确在下方
+        df.loc[prev_above & curr_below, "ema20_cross"] = "short"
+        return df
+
     # ================================================================
     # 通知 + PG 持久化
     # ================================================================
@@ -626,8 +654,14 @@ class PriceActionMonitor(IStrategy):
             types.append("doji")
         return types
 
-    def _save_signal(self, pair: str, row: pd.Series, reason: str) -> None:
-        """将信号写入 PostgreSQL。"""
+    def _save_signal(
+        self, pair: str, row: pd.Series, reason: str,
+        signal_type: str | None = None,
+    ) -> None:
+        """将信号写入 PostgreSQL。
+
+        :param signal_type: 自定义 signal_type(默认 signal_bar_{quality})
+        """
         if not self._pg_session_factory:
             return
 
@@ -655,7 +689,7 @@ class PriceActionMonitor(IStrategy):
             symbol=pair,
             timeframe=self.timeframe,
             candle_time=candle_time,
-            signal_type=f"signal_bar_{quality}",
+            signal_type=f"signal_bar_{quality}" if signal_type is None else signal_type,
             direction=direction,
             quality=quality,
             open=float(row.get("open", 0)),
@@ -824,6 +858,7 @@ class PriceActionMonitor(IStrategy):
             "timeframe": self.timeframe,
             "direction": direction,
             "quality": quality,
+            "signal_type": row.get("signal_type", f"signal_bar_{quality}"),
             "body_pct": float(row.get("body_pct", 0)),
             "close_location": float(row.get("close_location", 0)),
             "body_ratio": float(row.get("body_ratio", 0)),
@@ -868,6 +903,22 @@ class PriceActionMonitor(IStrategy):
             logger.info("Signal notified to tg-bot: %s %s %s", pair, direction, quality)
         except Exception:
             logger.warning("Failed to notify tg-bot for %s", pair, exc_info=True)
+
+    def _notify_ema_cross(
+        self, pair: str, row: pd.Series, dataframe: DataFrame, direction: str,
+    ) -> None:
+        """EMA20 穿越信号:落库 + 复用 _notify_tg_bot 发 K 线图。
+
+        :param direction: "long"(上穿)或 "short"(下穿)
+        """
+        reason = f"ema20_cross_{'up' if direction == 'long' else 'down'}"
+        # 用副本设置 signal_type / direction / quality,避免污染原 row
+        row = row.copy()
+        row["signal_direction"] = direction
+        row["signal_quality"] = "cross"
+        row["signal_type"] = "ema20_cross"
+        self._save_signal(pair, row, reason, signal_type="ema20_cross")
+        self._notify_tg_bot(pair, row, dataframe)
 
     # ================================================================
     # 消息格式化

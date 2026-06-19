@@ -509,8 +509,6 @@ def format_signal_message(data: dict) -> str:
     quality_map = {"good": "Good", "acceptable": "Acceptable", "fair": "Fair"}
     q_str = quality_map.get(quality, quality)
 
-    dir_cn = "做多" if direction == "long" else "做空"
-    arrow = "+" if direction == "long" else "-"
     symbol = data.get("symbol", "?")
     tf = data.get("timeframe", "?")
     display_name = data.get("display_name")
@@ -526,12 +524,6 @@ def format_signal_message(data: dict) -> str:
             time_str = ct.astimezone(timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
         except (ValueError, TypeError):
             time_str = ""
-    header = f"{arrow} {label} {tf}"
-    if time_str:
-        header += f" @{time_str}"
-    price = data.get("entry_price", 0)
-    sl = data.get("stop_loss", 0)
-    tp = data.get("target_price", 0)
 
     # 价格精度：根据价格大小自动选择小数位
     def fmt_price(v):
@@ -541,6 +533,25 @@ def format_signal_message(data: dict) -> str:
             return f"{v:.4f}"
         else:
             return f"{v:.6f}"
+
+    # EMA20 穿越信号走精简分支(只显示标的时间+穿越方向+价格)
+    if quality == "cross":
+        action = "上穿" if direction == "long" else "下穿"
+        arrow = "↗" if direction == "long" else "↘"
+        header = f"{arrow} {label} {tf} EMA20 {action}"
+        if time_str:
+            header += f" @{time_str}"
+        price = data.get("entry_price", 0)
+        return f"{header}\n当前价格: {fmt_price(price)}"
+
+    dir_cn = "做多" if direction == "long" else "做空"
+    arrow = "+" if direction == "long" else "-"
+    header = f"{arrow} {label} {tf}"
+    if time_str:
+        header += f" @{time_str}"
+    price = data.get("entry_price", 0)
+    sl = data.get("stop_loss", 0)
+    tp = data.get("target_price", 0)
 
     lines = [
         header,
@@ -558,7 +569,10 @@ def format_signal_message(data: dict) -> str:
 
     bar_types = data.get("bar_types", [])
     if bar_types:
-        type_map = {"surprise": "惊喜", "engulfing": "吞噬", "inside": "内包", "2k_reversal": "2K反转", "doji": "十字星"}
+        type_map = {
+            "surprise": "惊喜", "engulfing": "吞噬", "inside": "内包",
+            "2k_reversal": "2K反转", "doji": "十字星",
+        }
         type_names = [type_map.get(t, t) for t in bar_types]
         lines.append("特殊K线: " + " | ".join(type_names))
 

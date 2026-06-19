@@ -306,3 +306,86 @@ class TestDbGetSignalsBySymbol:
         assert result[0]["direction"] == "long"
         assert result[0]["quality"] == "good"
         assert result[1]["direction"] == "short"
+
+
+# ===================================================================
+# Tests: format_signal_message (EMA20 cross branch)
+# ===================================================================
+
+
+class TestFormatSignalMessageCross:
+    """Verify the concise rendering path for ema20_cross signals."""
+
+    def test_cross_up_message(self):
+        """上穿 → ↗ 符号 + EMA20 上穿 + 价格。"""
+        data = {
+            "symbol": "BTC/USDT",
+            "display_name": None,
+            "timeframe": "1h",
+            "direction": "long",
+            "quality": "cross",  # 触发精简分支
+            "signal_time": "2026-06-20T10:00:00+00:00",
+            "entry_price": 60000.0,
+        }
+        msg = tg_bot.format_signal_message(data)
+        assert "↗" in msg
+        assert "EMA20 上穿" in msg
+        assert "BTC/USDT" in msg
+        assert "当前价格" in msg
+        # 精简分支不应出现实体占比/收盘位置等形态细节
+        assert "实体占比" not in msg
+        assert "收盘位置" not in msg
+
+    def test_cross_down_message(self):
+        """下穿 → ↘ 符号 + EMA20 下穿 + 价格。"""
+        data = {
+            "symbol": "ETH/USDT",
+            "display_name": None,
+            "timeframe": "4h",
+            "direction": "short",
+            "quality": "cross",
+            "signal_time": "2026-06-20T10:00:00+00:00",
+            "entry_price": 3000.0,
+        }
+        msg = tg_bot.format_signal_message(data)
+        assert "↘" in msg
+        assert "EMA20 下穿" in msg
+        assert "ETH/USDT" in msg
+        assert "实体占比" not in msg
+
+    def test_cross_message_includes_time(self):
+        """穿越消息应该带北京时间。"""
+        data = {
+            "symbol": "588290/SH",
+            "display_name": "科创ETF",
+            "timeframe": "1d",
+            "direction": "long",
+            "quality": "cross",
+            "signal_time": "2026-06-20T02:00:00+00:00",  # 北京 10:00
+            "entry_price": 1.05,
+        }
+        msg = tg_bot.format_signal_message(data)
+        assert "@06-20 10:00" in msg
+        # 带 display_name 时应展开成 中文(symbol)
+        assert "科创ETF(588290/SH)" in msg
+
+    def test_normal_signal_message_unchanged(self):
+        """quality=good 仍走原完整路径,不应触发精简分支。"""
+        data = {
+            "symbol": "BTC/USDT",
+            "display_name": None,
+            "timeframe": "1h",
+            "direction": "long",
+            "quality": "good",
+            "signal_time": "2026-06-20T10:00:00+00:00",
+            "entry_price": 60000.0,
+            "body_pct": 0.8,
+            "close_location": 0.9,
+            "body_ratio": 1.5,
+            "stop_loss": 58000.0,
+            "target_price": 64000.0,
+        }
+        msg = tg_bot.format_signal_message(data)
+        assert "做多" in msg
+        assert "实体占比" in msg
+        assert "止损" in msg

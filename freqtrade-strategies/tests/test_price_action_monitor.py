@@ -635,3 +635,87 @@ class TestMarketAttribute:
         session = s._pg_session_factory.return_value.__enter__.return_value
         added_signal = session.add.call_args[0][0]
         assert added_signal.market == "crypto"
+
+
+# ===================================================================
+# Tests: _detect_ema20_cross
+# ===================================================================
+
+
+def _make_ema_df(closes, ema_vals):
+    """Build a minimal df with close + ema20 columns for cross detection."""
+    return pd.DataFrame({
+        "close": closes,
+        "ema20": ema_vals,
+    })
+
+
+class TestDetectEma20Cross:
+    """Unit tests for EMA20 crossover detection."""
+
+    def test_cross_up(self):
+        """prev_close < prev_ema20 and curr_close > curr_ema20 → long."""
+        df = _make_ema_df(
+            closes=[95.0, 105.0],   # 95 < 100, 105 > 100
+            ema_vals=[100.0, 100.0],
+        )
+        s = _make_strategy()
+        s._detect_ema20_cross(df)
+        assert df.loc[1, "ema20_cross"] == "long"
+
+    def test_cross_down(self):
+        """prev_close > prev_ema20 and curr_close < curr_ema20 → short."""
+        df = _make_ema_df(
+            closes=[105.0, 95.0],   # 105 > 100, 95 < 100
+            ema_vals=[100.0, 100.0],
+        )
+        s = _make_strategy()
+        s._detect_ema20_cross(df)
+        assert df.loc[1, "ema20_cross"] == "short"
+
+    def test_no_cross_when_above_both(self):
+        """prev above and curr above → none."""
+        df = _make_ema_df(
+            closes=[105.0, 110.0],
+            ema_vals=[100.0, 100.0],
+        )
+        s = _make_strategy()
+        s._detect_ema20_cross(df)
+        assert df.loc[1, "ema20_cross"] == "none"
+
+    def test_no_cross_when_below_both(self):
+        """prev below and curr below → none."""
+        df = _make_ema_df(
+            closes=[95.0, 90.0],
+            ema_vals=[100.0, 100.0],
+        )
+        s = _make_strategy()
+        s._detect_ema20_cross(df)
+        assert df.loc[1, "ema20_cross"] == "none"
+
+    def test_first_row_always_none(self):
+        """First row has no prev (NaN from shift), should not trigger a cross."""
+        df = _make_ema_df(
+            closes=[105.0, 95.0],
+            ema_vals=[100.0, 100.0],
+        )
+        s = _make_strategy()
+        s._detect_ema20_cross(df)
+        # First row cannot cross — no previous bar
+        assert df.loc[0, "ema20_cross"] == "none"
+
+    def test_multi_bar_sequence(self):
+        """A sequence with a clear up-cross then later a down-cross."""
+        closes = [95.0, 95.0, 105.0, 110.0, 95.0]
+        ema_vals = [100.0] * 5
+        df = _make_ema_df(closes, ema_vals)
+        s = _make_strategy()
+        s._detect_ema20_cross(df)
+        # row 2: prev 95<100, curr 105>100 → long
+        # row 4: prev 110>100, curr 95<100 → short
+        assert df.loc[2, "ema20_cross"] == "long"
+        assert df.loc[4, "ema20_cross"] == "short"
+        # row 1 (95→95): both below → none
+        assert df.loc[1, "ema20_cross"] == "none"
+        # row 3 (105→110): both above → none
+        assert df.loc[3, "ema20_cross"] == "none"
