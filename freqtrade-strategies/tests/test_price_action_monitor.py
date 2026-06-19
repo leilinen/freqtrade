@@ -504,3 +504,134 @@ class TestCheckAndNotifyDataframe:
         mock_notify.assert_called_once()
         # Third argument should be the dataframe
         assert mock_notify.call_args[0][2] is df
+
+
+# ===================================================================
+# Tests: _market attribute and _save_signal market field
+# ===================================================================
+
+
+class TestMarketAttribute:
+    """Verify that self._market is correctly derived from config and
+    passed through to saved signals."""
+
+    def test_default_market_is_crypto(self):
+        """__init__ should set _market = 'crypto' as default."""
+        s = PriceActionMonitor(config={})
+        assert s._market == "crypto"
+
+    def test_ashare_config_sets_market(self):
+        """When config exchange.name is 'ashare', _init_default_pairs should set
+        self._market = 'ashare'."""
+        s = PriceActionMonitor(config={"exchange": {"name": "ashare", "pair_whitelist": []}})
+        s.timeframe = "1h"
+        # Mock PG session so _init_default_pairs doesn't fail
+        mock_session = MagicMock()
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__ = MagicMock(return_value=mock_session)
+        mock_ctx.__exit__ = MagicMock(return_value=False)
+        s._pg_session_factory = MagicMock(return_value=mock_ctx)
+        # Need to stub the ashare name import
+        with patch.dict("sys.modules", {"freqtrade.exchange.ashare": MagicMock()}):
+            s._init_default_pairs()
+        assert s._market == "ashare"
+
+    def test_crypto_config_sets_market(self):
+        """When config exchange.name is 'okx' (or missing), _market stays 'crypto'."""
+        s = PriceActionMonitor(config={"exchange": {"name": "okx"}})
+        s.timeframe = "1h"
+        mock_session = MagicMock()
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__ = MagicMock(return_value=mock_session)
+        mock_ctx.__exit__ = MagicMock(return_value=False)
+        s._pg_session_factory = MagicMock(return_value=mock_ctx)
+        s._init_default_pairs()
+        assert s._market == "crypto"
+
+    def test_empty_config_market_stays_crypto(self):
+        """When no exchange config, _market should remain default 'crypto'."""
+        s = PriceActionMonitor(config={})
+        s.timeframe = "1h"
+        mock_session = MagicMock()
+        mock_ctx = MagicMock()
+        mock_ctx.__enter__ = MagicMock(return_value=mock_session)
+        mock_ctx.__exit__ = MagicMock(return_value=False)
+        s._pg_session_factory = MagicMock(return_value=mock_ctx)
+        s._init_default_pairs()
+        assert s._market == "crypto"
+
+    def test_save_signal_uses_self_market(self):
+        """_save_signal should use self._market, not hardcoded 'crypto'."""
+        s = _make_strategy()
+        # Simulate an ashare container
+        s._market = "ashare"
+        s.timeframe = "1h"
+
+        row = pd.Series({
+            "signal_quality": "good",
+            "signal_direction": "long",
+            "body_pct": 0.8,
+            "close_location": 0.9,
+            "body_ratio": 1.5,
+            "above_ema20": True,
+            "ema_gap": 0.5,
+            "bull_strength_5": 0.7,
+            "close": 42000.0,
+            "low": 41800.0,
+            "high": 42100.0,
+            "open": 41900.0,
+            "volume": 100.0,
+            "ema20": 41950.0,
+            "atr14": 200.0,
+            "ema20_position": 0.6,
+            "is_inside": False,
+            "is_engulfing": False,
+            "is_surprise": False,
+            "is_2k_reversal": False,
+            "is_doji": False,
+            "date": pd.Timestamp("2025-06-18 10:00", tz="UTC"),
+        })
+
+        s._save_signal("588290/SH", row, "test_reason")
+
+        # Get the PaSignal object added to the mock session
+        session = s._pg_session_factory.return_value.__enter__.return_value
+        added_signal = session.add.call_args[0][0]
+        assert added_signal.market == "ashare"
+
+    def test_save_signal_crypto_market(self):
+        """_save_signal with default crypto market should save market='crypto'."""
+        s = _make_strategy()
+        # Default is crypto, no need to set
+        assert s._market == "crypto"
+
+        row = pd.Series({
+            "signal_quality": "good",
+            "signal_direction": "short",
+            "body_pct": 0.6,
+            "close_location": 0.2,
+            "body_ratio": 0.8,
+            "above_ema20": False,
+            "ema_gap": -0.3,
+            "bull_strength_5": 0.3,
+            "close": 50000.0,
+            "low": 49500.0,
+            "high": 50500.0,
+            "open": 50200.0,
+            "volume": 200.0,
+            "ema20": 50100.0,
+            "atr14": 500.0,
+            "ema20_position": 0.4,
+            "is_inside": False,
+            "is_engulfing": False,
+            "is_surprise": False,
+            "is_2k_reversal": False,
+            "is_doji": False,
+            "date": pd.Timestamp("2025-06-18 10:00", tz="UTC"),
+        })
+
+        s._save_signal("BTC/USDT", row, "test_reason")
+
+        session = s._pg_session_factory.return_value.__enter__.return_value
+        added_signal = session.add.call_args[0][0]
+        assert added_signal.market == "crypto"

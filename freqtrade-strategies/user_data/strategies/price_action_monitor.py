@@ -205,6 +205,7 @@ class PriceActionMonitor(IStrategy):
         self._pg_engine = None
         self._pg_session_factory = None
         self._chart_http_server = None
+        self._market = "crypto"
 
     # ================================================================
     # 生命周期回调
@@ -322,6 +323,7 @@ class PriceActionMonitor(IStrategy):
         else:
             pairs = DEFAULT_PAIRS
             market = "crypto"
+        self._market = market
 
         with self._pg_session_factory() as session:
             for symbol in pairs:
@@ -649,7 +651,7 @@ class PriceActionMonitor(IStrategy):
             candle_time = datetime.now(timezone.utc)
 
         signal = PaSignal(
-            market="crypto",
+            market=self._market,
             symbol=pair,
             timeframe=self.timeframe,
             candle_time=candle_time,
