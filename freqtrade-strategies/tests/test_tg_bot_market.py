@@ -239,3 +239,70 @@ class TestVerifySymbolDispatch:
 
     def test_unknown_market_returns_false(self):
         assert tg_bot._verify_symbol("unknown", "WHATEVER") is False
+
+
+# ===================================================================
+# Tests: db_get_signals_by_symbol
+# ===================================================================
+
+
+class TestDbGetSignalsBySymbol:
+    """Verify db_get_signals_by_symbol passes correct SQL and params."""
+
+    def _mock_engine(self, rows):
+        """Create a mock db_engine whose .connect() returns a context manager.
+        `rows` is the list of tuples that fetchall() should return."""
+        mock_result = MagicMock()
+        mock_result.fetchall.return_value = rows
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value = mock_result
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_engine = MagicMock()
+        mock_engine.connect.return_value = mock_conn
+        return mock_engine, mock_conn
+
+    def test_passes_symbol_and_limit_params(self):
+        rows = [("BTC/USDT", "1h", "long", "good", 0.85,
+                 MagicMock(tzinfo=None), "strong_bar")]
+        mock_engine, mock_conn = self._mock_engine(rows)
+        with patch.object(tg_bot, "db_engine", mock_engine):
+            result = tg_bot.db_get_signals_by_symbol("BTC/USDT", 5)
+        # Verify execute was called with 2 positional args (text() + params dict)
+        mock_conn.execute.assert_called_once()
+        call_args = mock_conn.execute.call_args
+        # Verify params dict contains correct symbol and limit
+        params = call_args[0][1]
+        assert params["s"] == "BTC/USDT"
+        assert params["limit"] == 5
+
+    def test_clamps_limit_to_30(self):
+        rows = [("BTC/USDT", "1h", "long", "good", 0.85,
+                 MagicMock(tzinfo=None), "strong_bar")]
+        mock_engine, mock_conn = self._mock_engine(rows)
+        with patch.object(tg_bot, "db_engine", mock_engine):
+            tg_bot.db_get_signals_by_symbol("BTC/USDT", 100)
+        params = mock_conn.execute.call_args[0][1]
+        assert params["limit"] == 30
+
+    def test_returns_empty_when_no_rows(self):
+        mock_engine, _ = self._mock_engine([])
+        with patch.object(tg_bot, "db_engine", mock_engine):
+            result = tg_bot.db_get_signals_by_symbol("NONEXIST", 10)
+        assert result == []
+
+    def test_returns_dicts_from_rows(self):
+        candle_time = MagicMock()
+        candle_time.tzinfo = None
+        rows = [
+            ("588290/SH", "1h", "long", "good", 0.85, candle_time, "strong_bar"),
+            ("588290/SH", "1h", "short", "fair", 0.42, candle_time, "doji"),
+        ]
+        mock_engine, _ = self._mock_engine(rows)
+        with patch.object(tg_bot, "db_engine", mock_engine):
+            result = tg_bot.db_get_signals_by_symbol("588290/SH", 10)
+        assert len(result) == 2
+        assert result[0]["symbol"] == "588290/SH"
+        assert result[0]["direction"] == "long"
+        assert result[0]["quality"] == "good"
+        assert result[1]["direction"] == "short"

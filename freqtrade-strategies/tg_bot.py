@@ -412,6 +412,36 @@ def db_get_signals(limit: int = 10) -> list[dict]:
     ]
 
 
+def db_get_signals_by_symbol(symbol: str, limit: int = 10) -> list[dict]:
+    """按 symbol 过滤的历史信号告警记录,最近的在前。
+
+    :param symbol: 标的符号(调用方负责大写化,与 pa_signal.symbol 列一致)
+    :param limit: 返回条数上限,实际会 clamp 到 30
+    """
+    limit = min(limit, 30)
+    with db_engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT symbol, timeframe, direction, quality, body_pct, "
+                "candle_time, bar_types FROM pa_signal "
+                "WHERE symbol = :s ORDER BY created_at DESC LIMIT :limit"
+            ),
+            {"s": symbol, "limit": limit},
+        ).fetchall()
+    return [
+        {
+            "symbol": r[0],
+            "timeframe": r[1],
+            "direction": r[2],
+            "quality": r[3],
+            "body_pct": r[4],
+            "candle_time": r[5],
+            "bar_types": r[6],
+        }
+        for r in rows
+    ]
+
+
 # ================================================================
 # Signal notification (HTTP POST handler)
 # ================================================================
@@ -745,7 +775,46 @@ async def pa_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines))
 
 
-async def pa_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def pa_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """按标的查看历史信号告警记录。"""
+    if not authorized(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "用法: /pa_history <标的> [N]\n"
+            "例: /pa_history BTC/USDT 10\n"
+            "    /pa_history 588290/SH"
+        )
+        return
+    symbol = context.args[0].upper()
+    limit = 10
+    if len(context.args) > 1:
+        try:
+            limit = int(context.args[1])
+        except ValueError:
+            await update.message.reply_text("数量必须是整数")
+            return
+    signals = db_get_signals_by_symbol(symbol, limit)
+    if not signals:
+        await update.message.reply_text(f"{symbol} 暂无信号记录")
+        return
+    tz_shanghai = timezone(timedelta(hours=8))
+    lines = [f"{symbol} 最近 {len(signals)} 条信号:"]
+    for s in signals:
+        ct = s["candle_time"]
+        if ct:
+            if ct.tzinfo is None:
+                ct = ct.replace(tzinfo=timezone.utc)
+            time_str = ct.astimezone(tz_shanghai).strftime("%m/%d %H:%M")
+        else:
+            time_str = "?"
+        dir_cn = "多" if s["direction"] == "long" else "空"
+        lines.append(
+            f"{time_str} {s['timeframe']} "
+            f"{dir_cn} [{s['quality']}] "
+            f"实体={s['body_pct']:.2f}"
+        )
+    await update.message.reply_text("\n".join(lines))
     if not authorized(update):
         return
     await update.message.reply_text(
@@ -756,6 +825,7 @@ async def pa_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  手动指定: /pa_add AAPL usstock\n"
         "/pa_remove <标的> — 禁用标的\n"
         "/pa_signals [N] — 最近信号 (默认10条)\n"
+        "/pa_history <标的> [N] — 某标的信号历史 (默认10条)\n"
         "/quote <标的> [周期] [N] — K线图 (默认 1h、20 根)\n"
         "  crypto: 1h/4h · A股: 1h/1d\n"
         "  例: /quote BTC/USDT 4h 50\n"
@@ -849,6 +919,7 @@ async def main() -> None:
     app_tg.add_handler(CommandHandler("pa_add", pa_add))
     app_tg.add_handler(CommandHandler("pa_remove", pa_remove))
     app_tg.add_handler(CommandHandler("pa_signals", pa_signals))
+    app_tg.add_handler(CommandHandler("pa_history", pa_history))
     app_tg.add_handler(CommandHandler("pa_status", pa_status))
     app_tg.add_handler(CommandHandler("pa_help", pa_help))
     app_tg.add_handler(CommandHandler("quote", quote))
@@ -878,6 +949,7 @@ async def main() -> None:
                 BotCommand("pa_add", "添加标的"),
                 BotCommand("pa_remove", "禁用标的"),
                 BotCommand("pa_signals", "最近信号"),
+                BotCommand("pa_history", "标的信号历史"),
                 BotCommand("quote", "查 K 线图"),
                 BotCommand("pa_status", "服务健康状态"),
                 BotCommand("pa_help", "帮助信息"),
