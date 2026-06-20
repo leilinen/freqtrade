@@ -829,6 +829,10 @@ async def pa_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"实体={s['body_pct']:.2f}"
         )
     await update.message.reply_text("\n".join(lines))
+
+
+async def pa_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """显示帮助信息。"""
     if not authorized(update):
         return
     await update.message.reply_text(
