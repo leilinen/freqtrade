@@ -313,7 +313,7 @@ class TestDbGetSignalsBySymbol:
 
     def test_passes_symbol_and_limit_params(self):
         rows = [("BTC/USDT", "1h", "long", "good", 0.85,
-                 MagicMock(tzinfo=None), "strong_bar")]
+                 MagicMock(tzinfo=None), "strong_bar", 65000.0)]
         mock_engine, mock_conn = self._mock_engine(rows)
         with patch.object(tg_bot, "db_engine", mock_engine):
             result = tg_bot.db_get_signals_by_symbol("BTC/USDT", 5)
@@ -327,7 +327,7 @@ class TestDbGetSignalsBySymbol:
 
     def test_clamps_limit_to_30(self):
         rows = [("BTC/USDT", "1h", "long", "good", 0.85,
-                 MagicMock(tzinfo=None), "strong_bar")]
+                 MagicMock(tzinfo=None), "strong_bar", 65000.0)]
         mock_engine, mock_conn = self._mock_engine(rows)
         with patch.object(tg_bot, "db_engine", mock_engine):
             tg_bot.db_get_signals_by_symbol("BTC/USDT", 100)
@@ -344,8 +344,8 @@ class TestDbGetSignalsBySymbol:
         candle_time = MagicMock()
         candle_time.tzinfo = None
         rows = [
-            ("588290/SH", "1h", "long", "good", 0.85, candle_time, "strong_bar"),
-            ("588290/SH", "1h", "short", "fair", 0.42, candle_time, "doji"),
+            ("588290/SH", "1h", "long", "good", 0.85, candle_time, "strong_bar", 1.234),
+            ("588290/SH", "1h", "short", "fair", 0.42, candle_time, "doji", 1.100),
         ]
         mock_engine, _ = self._mock_engine(rows)
         with patch.object(tg_bot, "db_engine", mock_engine):
@@ -354,7 +354,9 @@ class TestDbGetSignalsBySymbol:
         assert result[0]["symbol"] == "588290/SH"
         assert result[0]["direction"] == "long"
         assert result[0]["quality"] == "good"
+        assert result[0]["entry_price"] == 1.234
         assert result[1]["direction"] == "short"
+        assert result[1]["entry_price"] == 1.100
 
 
 # ===================================================================
@@ -363,30 +365,33 @@ class TestDbGetSignalsBySymbol:
 
 
 class TestFormatSignalMessageCross:
-    """Verify the concise rendering path for ema20_cross signals."""
+    """Verify EMA20 cross signals use the full format (same as signal bar)."""
 
-    def test_cross_up_message(self):
-        """上穿 → ↗ 符号 + EMA20 上穿 + 价格。"""
+    def test_cross_up_uses_full_format(self):
+        """上穿EMA20 → 方向文本'上穿EMA20做多' + 完整指标行。"""
         data = {
             "symbol": "BTC/USDT",
             "display_name": None,
             "timeframe": "1h",
             "direction": "long",
-            "quality": "cross",  # 触发精简分支
+            "quality": "cross",
             "signal_time": "2026-06-20T10:00:00+00:00",
             "entry_price": 60000.0,
+            "body_pct": 0.8,
+            "close_location": 0.9,
+            "body_ratio": 1.5,
+            "stop_loss": 58000.0,
+            "target_price": 64000.0,
         }
         msg = tg_bot.format_signal_message(data)
-        assert "↗" in msg
-        assert "EMA20 上穿" in msg
-        assert "BTC/USDT" in msg
-        assert "当前价格" in msg
-        # 精简分支不应出现实体占比/收盘位置等形态细节
-        assert "实体占比" not in msg
-        assert "收盘位置" not in msg
+        assert "上穿EMA20做多" in msg
+        assert "[Cross]" in msg
+        assert "当前价格: 60000.00" in msg
+        assert "实体占比=0.80" in msg
+        assert "止损 58000.00" in msg
 
-    def test_cross_down_message(self):
-        """下穿 → ↘ 符号 + EMA20 下穿 + 价格。"""
+    def test_cross_down_uses_full_format(self):
+        """下穿EMA20 → 方向文本'下穿EMA20做空' + 完整指标行。"""
         data = {
             "symbol": "ETH/USDT",
             "display_name": None,
@@ -395,12 +400,16 @@ class TestFormatSignalMessageCross:
             "quality": "cross",
             "signal_time": "2026-06-20T10:00:00+00:00",
             "entry_price": 3000.0,
+            "body_pct": 0.6,
+            "close_location": 0.7,
+            "body_ratio": 1.2,
+            "stop_loss": 3100.0,
+            "target_price": 2800.0,
         }
         msg = tg_bot.format_signal_message(data)
-        assert "↘" in msg
-        assert "EMA20 下穿" in msg
-        assert "ETH/USDT" in msg
-        assert "实体占比" not in msg
+        assert "下穿EMA20做空" in msg
+        assert "[Cross]" in msg
+        assert "实体占比=0.60" in msg
 
     def test_cross_message_includes_time(self):
         """穿越消息应该带北京时间。"""
@@ -412,6 +421,9 @@ class TestFormatSignalMessageCross:
             "quality": "cross",
             "signal_time": "2026-06-20T02:00:00+00:00",  # 北京 10:00
             "entry_price": 1.05,
+            "body_pct": 0.5,
+            "close_location": 0.6,
+            "body_ratio": 1.0,
         }
         msg = tg_bot.format_signal_message(data)
         assert "@06-20 10:00" in msg
@@ -438,3 +450,24 @@ class TestFormatSignalMessageCross:
         assert "做多" in msg
         assert "实体占比" in msg
         assert "止损" in msg
+
+
+# ===================================================================
+# Tests: fmt_price
+# ===================================================================
+
+
+class TestFmtPrice:
+    """Verify price formatting precision by magnitude."""
+
+    def test_large_price(self):
+        assert tg_bot.fmt_price(65000.0) == "65000.00"
+
+    def test_medium_price(self):
+        assert tg_bot.fmt_price(3000.0) == "3000.00"
+
+    def test_small_price(self):
+        assert tg_bot.fmt_price(1.2345) == "1.2345"
+
+    def test_tiny_price(self):
+        assert tg_bot.fmt_price(0.000123) == "0.000123"

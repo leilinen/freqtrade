@@ -394,7 +394,7 @@ def db_get_signals(limit: int = 10) -> list[dict]:
         rows = conn.execute(
             text(
                 "SELECT symbol, timeframe, direction, quality, body_pct, "
-                "candle_time, bar_types FROM pa_signal "
+                "candle_time, bar_types, entry_price FROM pa_signal "
                 "ORDER BY created_at DESC LIMIT :limit"
             ),
             {"limit": limit},
@@ -408,6 +408,7 @@ def db_get_signals(limit: int = 10) -> list[dict]:
             "body_pct": r[4],
             "candle_time": r[5],
             "bar_types": r[6],
+            "entry_price": r[7],
         }
         for r in rows
     ]
@@ -424,7 +425,7 @@ def db_get_signals_by_symbol(symbol: str, limit: int = 10) -> list[dict]:
         rows = conn.execute(
             text(
                 "SELECT symbol, timeframe, direction, quality, body_pct, "
-                "candle_time, bar_types FROM pa_signal "
+                "candle_time, bar_types, entry_price FROM pa_signal "
                 "WHERE symbol = :s ORDER BY created_at DESC LIMIT :limit"
             ),
             {"s": symbol, "limit": limit},
@@ -438,6 +439,7 @@ def db_get_signals_by_symbol(symbol: str, limit: int = 10) -> list[dict]:
             "body_pct": r[4],
             "candle_time": r[5],
             "bar_types": r[6],
+            "entry_price": r[7],
         }
         for r in rows
     ]
@@ -507,7 +509,7 @@ def format_signal_message(data: dict) -> str:
     """格式化信号推送消息（中文）。"""
     direction = data.get("direction", "?").lower()
     quality = data.get("quality", "?")
-    quality_map = {"good": "Good", "acceptable": "Acceptable", "fair": "Fair"}
+    quality_map = {"good": "Good", "acceptable": "Acceptable", "fair": "Fair", "cross": "Cross"}
     q_str = quality_map.get(quality, quality)
 
     symbol = data.get("symbol", "?")
@@ -535,17 +537,12 @@ def format_signal_message(data: dict) -> str:
         else:
             return f"{v:.6f}"
 
-    # EMA20 穿越信号走精简分支(只显示标的时间+穿越方向+价格)
+    # EMA20 穿越信号与信号kk共用完整格式,方向文本区分
     if quality == "cross":
-        action = "上穿" if direction == "long" else "下穿"
-        arrow = "↗" if direction == "long" else "↘"
-        header = f"{arrow} {label} {tf} EMA20 {action}"
-        if time_str:
-            header += f" @{time_str}"
-        price = data.get("entry_price", 0)
-        return f"{header}\n当前价格: {fmt_price(price)}"
-
-    dir_cn = "做多" if direction == "long" else "做空"
+        dir_cn = ("上穿EMA20做多" if direction == "long"
+                  else "下穿EMA20做空")
+    else:
+        dir_cn = "做多" if direction == "long" else "做空"
     arrow = "+" if direction == "long" else "-"
     header = f"{arrow} {label} {tf}"
     if time_str:
@@ -790,6 +787,16 @@ async def pa_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines))
 
 
+def fmt_price(v: float) -> str:
+    """根据价格大小自动选择小数位。"""
+    if v >= 1000:
+        return f"{v:.2f}"
+    elif v >= 1:
+        return f"{v:.4f}"
+    else:
+        return f"{v:.6f}"
+
+
 async def pa_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """按标的查看历史信号告警记录。"""
     if not authorized(update):
@@ -824,9 +831,12 @@ async def pa_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         else:
             time_str = "?"
         dir_cn = "多" if s["direction"] == "long" else "空"
+        ep = s["entry_price"]
+        price_str = fmt_price(ep) if ep else "-"
         lines.append(
             f"{time_str} {s['timeframe']} "
             f"{dir_cn} [{s['quality']}] "
+            f"入场={price_str} "
             f"实体={s['body_pct']:.2f}"
         )
     await update.message.reply_text("\n".join(lines))
