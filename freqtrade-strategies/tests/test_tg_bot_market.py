@@ -10,6 +10,7 @@ Run from repo root:
 import os
 import sys
 import types
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -239,6 +240,54 @@ class TestVerifySymbolDispatch:
 
     def test_unknown_market_returns_false(self):
         assert tg_bot._verify_symbol("unknown", "WHATEVER") is False
+
+
+# ===================================================================
+# Tests: A-share health-check threshold
+# ===================================================================
+
+
+class TestHealthThreshold:
+    """A 股未开市时不应触发 K 线健康检查告警。"""
+
+    def test_ashare_weekend_skips_check(self):
+        # 2026-06-13 10:05 Beijing is Saturday.
+        now = datetime(2026, 6, 13, 2, 5, tzinfo=timezone.utc)
+        with patch.object(tg_bot, "_refresh_trade_days", return_value={"2026-06-12"}):
+            threshold, note = tg_bot._health_threshold("ashare", "1h", now)
+        assert threshold is None
+        assert note == "周末"
+
+    def test_ashare_weekday_holiday_skips_check(self):
+        # Calendar knows this weekday is not a trading day.
+        now = datetime(2026, 6, 9, 2, 5, tzinfo=timezone.utc)
+        with patch.object(tg_bot, "_refresh_trade_days", return_value={"2026-06-08"}):
+            threshold, note = tg_bot._health_threshold("ashare", "1h", now)
+        assert threshold is None
+        assert note == "休市日"
+
+    def test_ashare_trade_day_before_open_skips_check(self):
+        # 2026-06-08 09:05 Beijing: trade day, but no new intraday K-line is expected yet.
+        now = datetime(2026, 6, 8, 1, 5, tzinfo=timezone.utc)
+        with patch.object(tg_bot, "_refresh_trade_days", return_value={"2026-06-08"}):
+            threshold, note = tg_bot._health_threshold("ashare", "1h", now)
+        assert threshold is None
+        assert note == "非交易时段"
+
+    def test_ashare_trade_day_lunch_break_skips_check(self):
+        # 2026-06-08 12:05 Beijing: lunch break.
+        now = datetime(2026, 6, 8, 4, 5, tzinfo=timezone.utc)
+        with patch.object(tg_bot, "_refresh_trade_days", return_value={"2026-06-08"}):
+            threshold, note = tg_bot._health_threshold("ashare", "1h", now)
+        assert threshold is None
+        assert note == "非交易时段"
+
+    def test_ashare_trading_session_uses_timeframe_threshold(self):
+        # 2026-06-08 10:05 Beijing: actively trading.
+        now = datetime(2026, 6, 8, 2, 5, tzinfo=timezone.utc)
+        with patch.object(tg_bot, "_refresh_trade_days", return_value={"2026-06-08"}):
+            assert tg_bot._health_threshold("ashare", "1h", now) == (5, "")
+            assert tg_bot._health_threshold("ashare", "1d", now) == (36, "")
 
 
 # ===================================================================

@@ -317,11 +317,13 @@ def is_ashare_trading_day(now_utc: datetime) -> tuple[bool, str]:
     return False, "休市日" if wd < 5 else "周末"
 
 
-def _health_threshold(market: str, tf: str, now_utc: datetime) -> tuple[int, str]:
+def _health_threshold(market: str, tf: str, now_utc: datetime) -> tuple[int | None, str]:
     """根据市场和当前时间返回健康检查阈值（小时）及说明。
 
-    A 股：用 sh000001 交易日历判定是否交易日；非交易日放宽阈值，避免误报。
+    A 股：用 sh000001 交易日历判定是否交易日；未开市时暂停检查，避免误报。
     crypto 全天交易，使用固定阈值。
+
+    :return: (threshold_hours, note). threshold_hours 为 None 时表示当前无需检查。
     """
     if market == "ashare":
         tz_sh = timezone(timedelta(hours=8))
@@ -333,10 +335,9 @@ def _health_threshold(market: str, tf: str, now_utc: datetime) -> tuple[int, str
             or dt_time(13, 0) <= t <= dt_time(15, 0)
         )
         if not is_trading:
-            # 非交易时段：用日历的 day_reason（休市日 / 周末 / fallback-weekday）
-            # 作为说明，方便从告警里看出到底是节假日还是普通盘后
+            # 非交易时段无需期待新 K 线；用 day_reason 区分节假日/周末/普通盘前盘后。
             note = day_reason if day_reason != "trading-day" else "非交易时段"
-            return 72, note
+            return None, note
         if tf == "1h":
             return 5, ""
         if tf == "1d":
@@ -876,33 +877,17 @@ async def pa_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         age_hours = (now - last_candle).total_seconds() / 3600
         local_str = last_candle.astimezone(tz_shanghai).strftime("%m/%d %H:%M")
 
-        # A 股非交易时段不算异常
         if market == "ashare":
-            local_now = now.astimezone(tz_shanghai)
-            weekday = local_now.weekday()
-            t = local_now.time()
-            is_trading = weekday < 5 and (
-                dt_time(9, 30) <= t <= dt_time(11, 30)
-                or dt_time(13, 0) <= t <= dt_time(15, 0)
-            )
-            if not is_trading:
-                threshold = 72  # 非交易时段放宽到 72 小时
-            elif tf == "1h":
-                threshold = 5
-            elif tf == "1d":
-                threshold = 36
-            else:
-                threshold = 48
+            threshold, note = _health_threshold(market, tf, now)
+        elif tf == "1h":
+            threshold, note = 3, ""
+        elif tf == "4h":
+            threshold, note = 12, ""
         else:
-            # crypto 阈值
-            if tf == "1h":
-                threshold = 3
-            elif tf == "4h":
-                threshold = 12
-            else:
-                threshold = 24
-
-        if age_hours > threshold:
+            threshold, note = 24, ""
+        if threshold is None:
+            status = f"暂停检查({note})"
+        elif age_hours > threshold:
             status = f"⚠ 超过 {age_hours:.0f}h 无信号"
             has_alert = True
         else:
@@ -1016,6 +1001,11 @@ async def main() -> None:
                         last_candle = last_candle.replace(tzinfo=timezone.utc)
                     age_hours = (now - last_candle).total_seconds() / 3600
                     threshold, note = _health_threshold(market, tf, now)
+                    if threshold is None:
+                        logger.debug(
+                            "Skip health check for %s %s: %s", market, tf, note
+                        )
+                        continue
                     if age_hours > threshold:
                         tag = "A股" if market == "ashare" else "Crypto"
                         suffix = f", {note}" if note else ""
