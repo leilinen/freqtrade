@@ -432,7 +432,7 @@ class TestNotifyTgBotChart:
         s._notify_tg_bot("BTC/USDT", row, df)
 
         # Verify chart was generated
-        mock_chart.assert_called_once_with("BTC/USDT", df)
+        mock_chart.assert_called_once_with("BTC/USDT", "1h", df)
 
         # Verify POST was called with multipart
         mock_post.assert_called_once()
@@ -488,8 +488,8 @@ class TestCheckAndNotifyDataframe:
 
     @patch.object(PriceActionMonitor, "_notify_tg_bot")
     @patch.object(PriceActionMonitor, "_save_signal")
-    def test_passes_dataframe_to_notify(self, mock_save, mock_notify):
-        """_check_and_notify should pass dataframe to _notify_tg_bot."""
+    def test_candidate_waits_without_save_or_immediate_notify(self, mock_save, mock_notify):
+        """A fresh signal bar waits for follow-through without polluting signal history."""
         s = _make_strategy()
         df = _make_ohlcv_df(25)
         # Make the last row a "good long" signal that passes EMA filter
@@ -501,9 +501,64 @@ class TestCheckAndNotifyDataframe:
 
         s._check_and_notify("BTC/USDT", last, df)
 
+        mock_save.assert_not_called()
+        mock_notify.assert_not_called()
+
+    @patch.object(PriceActionMonitor, "_notify_tg_bot")
+    @patch.object(PriceActionMonitor, "_save_signal", return_value=True)
+    def test_confirmed_candidate_passes_dataframe_to_notify(self, mock_save, mock_notify):
+        """A prior candidate with follow-through should be saved as confirmed and notified."""
+        s = _make_strategy()
+        df = _make_ohlcv_df(25)
+        df["signal_quality"] = "none"
+        df["signal_direction"] = "none"
+        idx = len(df) - 2
+        df.loc[idx, "open"] = 100.0
+        df.loc[idx, "high"] = 102.0
+        df.loc[idx, "low"] = 99.0
+        df.loc[idx, "close"] = 101.8
+        df.loc[idx, "signal_quality"] = "good"
+        df.loc[idx, "signal_direction"] = "long"
+        df.loc[idx, "above_ema20"] = True
+        df.loc[idx, "bull_strength_5"] = 0.8
+        df.loc[idx, "ema_gap"] = 0.5
+        df.loc[idx + 1, "high"] = 103.0
+        df.loc[idx + 1, "low"] = 101.0
+        df.loc[idx + 1, "close"] = 102.5
+
+        s._check_and_notify("BTC/USDT", df.iloc[-1], df)
+
         mock_notify.assert_called_once()
         # Third argument should be the dataframe
         assert mock_notify.call_args[0][2] is df
+        assert mock_save.call_args.kwargs["signal_type"] == "confirmed_signal_bar_good"
+
+    @patch.object(PriceActionMonitor, "_notify_tg_bot")
+    @patch.object(PriceActionMonitor, "_save_signal", return_value=True)
+    def test_untriggered_candidate_is_not_confirmed(self, mock_save, mock_notify):
+        """A candidate without a break of its signal-bar high/low should not notify."""
+        s = _make_strategy()
+        df = _make_ohlcv_df(25)
+        df["signal_quality"] = "none"
+        df["signal_direction"] = "none"
+        idx = len(df) - 2
+        df.loc[idx, "open"] = 100.0
+        df.loc[idx, "high"] = 102.0
+        df.loc[idx, "low"] = 99.0
+        df.loc[idx, "close"] = 101.8
+        df.loc[idx, "signal_quality"] = "good"
+        df.loc[idx, "signal_direction"] = "long"
+        df.loc[idx, "above_ema20"] = True
+        df.loc[idx, "bull_strength_5"] = 0.8
+        df.loc[idx, "ema_gap"] = 0.5
+        df.loc[idx + 1, "high"] = 101.9
+        df.loc[idx + 1, "low"] = 100.5
+        df.loc[idx + 1, "close"] = 101.0
+
+        s._check_and_notify("BTC/USDT", df.iloc[-1], df)
+
+        mock_save.assert_not_called()
+        mock_notify.assert_not_called()
 
 
 # ===================================================================

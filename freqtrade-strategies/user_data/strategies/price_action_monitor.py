@@ -195,6 +195,7 @@ class PriceActionMonitor(IStrategy):
     EMA_MAX_GAP = 2.0
     BULL_STRENGTH_LONG_MIN = 0.5
     BULL_STRENGTH_SHORT_MAX = 0.5
+    FOLLOW_THROUGH_WINDOW = 3
 
     # 特殊K线参数
     SURPRISE_LOOKBACK = 20
@@ -375,7 +376,7 @@ class PriceActionMonitor(IStrategy):
                 logger.debug("Scan %s %s: no signal", pair, self.timeframe)
             self._check_and_notify(pair, last, dataframe)
 
-            # EMA20 穿越检测(独立于 signal_bar,可同根 K 线并存)
+            # EMA20 穿越检测是状态提醒,独立于 signal-bar follow-through。
             cross = last.get("ema20_cross", "none")
             if cross != "none":
                 self._notify_ema_cross(pair, last, dataframe, cross)
@@ -609,35 +610,108 @@ class PriceActionMonitor(IStrategy):
         else:
             return (not above_ema) and bull_strength <= self.BULL_STRENGTH_SHORT_MAX
 
+    def _candidate_signal_ok(self, row: pd.Series) -> bool:
+        """Return whether a row is a signal-bar candidate worth tracking."""
+        quality = row.get("signal_quality", "none")
+        direction = row.get("signal_direction", "none")
+
+        if quality == "none":
+            return False
+
+        # EMA20 背景方向过滤
+        if not self._ema_context_ok(row, direction):
+            return False
+
+        if quality in ("good", "acceptable"):
+            return True
+        if quality == "fair":
+            return bool(
+                row.get("is_inside", False)
+                or row.get("is_engulfing", False)
+                or row.get("is_surprise", False)
+                or row.get("is_2k_reversal", False)
+            )
+        return False
+
+    def _follow_through_ok(self, candidate: pd.Series, future: DataFrame) -> bool:
+        """Brooks-style confirmation: signal-bar extreme breaks and is not quickly rejected."""
+        if future.empty:
+            return False
+
+        direction = candidate.get("signal_direction", "none")
+        high = candidate.get("high")
+        low = candidate.get("low")
+        close = candidate.get("close")
+        if pd.isna(high) or pd.isna(low) or pd.isna(close):
+            return False
+
+        midpoint = (float(high) + float(low)) / 2
+        closes = future["close"]
+
+        if direction == "long":
+            triggered = (future["high"] > float(high)).any()
+            if not triggered:
+                return False
+            rejected = (closes < midpoint).sum() >= 2 or closes.iloc[-1] < midpoint
+            continued = (closes > float(close)).any()
+            return bool(continued and not rejected)
+
+        if direction == "short":
+            triggered = (future["low"] < float(low)).any()
+            if not triggered:
+                return False
+            rejected = (closes > midpoint).sum() >= 2 or closes.iloc[-1] > midpoint
+            continued = (closes < float(close)).any()
+            return bool(continued and not rejected)
+
+        return False
+
+    def _confirm_recent_candidates(self, pair: str, dataframe: DataFrame) -> None:
+        """Confirm prior candidates once follow-through appears within 3 bars."""
+        if len(dataframe) < 2:
+            return
+
+        current_pos = len(dataframe) - 1
+        start_pos = max(0, current_pos - self.FOLLOW_THROUGH_WINDOW)
+        for pos in range(start_pos, current_pos):
+            candidate = dataframe.iloc[pos]
+            if not self._candidate_signal_ok(candidate):
+                continue
+
+            future = dataframe.iloc[pos + 1: current_pos + 1]
+            if len(future) > self.FOLLOW_THROUGH_WINDOW:
+                future = future.iloc[: self.FOLLOW_THROUGH_WINDOW]
+            if not self._follow_through_ok(candidate, future):
+                continue
+
+            row = candidate.copy()
+            quality = row.get("signal_quality", "none")
+            row["signal_type"] = f"confirmed_signal_bar_{quality}"
+            msg = self._format_signal_message(pair, row)
+            saved = self._save_signal(
+                pair,
+                row,
+                f"follow_through_confirmed:{msg}",
+                signal_type=f"confirmed_signal_bar_{quality}",
+            )
+            if saved:
+                self._notify_tg_bot(pair, row, dataframe)
+
     def _check_and_notify(self, pair: str, last: pd.Series, dataframe: DataFrame) -> None:
-        """检查最新K线，写入 PG 并 POST 通知到 tg-bot。EMA20 背景过滤。"""
+        """Record candidates immediately; notify only after follow-through confirmation."""
         quality = last.get("signal_quality", "none")
         direction = last.get("signal_direction", "none")
 
-        if quality == "none":
-            return
-
-        # EMA20 背景方向过滤
-        if not self._ema_context_ok(last, direction):
+        if quality != "none" and not self._ema_context_ok(last, direction):
             logger.debug("Signal filtered by EMA context: %s %s %s", pair, direction, quality)
-            return
 
-        should_notify = False
-
-        if quality in ("good", "acceptable"):
-            should_notify = True
-        elif quality == "fair":
-            should_notify = bool(
-                last.get("is_inside", False)
-                or last.get("is_engulfing", False)
-                or last.get("is_surprise", False)
-                or last.get("is_2k_reversal", False)
+        if self._candidate_signal_ok(last):
+            logger.info(
+                "Candidate signal waiting for follow-through: %s %s %s",
+                pair, direction, quality,
             )
 
-        if should_notify:
-            msg = self._format_signal_message(pair, last)
-            self._save_signal(pair, last, msg)
-            self._notify_tg_bot(pair, last, dataframe)
+        self._confirm_recent_candidates(pair, dataframe)
 
     def _get_bar_types(self, row: pd.Series) -> list[str]:
         """收集当前K线的特殊类型标签。"""
@@ -657,13 +731,14 @@ class PriceActionMonitor(IStrategy):
     def _save_signal(
         self, pair: str, row: pd.Series, reason: str,
         signal_type: str | None = None,
-    ) -> None:
+    ) -> bool:
         """将信号写入 PostgreSQL。
 
         :param signal_type: 自定义 signal_type(默认 signal_bar_{quality})
+        :return: True when a new row was committed, False when skipped or duplicate.
         """
         if not self._pg_session_factory:
-            return
+            return False
 
         quality = row.get("signal_quality", "none")
         direction = row.get("signal_direction", "none")
@@ -723,9 +798,11 @@ class PriceActionMonitor(IStrategy):
                 session.add(signal)
                 session.commit()
                 logger.info("Signal saved to PG: %s %s %s", pair, direction, quality)
+                return True
         except Exception:
             # 唯一约束冲突 = 已写入，忽略
             logger.debug("Signal already exists or write failed for %s", pair)
+            return False
 
     def _persist_kline(self, pair: str, dataframe: DataFrame) -> None:
         """持久化最新已收盘 K 线到 PostgreSQL（UPSERT）。"""
@@ -790,20 +867,32 @@ class PriceActionMonitor(IStrategy):
     # K 线图表生成
     # ================================================================
 
-    def _generate_chart(self, pair: str, timeframe: str, dataframe: DataFrame, num_candles: int = 20) -> bytes:
+    def _generate_chart(
+        self,
+        pair: str,
+        timeframe: str | DataFrame,
+        dataframe: DataFrame | None = None,
+        num_candles: int = 20,
+    ) -> bytes:
         """生成最近 num_candles 根 K 线蜡烛图 + EMA20 + 成交量，返回 PNG bytes。
 
         EMA 在完整 dataframe 上算完再切片，避免边界 warmup 失真。
         """
+        # Backward-compatible test/helper call shape: _generate_chart(pair, dataframe)
+        if dataframe is None:
+            dataframe = timeframe  # type: ignore[assignment]
+            timeframe = self.timeframe
+
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import mplfinance as mpf
 
-        if len(dataframe) < num_candles:
+        if len(dataframe) == 0:
             raise ValueError(
-                f"Not enough candles for {pair}: have {len(dataframe)}, need {num_candles}"
+                f"Not enough candles for {pair}: have {len(dataframe)}, need at least 1"
             )
+        num_candles = min(num_candles, len(dataframe))
 
         df = dataframe.copy()
         df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
@@ -970,5 +1059,3 @@ class PriceActionMonitor(IStrategy):
         lines.append(f"5-bar: {bias} ({bs:.0%})")
 
         return "\n".join(lines)
-
-
