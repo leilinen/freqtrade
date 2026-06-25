@@ -989,13 +989,16 @@ class PriceActionMonitor(IStrategy):
                     f"{tg_api}/signal",
                     files={"chart": ("chart.png", chart_png, "image/png")},
                     data={"payload": json.dumps(payload)},
-                    timeout=10,
+                    # tg-bot 收到信号后会同步向 Telegram 发图，上传图片 + Telegram
+                    # 偶发延迟可能超过 10s；调大到 30s 避免策略侧误判超时
+                    # （消息其实已发出，只是 HTTP 响应未及时返回）。
+                    timeout=30,
                 )
             else:
                 http_requests.post(
                     f"{tg_api}/signal",
                     data={"payload": json.dumps(payload)},
-                    timeout=10,
+                    timeout=30,
                 )
             logger.info("Signal notified to tg-bot: %s %s %s", pair, direction, quality)
         except Exception:
