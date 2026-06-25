@@ -805,31 +805,48 @@ class PriceActionMonitor(IStrategy):
             return False
 
     def _persist_kline(self, pair: str, dataframe: DataFrame) -> None:
-        """持久化最新已收盘 K 线到 PostgreSQL（UPSERT）。"""
+        """持久化所有已收盘 K 线到 PostgreSQL（批量 UPSERT）。
+
+        把 dataframe 里除"当前进行中"最后一根之外的全部 K 线批量入库，
+        这样每次调度都能把上游返回的历史补齐，而不是只写最新一根。
+
+        "已收盘"判据：dataframe 的最后一根视为当前进行中（尚未固定），
+        其余全部视为已收盘。这与 A 股半点时间戳（02:30/03:30/06:00/07:00
+        UTC）兼容——不再依赖 now_utc.floor(timeframe) 做整点对齐，避免
+        A 股半点根被误判。
+        """
         if not self._pg_session_factory or len(dataframe) == 0:
             return
 
-        # 当前 timeframe 周期的开盘时间（UTC，floor 到频率）
-        # date < 周期开盘 的 K 线视为已收盘
-        now_utc = pd.Timestamp.utcnow().tz_localize(None)
-        period_start = now_utc.floor(self.timeframe)
-
-        # Normalize date column to tz-naive for comparison
         dates = dataframe["date"]
         if dates.dt.tz is not None:
             dates = dates.dt.tz_localize(None)
 
-        closed = dataframe[dates < period_start]
+        # 最后一根是当前进行中的根，跳过；其余全部已收盘。
+        if len(dataframe) <= 1:
+            return
+        closed = dataframe.iloc[:-1]
         if len(closed) == 0:
             return
 
-        last = closed.iloc[-1]  # 最新一根已收盘 K 线
-        candle_time = last["date"]
-        ct = (
-            candle_time.to_pydatetime()
-            if hasattr(candle_time, "to_pydatetime")
-            else candle_time
-        )
+        rows = []
+        for _, candle in closed.iterrows():
+            candle_time = candle["date"]
+            ct = (
+                candle_time.to_pydatetime()
+                if hasattr(candle_time, "to_pydatetime")
+                else candle_time
+            )
+            rows.append({
+                "symbol": pair,
+                "timeframe": self.timeframe,
+                "candle_time": ct,
+                "open": float(candle["open"]),
+                "high": float(candle["high"]),
+                "low": float(candle["low"]),
+                "close": float(candle["close"]),
+                "volume": float(candle["volume"]),
+            })
 
         try:
             with self._pg_session_factory() as session:
@@ -848,16 +865,7 @@ class PriceActionMonitor(IStrategy):
                             close = EXCLUDED.close,
                             volume = EXCLUDED.volume
                     """),
-                    {
-                        "symbol": pair,
-                        "timeframe": self.timeframe,
-                        "candle_time": ct,
-                        "open": float(last["open"]),
-                        "high": float(last["high"]),
-                        "low": float(last["low"]),
-                        "close": float(last["close"]),
-                        "volume": float(last["volume"]),
-                    },
+                    rows,
                 )
                 session.commit()
         except Exception:

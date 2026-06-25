@@ -11,12 +11,19 @@ A 股 Exchange 插件 — 仅监控模式
 配置示例 (config JSON):
   {
     "exchange": {
-      "name": "ashare",
-      "pair_whitelist": ["000001/SZ", "600519/SH"]
+      "name": "ashare"
     },
+    "pa_db_url": "postgresql://...",
+    "pairlists": [
+      {"method": "DatabasePairList", "db_url": "postgresql://...", "refresh_period": 3600}
+    ],
     "stake_currency": "CNY",
     "dry_run": true
   }
+
+监控标的来源: PostgreSQL watch_pair 表为唯一真相源
+  SELECT symbol FROM watch_pair WHERE enabled=true AND market='ashare'
+  config 中的 pair_whitelist 不再被读取（保留为空数组仅为通过校验）。
 
 品种格式: 代码/交易所 (如 000001/SZ, 600519/SH)
 K 线周期: 1h, 1d
@@ -114,9 +121,13 @@ class Ashare(Exchange):
     # ------------------------------------------------------------------
 
     def reload_markets(self, refresh=False, load_leverage_tiers=False):
-        """Override: 从 config.pair_whitelist 构建 markets dict。"""
-        exchange_conf = self._config.get("exchange", {})
-        pairs = exchange_conf.get("pair_whitelist", [])
+        """Override: 从 watch_pair 表构建 markets dict。
+
+        以 PostgreSQL watch_pair 表为唯一真相源：
+        SELECT symbol FROM watch_pair WHERE enabled=true AND market='ashare'
+        config 中的 pair_whitelist 不再被读取。
+        """
+        pairs = self._load_ashare_pairs()
 
         self._markets = {}
         for pair in pairs:
@@ -132,6 +143,37 @@ class Ashare(Exchange):
 
         self._last_markets_refresh = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
         logger.info("A-share markets loaded: %d pairs", len(self._markets))
+
+    def _load_ashare_pairs(self) -> list[str]:
+        """从 watch_pair 表读取所有 enabled 的 ashare 标的。
+
+        :return: 标的列表；数据库不可用时返回空列表（markets 为空，
+                 会在 _whitelist_for_active_markets 处抛 OperationalException，
+                 暴露配置问题而非静默失败）。
+        """
+        db_url = self._config.get("pa_db_url")
+        if not db_url:
+            logger.error("pa_db_url not set in config; cannot load A-share pairs from DB")
+            return []
+
+        try:
+            from sqlalchemy import create_engine, text
+
+            engine = create_engine(db_url)
+            with engine.connect() as conn:
+                result = conn.execute(
+                    text(
+                        "SELECT symbol FROM watch_pair "
+                        "WHERE enabled = true AND market = 'ashare' ORDER BY id"
+                    )
+                )
+                pairs = [row[0] for row in result]
+            engine.dispose()
+            logger.info("Loaded %d A-share pairs from watch_pair table", len(pairs))
+            return pairs
+        except Exception:
+            logger.exception("Failed to load A-share pairs from watch_pair table")
+            return []
 
     # ------------------------------------------------------------------
     # OHLCV 数据获取

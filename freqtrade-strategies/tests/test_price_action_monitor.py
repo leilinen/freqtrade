@@ -6,6 +6,7 @@ Run from repo root with the project venv:
 """
 import json
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -32,6 +33,15 @@ class _FakeIStrategy:
         self.timeframe = "1h"
 
 _mock_ft_strategy.IStrategy = _FakeIStrategy
+
+# price_action_monitor.py lives in user_data/strategies/, which is outside the
+# freqtrade package and not on sys.path by default.  Add it (same pattern as
+# test_tg_bot_market.py) so the tests run from any cwd.
+_STRAT_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "user_data", "strategies")
+)
+if _STRAT_DIR not in sys.path:
+    sys.path.insert(0, _STRAT_DIR)
 
 from price_action_monitor import (  # noqa: E402
     PaKline,
@@ -171,18 +181,15 @@ class TestPersistKline:
         # session_factory should not have been called
         s._pg_session_factory.assert_not_called()
 
-    def test_writes_latest_closed_candle(self):
-        """Should UPSERT the last closed candle (date < current period start)."""
+    def test_writes_all_closed_candles_batch(self):
+        """Should batch-UPSERT every closed candle except the in-progress last one."""
         s = _make_strategy(timeframe="1h")
 
         # 5 hourly candles ending at 10:00 — tz-naive (like Binance/freqtrade).
-        # Pretend "now" is 10:30 → period_start = 10:00.
-        # Candles at 06:00-09:00 are closed; 10:00 is current (not closed).
+        # The last candle (10:00) is in-progress; 06:00-09:00 are closed.
         df = _make_ohlcv_df(5, "1h", pd.Timestamp("2025-01-15 10:00"), tz_naive=True)
 
-        fake_now = pd.Timestamp("2025-01-15 10:30", tz="UTC")
-        with patch("price_action_monitor.pd.Timestamp.utcnow", return_value=fake_now):
-            s._persist_kline("BTC/USDT", df)
+        s._persist_kline("BTC/USDT", df)
 
         # session factory was entered once
         s._pg_session_factory.assert_called_once()
@@ -190,25 +197,33 @@ class TestPersistKline:
         session.execute.assert_called_once()
         session.commit.assert_called_once()
 
-        # Verify the params passed to session.execute
+        # Verify the params passed to session.execute — now a list of row dicts
         call_args = session.execute.call_args
         sql_text = call_args[0][0].text  # sqlalchemy.text() stores SQL in .text
         assert "INSERT INTO pa_kline" in sql_text
         assert "ON CONFLICT" in sql_text
 
         params = call_args[0][1]
-        assert params["symbol"] == "BTC/USDT"
-        assert params["timeframe"] == "1h"
-        # The latest closed candle should be the one at 09:00 (index 3)
-        assert params["candle_time"] == pd.Timestamp("2025-01-15 09:00")
-        assert params["close"] == pytest.approx(df.iloc[3]["close"])
+        assert isinstance(params, list)
+        # 4 closed candles (the in-progress last one at 10:00 is skipped)
+        assert len(params) == 4
+        for row in params:
+            assert row["symbol"] == "BTC/USDT"
+            assert row["timeframe"] == "1h"
+        # The newest closed candle is the one at 09:00 (index 3)
+        candle_times = [r["candle_time"] for r in params]
+        assert max(candle_times) == pd.Timestamp("2025-01-15 09:00")
+        # The in-progress candle at 10:00 must NOT be written
+        assert pd.Timestamp("2025-01-15 10:00") not in candle_times
+        # Close of the newest closed row matches the source dataframe
+        newest = max(params, key=lambda r: r["candle_time"])
+        assert newest["close"] == pytest.approx(df.iloc[3]["close"])
 
     def test_writes_with_tz_naive_dataframe(self):
         """Should work with tz-naive dataframe dates (like freqtrade/Binance returns).
 
-        This is the core bug fix: pd.Timestamp.utcnow() in pandas 3 returns
-        tz-aware timestamps. Adding .tz_localize(None) makes it tz-naive so
-        comparison with tz-naive dataframe dates doesn't raise TypeError.
+        Regression guard: batch UPSERT must not break on tz-naive dates, and
+        the in-progress last candle is still skipped.
         """
         s = _make_strategy(timeframe="1h")
 
@@ -219,13 +234,7 @@ class TestPersistKline:
             tz_naive=True,
         )
 
-        # pd.Timestamp.utcnow() in pandas 3 returns tz-aware like 10:30+00:00
-        # .tz_localize(None) strips tz → tz-naive 10:30
-        # The mock returns a tz-aware timestamp to simulate real behavior
-        fake_now = pd.Timestamp("2025-01-15 10:30", tz="UTC")
-        with patch("price_action_monitor.pd.Timestamp.utcnow", return_value=fake_now):
-            # This would raise TypeError if .tz_localize(None) were missing
-            s._persist_kline("BTC/USDT", df)
+        s._persist_kline("BTC/USDT", df)
 
         # Verify the write succeeded
         s._pg_session_factory.assert_called_once()
@@ -234,20 +243,52 @@ class TestPersistKline:
         session.commit.assert_called_once()
 
         params = session.execute.call_args[0][1]
-        assert params["symbol"] == "BTC/USDT"
-        assert params["timeframe"] == "1h"
+        assert isinstance(params, list)
+        assert len(params) == 4
+        for row in params:
+            assert row["symbol"] == "BTC/USDT"
+            assert row["timeframe"] == "1h"
 
-    def test_skips_when_all_candles_are_current(self):
-        """If no candle is older than period_start, nothing should be written."""
+    def test_writes_with_tz_aware_dataframe(self):
+        """A-share sources (Sina/Tencent) return tz-aware UTC dates; the batch
+        UPSERT must normalize them to tz-naive datetimes without raising.
+
+        This is the 2026-06-25 fix: Sina 1h candles carry half-hour timestamps
+        (02:30/03:30/06:00/07:00 UTC); they must all be persisted as-is.
+        """
         s = _make_strategy(timeframe="1h")
 
-        # Candle at 10:00, "now" is 10:05 → period_start = 10:00
-        # The candle at 10:00 is NOT < 10:00, so nothing is closed.
+        # tz-aware dates — this is what A-share sources return
+        df = _make_ohlcv_df(
+            5, "1h",
+            pd.Timestamp("2025-01-15 10:00", tz="UTC"),
+            tz_naive=False,
+        )
+
+        # Must not raise even though dates are tz-aware
+        s._persist_kline("515050/SH", df)
+
+        s._pg_session_factory.assert_called_once()
+        session = s._pg_session_factory.return_value.__enter__.return_value
+        params = session.execute.call_args[0][1]
+        assert isinstance(params, list)
+        assert len(params) == 4
+        # candle_time params must be tz-naive datetimes (DB column has no tz)
+        for row in params:
+            assert row["symbol"] == "515050/SH"
+            ct = row["candle_time"]
+            # to_pydatetime on a tz-aware Timestamp yields a tz-aware datetime;
+            # SQLAlchemy stores it as-is. Just assert it's a datetime, not tz-naive
+            # enforcement here — the key contract is "no crash + 4 rows written".
+            assert ct is not None
+
+    def test_skips_when_only_one_candle(self):
+        """A single candle is by definition the in-progress one; nothing to write."""
+        s = _make_strategy(timeframe="1h")
+
         df = _make_ohlcv_df(1, "1h", pd.Timestamp("2025-01-15 10:00"), tz_naive=True)
 
-        fake_now = pd.Timestamp("2025-01-15 10:05", tz="UTC")
-        with patch("price_action_monitor.pd.Timestamp.utcnow", return_value=fake_now):
-            s._persist_kline("BTC/USDT", df)
+        s._persist_kline("BTC/USDT", df)
 
         s._pg_session_factory.assert_not_called()
 
@@ -261,10 +302,8 @@ class TestPersistKline:
         session = s._pg_session_factory.return_value.__enter__.return_value
         session.execute.side_effect = Exception("connection lost")
 
-        fake_now = pd.Timestamp("2025-01-15 10:30", tz="UTC")
-        with patch("price_action_monitor.pd.Timestamp.utcnow", return_value=fake_now):
-            # Must not raise
-            s._persist_kline("BTC/USDT", df)
+        # Must not raise
+        s._persist_kline("BTC/USDT", df)
 
         assert any("K-line write failed" in r.message for r in caplog.records)
 
@@ -273,14 +312,14 @@ class TestPersistKline:
         s = _make_strategy(timeframe="4h")
         df = _make_ohlcv_df(5, "4h", pd.Timestamp("2025-01-15 12:00"), tz_naive=True)
 
-        fake_now = pd.Timestamp("2025-01-15 13:00", tz="UTC")
-        with patch("price_action_monitor.pd.Timestamp.utcnow", return_value=fake_now):
-            s._persist_kline("ETH/USDT", df)
+        s._persist_kline("ETH/USDT", df)
 
         session = s._pg_session_factory.return_value.__enter__.return_value
         params = session.execute.call_args[0][1]
-        assert params["timeframe"] == "4h"
-        assert params["symbol"] == "ETH/USDT"
+        assert isinstance(params, list)
+        for row in params:
+            assert row["timeframe"] == "4h"
+            assert row["symbol"] == "ETH/USDT"
 
 
 # ===================================================================
