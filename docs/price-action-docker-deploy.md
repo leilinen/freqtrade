@@ -95,7 +95,19 @@ tg-bot:
     DB_URL: "postgresql://postgres:postgres@postgres:5432/freqtrade_monitor"
 ```
 
-### 3.4 Docker 网络
+### 3.4 配置 user_data 挂载路径
+
+compose 通过 `USERDATA_DIR` 环境变量决定把宿主机哪个 `user_data/` 目录挂载进容器（用于热加载策略和配置）。在 `docker/` 目录下创建 `.env` 文件：
+
+```bash
+cp docker/.env.example docker/.env
+# 编辑 docker/.env，填入仓库内 user_data 的绝对路径：
+#   USERDATA_DIR=/Users/yourname/path/to/freqtrade/user_data
+```
+
+> 注意：`docker/.env` 已被 gitignore，不会进版本库。未设置 `USERDATA_DIR` 时 `docker compose` 会直接报错，避免误用错误路径。
+
+### 3.5 Docker 网络
 
 确保 Docker 网络存在且 PG 在同一网络：
 

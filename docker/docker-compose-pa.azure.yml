@@ -9,7 +9,7 @@ services:
     environment:
       TZ: "Asia/Shanghai"
     volumes:
-      - /home/azureuser/freqtrade-develop/user_data:/freqtrade/user_data
+      - ${USERDATA_DIR:?set USERDATA_DIR in docker/.env}:/freqtrade/user_data
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_1h.json
@@ -24,7 +24,7 @@ services:
     environment:
       TZ: "Asia/Shanghai"
     volumes:
-      - /home/azureuser/freqtrade-develop/user_data:/freqtrade/user_data
+      - ${USERDATA_DIR:?set USERDATA_DIR in docker/.env}:/freqtrade/user_data
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_4h.json
@@ -39,7 +39,7 @@ services:
     environment:
       TZ: "Asia/Shanghai"
     volumes:
-      - /home/azureuser/freqtrade-develop/user_data:/freqtrade/user_data
+      - ${USERDATA_DIR:?set USERDATA_DIR in docker/.env}:/freqtrade/user_data
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_ashare_1h.json
@@ -54,7 +54,7 @@ services:
     environment:
       TZ: "Asia/Shanghai"
     volumes:
-      - /home/azureuser/freqtrade-develop/user_data:/freqtrade/user_data
+      - ${USERDATA_DIR:?set USERDATA_DIR in docker/.env}:/freqtrade/user_data
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_ashare_1d.json
