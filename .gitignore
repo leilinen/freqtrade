@@ -119,11 +119,3 @@ docker-compose-*.yml
 # Local agent/project artifacts
 .claude/settings.local.json
 docs/superpowers/
-
-# Imported freqtrade-strategies repository contents kept local
-freqtrade-strategies/.github/
-freqtrade-strategies/.gitignore
-freqtrade-strategies/LICENSE
-freqtrade-strategies/README.md
-freqtrade-strategies/user_data/hyperopts/
-freqtrade-strategies/user_data/strategies/

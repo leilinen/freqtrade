@@ -5,7 +5,7 @@ Unit tests for Ashare.reload_markets / _load_ashare_pairs.
 watch_pair 表 (SELECT symbol FROM watch_pair WHERE enabled=true AND market='ashare')。
 
 Run from repo root:
-  .venv/bin/pytest freqtrade-strategies/tests/test_ashare_reload_markets.py -v
+  .venv/bin/pytest tests/price_action/test_ashare_reload_markets.py -v
 """
 import os
 import sys

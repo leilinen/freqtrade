@@ -19,25 +19,25 @@
 用法示例：
 
   # 单标的（默认连本地库）
-  .venv/bin/python freqtrade-strategies/tools/eval_signal_quality.py \\
+  .venv/bin/python tools/eval_signal_quality.py \\
       --symbol 600519/SH --timeframe 1d
 
   # 连远程库 —— 用 DB_URL 环境变量（推荐，连 Azure/生产库最简洁）
   DB_URL="postgresql://postgres:postgres@xx.xx.xx.xx:5432/freqtrade_monitor" \\
-      .venv/bin/python freqtrade-strategies/tools/eval_signal_quality.py \\
+      .venv/bin/python tools/eval_signal_quality.py \\
       --symbol 600519/SH --timeframe 1d
 
   # 连远程库 —— 或用 --db-url 临时指定
-  .venv/bin/python freqtrade-strategies/tools/eval_signal_quality.py \\
+  .venv/bin/python tools/eval_signal_quality.py \\
       --symbol BTC/USDT --timeframe 1h \\
       --db-url postgresql://user:pass@remote-host:5432/freqtrade_monitor
 
   # 批量评估某市场所有 enabled 标的（从 watch_pair 表读取）
-  DB_URL="..." .venv/bin/python freqtrade-strategies/tools/eval_signal_quality.py \\
+  DB_URL="..." .venv/bin/python tools/eval_signal_quality.py \\
       --market ashare --timeframe 1d
 
   # 评估时不叠加 EMA20 背景过滤（对比用）
-  .venv/bin/python freqtrade-strategies/tools/eval_signal_quality.py \\
+  .venv/bin/python tools/eval_signal_quality.py \\
       --symbol 600519/SH --timeframe 1d --no-ema-filter
 
 DB 连接优先级：--db-url > 环境变量 DB_URL > 默认 localhost。

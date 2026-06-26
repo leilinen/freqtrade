@@ -1,21 +1,24 @@
 services:
   price-action-1h:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.pa
     image: freqtrade-pa:latest
     container_name: price-action-1h
     restart: unless-stopped
     environment:
       TZ: "Asia/Shanghai"
     volumes:
-      - /home/azureuser/freqtrade-develop/freqtrade-strategies/user_data:/freqtrade/user_data
+      - ../user_data:/freqtrade/user_data
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_1h.json
       --strategy PriceActionMonitor
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os; [exit(0) for p in os.listdir('/proc') if p.isdigit() and 'freqtrade' in open(f'/proc/{p}/cmdline').read()] or exit(1)\""]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     networks:
-      - pricedog_default
+      - panwatch_default
 
   price-action-4h:
     image: freqtrade-pa:latest
@@ -24,47 +27,56 @@ services:
     environment:
       TZ: "Asia/Shanghai"
     volumes:
-      - /home/azureuser/freqtrade-develop/freqtrade-strategies/user_data:/freqtrade/user_data
+      - ../user_data:/freqtrade/user_data
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_4h.json
       --strategy PriceActionMonitor
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os; [exit(0) for p in os.listdir('/proc') if p.isdigit() and 'freqtrade' in open(f'/proc/{p}/cmdline').read()] or exit(1)\""]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     networks:
-      - pricedog_default
+      - panwatch_default
 
   ashare-1h:
-    image: freqtrade-pa:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ashare
+    image: freqtrade-ashare:latest
     container_name: ashare-1h
     restart: unless-stopped
     environment:
       TZ: "Asia/Shanghai"
     volumes:
-      - /home/azureuser/freqtrade-develop/freqtrade-strategies/user_data:/freqtrade/user_data
+      - ../user_data:/freqtrade/user_data
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_ashare_1h.json
       --strategy PriceActionMonitor
     networks:
-      - pricedog_default
+      - panwatch_default
 
   ashare-1d:
-    image: freqtrade-pa:latest
+    image: freqtrade-ashare:latest
     container_name: ashare-1d
     restart: unless-stopped
     environment:
       TZ: "Asia/Shanghai"
     volumes:
-      - /home/azureuser/freqtrade-develop/freqtrade-strategies/user_data:/freqtrade/user_data
+      - ../user_data:/freqtrade/user_data
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_ashare_1d.json
       --strategy PriceActionMonitor
     networks:
-      - pricedog_default
+      - panwatch_default
 
   tg-bot:
     build:
-      context: .
+      context: ../services
       dockerfile: Dockerfile.tg
     image: freqtrade-tg-bot:latest
     container_name: freqtrade-tg-bot
@@ -76,8 +88,8 @@ services:
       DB_URL: "postgresql://postgres:postgres@postgres:5432/freqtrade_monitor"
       API_PORT: "8090"
     networks:
-      - pricedog_default
+      - panwatch_default
 
 networks:
-  pricedog_default:
+  panwatch_default:
     external: true

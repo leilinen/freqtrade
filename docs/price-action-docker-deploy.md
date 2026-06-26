@@ -56,8 +56,7 @@ docker build -f docker/Dockerfile.pa -t freqtrade-pa:latest .
 ### 2.2 构建 TG Bot 镜像
 
 ```bash
-cd freqtrade-strategies
-docker-compose -f docker-compose-pa.yml build tg-bot
+docker compose -f docker/docker-compose-pa.yml build tg-bot
 ```
 
 ## 第三步：配置
@@ -70,7 +69,7 @@ docker-compose -f docker-compose-pa.yml build tg-bot
 
 ### 3.2 修改配置文件
 
-编辑 `freqtrade-strategies/user_data/price_action_config_1h.json`：
+编辑 `user_data/price_action_config_1h.json`：
 
 ```json
 {
@@ -86,7 +85,7 @@ docker-compose -f docker-compose-pa.yml build tg-bot
 
 ### 3.3 修改 docker-compose 环境变量
 
-编辑 `freqtrade-strategies/docker-compose-pa.yml`：
+编辑 `docker/docker-compose-pa.yml`：
 
 ```yaml
 tg-bot:
@@ -109,8 +108,7 @@ docker network create panwatch_default 2>/dev/null || true
 ## 第四步：启动服务
 
 ```bash
-cd freqtrade-strategies
-docker-compose -f docker-compose-pa.yml up -d
+docker compose -f docker/docker-compose-pa.yml up -d
 ```
 
 验证三个服务都启动：
@@ -208,15 +206,13 @@ TG 收到消息说明整条链路正常。
 ### 重启服务
 
 ```bash
-cd freqtrade-strategies
-docker-compose -f docker-compose-pa.yml restart
+docker compose -f docker/docker-compose-pa.yml restart
 ```
 
 ### 停止服务
 
 ```bash
-cd freqtrade-strategies
-docker-compose -f docker-compose-pa.yml down
+docker compose -f docker/docker-compose-pa.yml down
 ```
 
 ### 更新策略代码
@@ -224,21 +220,18 @@ docker-compose -f docker-compose-pa.yml down
 修改策略后需要重建镜像并重启：
 
 ```bash
-# 重建 freqtrade 镜像
-cd freqtrade
+# 重建 freqtrade 镜像（在仓库根目录执行）
 docker build -f docker/Dockerfile.pa -t freqtrade-pa:latest .
 
 # 重启
-cd ../freqtrade-strategies
-docker-compose -f docker-compose-pa.yml up -d price-action-1h price-action-4h
+docker compose -f docker/docker-compose-pa.yml up -d price-action-1h price-action-4h
 ```
 
 ### 更新 TG Bot 代码
 
 ```bash
-cd freqtrade-strategies
-docker-compose -f docker-compose-pa.yml build tg-bot
-docker-compose -f docker-compose-pa.yml up -d tg-bot
+docker compose -f docker/docker-compose-pa.yml build tg-bot
+docker compose -f docker/docker-compose-pa.yml up -d tg-bot
 ```
 
 ## 信号消息格式说明

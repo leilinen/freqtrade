@@ -5,7 +5,7 @@ Focus: /pa_add 自动识别市场规则 (纯数字→A股, 字母→美股, 含/
 以及 A 股代码按前缀补 /SH 或 /SZ 的归一化逻辑。
 
 Run from repo root:
-  .venv/bin/pytest freqtrade-strategies/tests/test_tg_bot_market.py -v
+  .venv/bin/pytest tests/price_action/test_tg_bot_market.py -v
 """
 import os
 import sys
@@ -32,10 +32,11 @@ sys.modules["aiohttp"].web = types.SimpleNamespace(
 os.environ.setdefault("TG_TOKEN", "x")
 os.environ.setdefault("TG_CHAT_ID", "1")
 
-# 为了 import tg_bot,把 freqtrade-strategies/ 加入 sys.path
-_STRAT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _STRAT_DIR not in sys.path:
-    sys.path.insert(0, _STRAT_DIR)
+# 为了 import tg_bot,把 services/ 加入 sys.path
+# (tests/price_action/ -> ../../ = repo root -> services/)
+_SERVICES_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "services"))
+if _SERVICES_DIR not in sys.path:
+    sys.path.insert(0, _SERVICES_DIR)
 
 import tg_bot  # noqa: E402
 

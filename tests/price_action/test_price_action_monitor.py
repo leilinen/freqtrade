@@ -2,7 +2,7 @@
 Unit tests for PriceActionMonitor._persist_kline and PaKline model.
 
 Run from repo root with the project venv:
-  .venv/bin/pytest freqtrade-strategies/tests/test_price_action_monitor.py -v
+  .venv/bin/pytest tests/price_action/test_price_action_monitor.py -v
 """
 import json
 import logging
@@ -35,10 +35,10 @@ class _FakeIStrategy:
 _mock_ft_strategy.IStrategy = _FakeIStrategy
 
 # price_action_monitor.py lives in user_data/strategies/, which is outside the
-# freqtrade package and not on sys.path by default.  Add it (same pattern as
-# test_tg_bot_market.py) so the tests run from any cwd.
+# freqtrade package and not on sys.path by default.  Add it so the tests run
+# from any cwd. (tests/price_action/ -> ../../ = repo root)
 _STRAT_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "user_data", "strategies")
+    os.path.join(os.path.dirname(__file__), "..", "..", "user_data", "strategies")
 )
 if _STRAT_DIR not in sys.path:
     sys.path.insert(0, _STRAT_DIR)
