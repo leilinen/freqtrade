@@ -302,6 +302,7 @@ class PriceActionMonitor(IStrategy):
         dataframe = self._detect_special_bars(dataframe)
         dataframe = self._classify_signal_quality(dataframe)
         dataframe = self._evaluate_context(dataframe)
+        dataframe = self._calc_structure_context(dataframe)
         dataframe = self._evaluate_background(dataframe)
         dataframe = self._detect_ema20_cross(dataframe)
         return dataframe
@@ -359,6 +360,10 @@ class PriceActionMonitor(IStrategy):
     def _evaluate_context(self, df: DataFrame) -> DataFrame:
         """背景评估指标 — signal-bar-spec.md §4"""
         return self._rules.evaluate_context(df)
+
+    def _calc_structure_context(self, df: DataFrame) -> DataFrame:
+        """确定性结构上下文:区间位置、铁丝网、微观组合形态。"""
+        return self._rules.calc_structure_context(df)
 
     def _evaluate_background(self, df: DataFrame) -> DataFrame:
         """PA_AGENT-inspired multi-window market background detection."""

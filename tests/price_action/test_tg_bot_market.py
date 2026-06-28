@@ -471,6 +471,26 @@ class TestFormatSignalMessageCross:
         assert "实体占比" in msg
         assert "止损" in msg
 
+    def test_new_context_bar_type_labels_are_rendered(self):
+        """新增结构标签应该映射为中文展示。"""
+        data = {
+            "symbol": "BTC/USDT",
+            "display_name": None,
+            "timeframe": "1h",
+            "direction": "long",
+            "quality": "good",
+            "entry_price": 60000.0,
+            "body_pct": 0.8,
+            "close_location": 0.9,
+            "body_ratio": 1.5,
+            "bar_types": ["ioi", "mdb", "breakout_up", "range_edge"],
+        }
+        msg = tg_bot.format_signal_message(data)
+        assert "内外内" in msg
+        assert "微双底" in msg
+        assert "上破近5K" in msg
+        assert "区间边界" in msg
+
 
 # ===================================================================
 # Tests: fmt_price

@@ -598,6 +598,95 @@ class TestCheckAndNotifyDataframe:
 
 
 # ===================================================================
+# Tests: structure context filters
+# ===================================================================
+
+
+class TestStructureContextRules:
+    """Unit tests for PA_Agent-inspired deterministic context filters."""
+
+    def _base_row(self, **overrides):
+        row = {
+            "signal_quality": "acceptable",
+            "signal_direction": "long",
+            "above_ema20": True,
+            "ema_gap": 0.5,
+            "bull_strength_5": 0.7,
+            "is_barbwire": False,
+            "range_zone": "unknown",
+            "is_inside": False,
+            "is_engulfing": False,
+            "is_surprise": False,
+            "is_2k_reversal": False,
+            "is_ioi": False,
+            "inside_sequence": "none",
+            "micro_double": "none",
+            "breakout_prev_5": "none",
+        }
+        row.update(overrides)
+        return pd.Series(row)
+
+    def test_barbwire_filters_even_good_signal(self):
+        s = _make_strategy()
+        row = self._base_row(signal_quality="good", is_barbwire=True)
+
+        assert s._candidate_signal_ok(row) is False
+
+    def test_middle_range_filters_plain_acceptable_signal(self):
+        s = _make_strategy()
+        row = self._base_row(signal_quality="acceptable", range_zone="middle")
+
+        assert s._candidate_signal_ok(row) is False
+
+    def test_middle_range_allows_acceptable_with_breakout_context(self):
+        s = _make_strategy()
+        row = self._base_row(
+            signal_quality="acceptable",
+            range_zone="middle",
+            breakout_prev_5="up",
+        )
+
+        assert s._candidate_signal_ok(row) is True
+
+    def test_fair_signal_allowed_at_range_edge(self):
+        s = _make_strategy()
+        row = self._base_row(signal_quality="fair", range_zone="lower")
+
+        assert s._candidate_signal_ok(row) is True
+
+    def test_fair_signal_filtered_in_middle_without_context(self):
+        s = _make_strategy()
+        row = self._base_row(signal_quality="fair", range_zone="middle")
+
+        assert s._candidate_signal_ok(row) is False
+
+    def test_detects_inside_sequences_ioi_micro_double_and_breakout(self):
+        s = _make_strategy()
+        df = pd.DataFrame({
+            "open": [5.0, 4.0, 5.0, 6.0, 5.5, 7.0],
+            "high": [10.0, 9.0, 11.0, 10.0, 10.0, 12.0],
+            "low": [0.0, 1.0, -1.0, 0.0, 0.0, -2.0],
+            "close": [5.0, 6.0, 4.0, 7.0, 6.0, 11.0],
+        })
+        df["volume"] = 100.0
+        df = s._calc_basic_indicators(df)
+        df["atr14"] = 10.0
+        df = s._detect_special_bars(df)
+        df = s._rules.calc_structure_context(df)
+
+        assert bool(df.loc[3, "is_ioi"]) is True
+        assert bool(df.loc[3, "is_inside"]) is True
+        assert df.loc[4, "inside_sequence"] == "ii"
+        assert bool(df.loc[4, "is_mdb"]) is True
+        assert bool(df.loc[4, "is_mdt"]) is True
+        assert df.loc[5, "breakout_prev_5"] == "both"
+
+        tags = s._get_bar_types(df.loc[5])
+        assert "breakout_up" in tags
+        assert "breakout_down" in tags
+
+
+# ===================================================================
 # Tests: _market attribute and _save_signal market field
 # ===================================================================
 

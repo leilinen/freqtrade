@@ -584,6 +584,11 @@ def format_signal_message(data: dict) -> str:
         type_map = {
             "surprise": "惊喜", "engulfing": "吞噬", "inside": "内包",
             "2k_reversal": "2K反转", "doji": "十字星",
+            "ii": "双内包", "iii": "三内包", "ioi": "内外内",
+            "mdb": "微双底", "mdt": "微双顶",
+            "breakout_up": "上破近5K", "breakout_down": "下破近5K",
+            "range_edge": "区间边界", "range_middle": "区间中部",
+            "barbwire": "铁丝网",
         }
         type_names = [type_map.get(t, t) for t in bar_types]
         lines.append("特殊K线: " + " | ".join(type_names))
