@@ -13,127 +13,36 @@
     例: "http://tg-bot:8090"
 """
 
+import atexit
 import json
 import logging
-import io
-import atexit
 import threading
-import time as _time
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
-import requests as http_requests
-
-import numpy as np
 import pandas as pd
+import requests as http_requests
 from pandas import DataFrame
-from sqlalchemy import (
-    Column, Integer, BigInteger, String, Float, Boolean, DateTime,
-    UniqueConstraint, create_engine, func, text,
-)
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session, sessionmaker
+from price_action.models import PaKline, PaSignal, WatchPair, _Base
+from price_action.notification import SignalNotifier
+from price_action.repository import PriceActionRepository
+from price_action.rules import PriceActionSignalRules
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from freqtrade.strategy import IStrategy
-import talib.abstract as ta
+
 
 logger = logging.getLogger(__name__)
 
-# ================================================================
-# SQLAlchemy ORM — 独立 Base，不碰 freqtrade 内部
-# ================================================================
-
-class _Base(DeclarativeBase):
-    pass
-
-
-class WatchPair(_Base):
-    """盯盘标的配置表"""
-    __tablename__ = "watch_pair"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    symbol: Mapped[str] = mapped_column(String, nullable=False, unique=True)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    market: Mapped[str] = mapped_column(String, default="crypto")
-    display_name: Mapped[str | None] = mapped_column(String, nullable=True, default=None)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-
-
-class PaSignal(_Base):
-    """信号K线记录表"""
-    __tablename__ = "pa_signal"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    # 品种信息
-    market: Mapped[str] = mapped_column(String, nullable=False)
-    symbol: Mapped[str] = mapped_column(String, nullable=False)
-    timeframe: Mapped[str] = mapped_column(String, nullable=False)
-    candle_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    # 信号
-    signal_type: Mapped[str] = mapped_column(String, nullable=False)
-    direction: Mapped[str] = mapped_column(String, nullable=False)
-    quality: Mapped[str] = mapped_column(String, nullable=False)
-    # K线 OHLCV
-    open: Mapped[float] = mapped_column(Float)
-    high: Mapped[float] = mapped_column(Float)
-    low: Mapped[float] = mapped_column(Float)
-    close: Mapped[float] = mapped_column(Float)
-    volume: Mapped[float] = mapped_column(Float)
-    # 量化指标
-    body_pct: Mapped[float] = mapped_column(Float)
-    close_location: Mapped[float] = mapped_column(Float)
-    body_ratio: Mapped[float] = mapped_column(Float)
-    upper_shadow_pct: Mapped[float] = mapped_column(Float)
-    lower_shadow_pct: Mapped[float] = mapped_column(Float)
-    # 背景
-    ema20: Mapped[float] = mapped_column(Float)
-    atr14: Mapped[float] = mapped_column(Float)
-    ema20_position: Mapped[float] = mapped_column(Float)
-    ema_gap: Mapped[float] = mapped_column(Float)
-    bull_strength_5: Mapped[float] = mapped_column(Float)
-    # 特殊K线 (JSON array string)
-    bar_types: Mapped[str] = mapped_column(String, default="[]")
-    # 交易参数
-    entry_price: Mapped[float] = mapped_column(Float)
-    stop_loss: Mapped[float] = mapped_column(Float)
-    target_price: Mapped[float] = mapped_column(Float)
-    # 通知文本
-    reason: Mapped[str] = mapped_column(String, default="")
-
-    __table_args__ = (
-        UniqueConstraint(
-            "symbol", "timeframe", "candle_time", "signal_type", "direction",
-            name="ux_pa_signal_identity",
-        ),
-    )
-
-
-class PaKline(_Base):
-    """盯盘 K 线原始 OHLCV 记录表"""
-    __tablename__ = "pa_kline"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    symbol: Mapped[str] = mapped_column(String, nullable=False)
-    timeframe: Mapped[str] = mapped_column(String, nullable=False)
-    candle_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    open: Mapped[float] = mapped_column(Float)
-    high: Mapped[float] = mapped_column(Float)
-    low: Mapped[float] = mapped_column(Float)
-    close: Mapped[float] = mapped_column(Float)
-    volume: Mapped[float] = mapped_column(Float)
-
-    __table_args__ = (
-        UniqueConstraint("symbol", "timeframe", "candle_time", name="ux_pa_kline_identity"),
-    )
-
+__all__ = [
+    "PaKline",
+    "PaSignal",
+    "PriceActionMonitor",
+    "WatchPair",
+    "_Base",
+    "http_requests",
+]
 
 DEFAULT_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 
@@ -207,6 +116,9 @@ class PriceActionMonitor(IStrategy):
         self._pg_session_factory = None
         self._chart_http_server = None
         self._market = "crypto"
+        self._rules = PriceActionSignalRules()
+        self._repository: PriceActionRepository | None = None
+        self._notifier: SignalNotifier | None = None
 
     # ================================================================
     # 生命周期回调
@@ -222,6 +134,18 @@ class PriceActionMonitor(IStrategy):
         self._pg_engine = create_engine(db_url)
         _Base.metadata.create_all(self._pg_engine)
         self._pg_session_factory = sessionmaker(bind=self._pg_engine)
+        self._repository = PriceActionRepository(
+            self._pg_session_factory,
+            timeframe=self.timeframe,
+            market=self._market,
+            rules=self._rules,
+        )
+        self._notifier = SignalNotifier(
+            self._pg_session_factory,
+            config=self.config,
+            timeframe=self.timeframe,
+            rules=self._rules,
+        )
         atexit.register(self._cleanup)
 
         # 初始化默认标的
@@ -246,6 +170,31 @@ class PriceActionMonitor(IStrategy):
             self._chart_http_server = None
         if self._pg_engine:
             self._pg_engine.dispose()
+
+    def _get_repository(self) -> PriceActionRepository | None:
+        """Return the persistence repository when PG is configured."""
+        if not self._pg_session_factory:
+            return None
+        if self._repository is None:
+            self._repository = PriceActionRepository(
+                self._pg_session_factory,
+                timeframe=self.timeframe,
+                market=self._market,
+                rules=self._rules,
+            )
+        self._repository.market = self._market
+        return self._repository
+
+    def _get_notifier(self) -> SignalNotifier:
+        """Return the notifier, creating it lazily for tests and direct calls."""
+        if self._notifier is None:
+            self._notifier = SignalNotifier(
+                self._pg_session_factory,
+                config=self.config,
+                timeframe=self.timeframe,
+                rules=self._rules,
+            )
+        return self._notifier
 
     # ================================================================
     # Chart HTTP server (/quote endpoint)
@@ -317,6 +266,9 @@ class PriceActionMonitor(IStrategy):
 
     def _init_default_pairs(self) -> None:
         """将默认标的写入 watch_pair 表（如不存在）。"""
+        repository = self._get_repository()
+        if not repository:
+            return
         exchange_name = self.config.get("exchange", {}).get("name", "")
         if exchange_name == "ashare":
             pairs = self.config.get("exchange", {}).get("pair_whitelist", [])
@@ -325,25 +277,17 @@ class PriceActionMonitor(IStrategy):
             pairs = DEFAULT_PAIRS
             market = "crypto"
         self._market = market
+        repository.market = market
 
-        with self._pg_session_factory() as session:
-            for symbol in pairs:
-                existing = session.query(WatchPair).filter_by(symbol=symbol).first()
-                if not existing:
-                    display_name = None
-                    if market == "ashare":
-                        from freqtrade.exchange.ashare import fetch_ashare_name
-                        display_name = fetch_ashare_name(symbol)
-                        _time.sleep(1)
-                    session.add(
-                        WatchPair(
-                            symbol=symbol,
-                            enabled=True,
-                            market=market,
-                            display_name=display_name,
-                        )
-                    )
-            session.commit()
+        display_name_fetcher = None
+        if market == "ashare":
+            from freqtrade.exchange.ashare import fetch_ashare_name
+            display_name_fetcher = fetch_ashare_name
+        repository.init_default_pairs(
+            pairs,
+            market=market,
+            display_name_fetcher=display_name_fetcher,
+        )
 
     # ================================================================
     # 策略接口
@@ -395,175 +339,23 @@ class PriceActionMonitor(IStrategy):
 
     def _calc_basic_indicators(self, df: DataFrame) -> DataFrame:
         """K线基础指标 — signal-bar-spec.md §2.1"""
-        df["body"] = abs(df["close"] - df["open"])
-        df["range"] = df["high"] - df["low"]
-
-        df["body_pct"] = np.where(df["range"] > 0, df["body"] / df["range"], 0.0)
-        df["close_location"] = np.where(
-            df["range"] > 0, (df["close"] - df["low"]) / df["range"], 0.5
-        )
-
-        df["upper_shadow"] = df["high"] - np.maximum(df["close"], df["open"])
-        df["lower_shadow"] = np.minimum(df["close"], df["open"]) - df["low"]
-        df["upper_shadow_pct"] = np.where(
-            df["range"] > 0, df["upper_shadow"] / df["range"], 0.0
-        )
-        df["lower_shadow_pct"] = np.where(
-            df["range"] > 0, df["lower_shadow"] / df["range"], 0.0
-        )
-
-        df["is_bull"] = df["close"] > df["open"]
-
-        df["median_body_20"] = df["body"].rolling(window=20, min_periods=10).median()
-        df["body_ratio"] = np.where(
-            df["median_body_20"] > 0, df["body"] / df["median_body_20"], 0.0
-        )
-
-        df["is_trend_bar"] = df["body_pct"] >= 0.5
-        df["is_doji"] = df["body_pct"] < 0.1
-
-        return df
+        return self._rules.calc_basic_indicators(df)
 
     def _calc_ema_atr(self, df: DataFrame) -> DataFrame:
         """EMA20 和 ATR14 — signal-bar-spec.md §4.3"""
-        df["ema20"] = ta.EMA(df, timeperiod=20)
-        df["atr14"] = ta.ATR(df, timeperiod=14)
-        df["ema20_position"] = np.where(
-            df["atr14"] > 0, (df["close"] - df["ema20"]) / df["atr14"], 0.0
-        )
-        return df
+        return self._rules.calc_ema_atr(df)
 
     def _detect_special_bars(self, df: DataFrame) -> DataFrame:
         """特殊K线类型检测 — signal-bar-spec.md §3"""
-        # Inside Bar
-        df["is_inside"] = (
-            (df["high"] <= df["high"].shift(1)) & (df["low"] >= df["low"].shift(1))
-        )
-
-        # Engulfing
-        df["is_engulfing"] = (
-            (df["high"] > df["high"].shift(1))
-            & (df["low"] < df["low"].shift(1))
-            & (df["body"] > df["body"].shift(1))
-        )
-
-        # Surprise Bar
-        df["prev_max_range_20"] = (
-            df["range"].shift(1).rolling(window=self.SURPRISE_LOOKBACK, min_periods=5).max()
-        )
-        df["is_surprise"] = (
-            (df["range"] > df["prev_max_range_20"])
-            & (df["body_pct"] >= self.SURPRISE_MIN_BODY_PCT)
-        )
-
-        # 2K Reversal
-        prev_bull = df["is_bull"].shift(1).fillna(False).astype(bool)
-        curr_bull = df["is_bull"].astype(bool)
-        prev_open = df["open"].shift(1)
-
-        df["is_2k_reversal_long"] = (~prev_bull) & curr_bull & (df["close"] > prev_open)
-        df["is_2k_reversal_short"] = prev_bull & (~curr_bull) & (df["close"] < prev_open)
-        df["is_2k_reversal"] = df["is_2k_reversal_long"] | df["is_2k_reversal_short"]
-
-        return df
+        return self._rules.detect_special_bars(df)
 
     def _classify_signal_quality(self, df: DataFrame) -> DataFrame:
         """信号K线质量分级 — V2 收紧阈值 + body_ratio 过滤"""
-        df["signal_quality"] = "none"
-        df["signal_direction"] = "none"
-
-        is_bull = df["is_bull"]
-
-        # Good long
-        good_long = (
-            is_bull
-            & (df["body_pct"] >= self.GOOD_LONG_BODY_PCT)
-            & (df["close_location"] >= self.GOOD_LONG_CLOSE_LOC)
-            & (df["upper_shadow_pct"] <= self.GOOD_LONG_UPPER_SHADOW)
-            & (df["body_ratio"] >= self.GOOD_MIN_BODY_RATIO)
-        )
-        df.loc[good_long, "signal_quality"] = "good"
-        df.loc[good_long, "signal_direction"] = "long"
-
-        # Acceptable long
-        accept_long = (
-            is_bull
-            & (df["signal_quality"] == "none")
-            & (df["body_pct"] >= self.ACCEPT_LONG_BODY_PCT)
-            & (df["close_location"] >= self.ACCEPT_LONG_CLOSE_LOC)
-            & (df["upper_shadow_pct"] <= self.ACCEPT_LONG_UPPER_SHADOW)
-            & (df["body_ratio"] >= self.ACCEPT_MIN_BODY_RATIO)
-        )
-        df.loc[accept_long, "signal_quality"] = "acceptable"
-        df.loc[accept_long, "signal_direction"] = "long"
-
-        # Fair long
-        fair_long = (
-            is_bull
-            & (df["signal_quality"] == "none")
-            & (df["body_pct"] >= self.FAIR_LONG_BODY_PCT)
-            & (df["close_location"] >= self.FAIR_LONG_CLOSE_LOC)
-        )
-        df.loc[fair_long, "signal_quality"] = "fair"
-        df.loc[fair_long, "signal_direction"] = "long"
-
-        # 做空
-        is_bear = ~df["is_bull"].astype(bool)
-
-        # Good short
-        good_short = (
-            is_bear
-            & (df["body_pct"] >= self.GOOD_LONG_BODY_PCT)
-            & (df["close_location"] <= self.GOOD_SHORT_CLOSE_LOC)
-            & (df["lower_shadow_pct"] <= self.GOOD_SHORT_LOWER_SHADOW)
-            & (df["body_ratio"] >= self.GOOD_MIN_BODY_RATIO)
-        )
-        df.loc[good_short, "signal_quality"] = "good"
-        df.loc[good_short, "signal_direction"] = "short"
-
-        # Acceptable short
-        accept_short = (
-            is_bear
-            & (df["signal_quality"] == "none")
-            & (df["body_pct"] >= self.ACCEPT_LONG_BODY_PCT)
-            & (df["close_location"] <= self.ACCEPT_SHORT_CLOSE_LOC)
-            & (df["lower_shadow_pct"] <= self.ACCEPT_SHORT_LOWER_SHADOW)
-            & (df["body_ratio"] >= self.ACCEPT_MIN_BODY_RATIO)
-        )
-        df.loc[accept_short, "signal_quality"] = "acceptable"
-        df.loc[accept_short, "signal_direction"] = "short"
-
-        # Fair short
-        fair_short = (
-            is_bear
-            & (df["signal_quality"] == "none")
-            & (df["body_pct"] >= self.FAIR_LONG_BODY_PCT)
-            & (df["close_location"] <= self.FAIR_SHORT_CLOSE_LOC)
-        )
-        df.loc[fair_short, "signal_quality"] = "fair"
-        df.loc[fair_short, "signal_direction"] = "short"
-
-        return df
+        return self._rules.classify_signal_quality(df)
 
     def _evaluate_context(self, df: DataFrame) -> DataFrame:
         """背景评估指标 — signal-bar-spec.md §4"""
-        df["above_ema20"] = df["close"] > df["ema20"]
-        df["ema_gap"] = np.where(
-            df["atr14"] > 0, abs(df["close"] - df["ema20"]) / df["atr14"], 0.0
-        )
-
-        bull_body = np.where(df["is_bull"], df["body"], 0.0)
-        bear_body = np.where(~df["is_bull"].astype(bool), df["body"], 0.0)
-
-        bull_sum_5 = pd.Series(bull_body).rolling(window=5, min_periods=3).sum()
-        bear_sum_5 = pd.Series(bear_body).rolling(window=5, min_periods=3).sum()
-        total_body_5 = bull_sum_5 + bear_sum_5
-
-        df["bull_strength_5"] = np.where(
-            total_body_5 > 0, bull_sum_5 / total_body_5, 0.5
-        )
-
-        return df
+        return self._rules.evaluate_context(df)
 
     def _detect_ema20_cross(self, df: DataFrame) -> DataFrame:
         """标记 EMA20 穿越:上穿(long)/ 下穿(short)/ 无(none)。
@@ -572,19 +364,7 @@ class PriceActionMonitor(IStrategy):
         下穿:前一根 close > ema20,当前 close < ema20
         首行因 shift(1) 产生 NaN,被视为无穿越。
         """
-        # shift(1) 首行 NaN,NaN > x 返回 False,~False 会误判为 True。
-        # 用 fillna(False) 让首行 prev_above=False,且后续逻辑通过 & curr_above
-        # 要求 prev 必须明确为 True 或 False 才算穿越。
-        prev_above = (df["close"].shift(1) > df["ema20"].shift(1)).fillna(False)
-        prev_below = (df["close"].shift(1) < df["ema20"].shift(1)).fillna(False)
-        curr_above = df["close"] > df["ema20"]
-        curr_below = df["close"] < df["ema20"]
-        df["ema20_cross"] = "none"
-        # 上穿:prev 明确在下方 + curr 明确在上方
-        df.loc[prev_below & curr_above, "ema20_cross"] = "long"
-        # 下穿:prev 明确在上方 + curr 明确在下方
-        df.loc[prev_above & curr_below, "ema20_cross"] = "short"
-        return df
+        return self._rules.detect_ema20_cross(df)
 
     # ================================================================
     # 通知 + PG 持久化
@@ -592,79 +372,15 @@ class PriceActionMonitor(IStrategy):
 
     def _ema_context_ok(self, row: pd.Series, direction: str) -> bool:
         """EMA20 背景过滤: 方向一致性 + ema_gap 限制。"""
-        ema_gap = row.get("ema_gap", 0)
-        if pd.isna(ema_gap):
-            return True
-
-        # 距 EMA20 太远 (>2 ATR) 不参与
-        if ema_gap > self.EMA_MAX_GAP:
-            return False
-
-        above_ema = row.get("above_ema20", False)
-        bull_strength = row.get("bull_strength_5", 0.5)
-        if pd.isna(bull_strength):
-            bull_strength = 0.5
-
-        if direction == "long":
-            return above_ema and bull_strength >= self.BULL_STRENGTH_LONG_MIN
-        else:
-            return (not above_ema) and bull_strength <= self.BULL_STRENGTH_SHORT_MAX
+        return self._rules.ema_context_ok(row, direction)
 
     def _candidate_signal_ok(self, row: pd.Series) -> bool:
         """Return whether a row is a signal-bar candidate worth tracking."""
-        quality = row.get("signal_quality", "none")
-        direction = row.get("signal_direction", "none")
-
-        if quality == "none":
-            return False
-
-        # EMA20 背景方向过滤
-        if not self._ema_context_ok(row, direction):
-            return False
-
-        if quality in ("good", "acceptable"):
-            return True
-        if quality == "fair":
-            return bool(
-                row.get("is_inside", False)
-                or row.get("is_engulfing", False)
-                or row.get("is_surprise", False)
-                or row.get("is_2k_reversal", False)
-            )
-        return False
+        return self._rules.candidate_signal_ok(row)
 
     def _follow_through_ok(self, candidate: pd.Series, future: DataFrame) -> bool:
         """Brooks-style confirmation: signal-bar extreme breaks and is not quickly rejected."""
-        if future.empty:
-            return False
-
-        direction = candidate.get("signal_direction", "none")
-        high = candidate.get("high")
-        low = candidate.get("low")
-        close = candidate.get("close")
-        if pd.isna(high) or pd.isna(low) or pd.isna(close):
-            return False
-
-        midpoint = (float(high) + float(low)) / 2
-        closes = future["close"]
-
-        if direction == "long":
-            triggered = (future["high"] > float(high)).any()
-            if not triggered:
-                return False
-            rejected = (closes < midpoint).sum() >= 2 or closes.iloc[-1] < midpoint
-            continued = (closes > float(close)).any()
-            return bool(continued and not rejected)
-
-        if direction == "short":
-            triggered = (future["low"] < float(low)).any()
-            if not triggered:
-                return False
-            rejected = (closes > midpoint).sum() >= 2 or closes.iloc[-1] > midpoint
-            continued = (closes < float(close)).any()
-            return bool(continued and not rejected)
-
-        return False
+        return self._rules.follow_through_ok(candidate, future)
 
     def _confirm_recent_candidates(self, pair: str, dataframe: DataFrame) -> None:
         """Confirm prior candidates once follow-through appears within 3 bars."""
@@ -715,18 +431,7 @@ class PriceActionMonitor(IStrategy):
 
     def _get_bar_types(self, row: pd.Series) -> list[str]:
         """收集当前K线的特殊类型标签。"""
-        types = []
-        if row.get("is_surprise", False):
-            types.append("surprise")
-        if row.get("is_engulfing", False):
-            types.append("engulfing")
-        if row.get("is_inside", False):
-            types.append("inside")
-        if row.get("is_2k_reversal", False):
-            types.append("2k_reversal")
-        if row.get("is_doji", False):
-            types.append("doji")
-        return types
+        return self._rules.get_bar_types(row)
 
     def _save_signal(
         self, pair: str, row: pd.Series, reason: str,
@@ -737,72 +442,15 @@ class PriceActionMonitor(IStrategy):
         :param signal_type: 自定义 signal_type(默认 signal_bar_{quality})
         :return: True when a new row was committed, False when skipped or duplicate.
         """
-        if not self._pg_session_factory:
+        repository = self._get_repository()
+        if not repository:
             return False
-
-        quality = row.get("signal_quality", "none")
-        direction = row.get("signal_direction", "none")
-        entry_price = float(row.get("close", 0))
-
-        # 止损和目标位 — signal-bar-spec.md §5
-        if direction == "long":
-            stop_loss = float(row.get("low", 0))
-            risk = entry_price - stop_loss
-            target_price = entry_price + 2 * risk if risk > 0 else entry_price
-        else:
-            stop_loss = float(row.get("high", 0))
-            risk = stop_loss - entry_price
-            target_price = entry_price - 2 * risk if risk > 0 else entry_price
-
-        # K线时间
-        candle_time = row.get("date", None)
-        if candle_time is None:
-            candle_time = datetime.now(timezone.utc)
-
-        signal = PaSignal(
-            market=self._market,
-            symbol=pair,
-            timeframe=self.timeframe,
-            candle_time=candle_time,
-            signal_type=f"signal_bar_{quality}" if signal_type is None else signal_type,
-            direction=direction,
-            quality=quality,
-            open=float(row.get("open", 0)),
-            high=float(row.get("high", 0)),
-            low=float(row.get("low", 0)),
-            close=float(row.get("close", 0)),
-            volume=float(row.get("volume", 0)),
-            body_pct=float(row.get("body_pct", 0)),
-            close_location=float(row.get("close_location", 0)),
-            body_ratio=float(row.get("body_ratio", 0)),
-            upper_shadow_pct=float(row.get("upper_shadow_pct", 0)),
-            lower_shadow_pct=float(row.get("lower_shadow_pct", 0)),
-            ema20=float(row.get("ema20", 0)) if pd.notna(row.get("ema20")) else 0,
-            atr14=float(row.get("atr14", 0)) if pd.notna(row.get("atr14")) else 0,
-            ema20_position=float(row.get("ema20_position", 0))
-            if pd.notna(row.get("ema20_position"))
-            else 0,
-            ema_gap=float(row.get("ema_gap", 0)) if pd.notna(row.get("ema_gap")) else 0,
-            bull_strength_5=float(row.get("bull_strength_5", 0.5))
-            if pd.notna(row.get("bull_strength_5"))
-            else 0.5,
-            bar_types=json.dumps(self._get_bar_types(row)),
-            entry_price=entry_price,
-            stop_loss=stop_loss,
-            target_price=target_price,
-            reason=reason,
+        return repository.save_signal(
+            pair,
+            row,
+            reason,
+            signal_type=signal_type,
         )
-
-        try:
-            with self._pg_session_factory() as session:
-                session.add(signal)
-                session.commit()
-                logger.info("Signal saved to PG: %s %s %s", pair, direction, quality)
-                return True
-        except Exception:
-            # 唯一约束冲突 = 已写入，忽略
-            logger.debug("Signal already exists or write failed for %s", pair)
-            return False
 
     def _persist_kline(self, pair: str, dataframe: DataFrame) -> None:
         """持久化 Freqtrade 传入策略的 K 线到 PostgreSQL（批量 UPSERT）。
@@ -812,52 +460,10 @@ class PriceActionMonitor(IStrategy):
         因此这里不能再额外跳过最后一根，否则 pa_kline 会永久落后一根，
         小周期健康检查会在每根新 K 线后误报。
         """
-        if not self._pg_session_factory or len(dataframe) == 0:
+        repository = self._get_repository()
+        if not repository:
             return
-
-        rows = []
-        for _, candle in dataframe.iterrows():
-            candle_time = candle["date"]
-            ct = (
-                candle_time.to_pydatetime()
-                if hasattr(candle_time, "to_pydatetime")
-                else candle_time
-            )
-            if getattr(ct, "tzinfo", None) is not None:
-                ct = ct.astimezone(timezone.utc).replace(tzinfo=None)
-            rows.append({
-                "symbol": pair,
-                "timeframe": self.timeframe,
-                "candle_time": ct,
-                "open": float(candle["open"]),
-                "high": float(candle["high"]),
-                "low": float(candle["low"]),
-                "close": float(candle["close"]),
-                "volume": float(candle["volume"]),
-            })
-
-        try:
-            with self._pg_session_factory() as session:
-                session.execute(
-                    text("""
-                        INSERT INTO pa_kline
-                            (symbol, timeframe, candle_time,
-                             open, high, low, close, volume)
-                        VALUES
-                            (:symbol, :timeframe, :candle_time,
-                             :open, :high, :low, :close, :volume)
-                        ON CONFLICT (symbol, timeframe, candle_time) DO UPDATE SET
-                            open = EXCLUDED.open,
-                            high = EXCLUDED.high,
-                            low = EXCLUDED.low,
-                            close = EXCLUDED.close,
-                            volume = EXCLUDED.volume
-                    """),
-                    rows,
-                )
-                session.commit()
-        except Exception:
-            logger.warning("K-line write failed for %s", pair, exc_info=True)
+        repository.persist_kline(pair, dataframe)
 
     # ================================================================
     # K 线图表生成
@@ -874,45 +480,11 @@ class PriceActionMonitor(IStrategy):
 
         EMA 在完整 dataframe 上算完再切片，避免边界 warmup 失真。
         """
-        # Backward-compatible test/helper call shape: _generate_chart(pair, dataframe)
         if dataframe is None:
             dataframe = timeframe  # type: ignore[assignment]
             timeframe = self.timeframe
-
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import mplfinance as mpf
-
-        if len(dataframe) == 0:
-            raise ValueError(
-                f"Not enough candles for {pair}: have {len(dataframe)}, need at least 1"
-            )
-        num_candles = min(num_candles, len(dataframe))
-
-        df = dataframe.copy()
-        df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-        df = df.tail(num_candles).set_index("date")
-        df.index = pd.DatetimeIndex(df.index)
-
-        apds = [mpf.make_addplot(df["ema20"], color="orange", width=1.5)]
-
-        fig, _ = mpf.plot(
-            df,
-            type="candle",
-            style="charles",
-            volume=True,
-            addplot=apds,
-            returnfig=True,
-            figratio=(16, 9),
-            figscale=1.2,
-            title=f"\n{pair} {timeframe}",
-        )
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
-        plt.close(fig)
-        return buf.getvalue()
+        notifier = self._get_notifier()
+        return notifier.generate_chart(pair, str(timeframe), dataframe, num_candles)
 
     # ================================================================
     # TG Bot 通知 (HTTP POST)
@@ -920,77 +492,13 @@ class PriceActionMonitor(IStrategy):
 
     def _notify_tg_bot(self, pair: str, row: pd.Series, dataframe: DataFrame) -> None:
         """POST 信号数据 + K线图表到独立 tg-bot 的 HTTP API。"""
-        tg_api = self.config.get("tg_api_url", "http://tg-bot:8090")
-        direction = row.get("signal_direction", "none")
-        quality = row.get("signal_quality", "none")
-
-        # 查询标的显示名称（A 股为中文名，其余为空）
-        display_name = None
-        with self._pg_session_factory() as session:
-            wp = session.query(WatchPair).filter_by(symbol=pair).first()
-            if wp:
-                display_name = wp.display_name
-
-        # 信号 K 线时间（与 _save_signal 取值逻辑一致）
-        candle_time = row.get("date", None)
-        if candle_time is None:
-            candle_time = datetime.now(timezone.utc)
-
-        payload = {
-            "symbol": pair,
-            "display_name": display_name,
-            "signal_time": candle_time.isoformat(),
-            "timeframe": self.timeframe,
-            "direction": direction,
-            "quality": quality,
-            "signal_type": row.get("signal_type", f"signal_bar_{quality}"),
-            "body_pct": float(row.get("body_pct", 0)),
-            "close_location": float(row.get("close_location", 0)),
-            "body_ratio": float(row.get("body_ratio", 0)),
-            "bar_types": self._get_bar_types(row),
-            "ema20_above": bool(row.get("above_ema20", False)),
-            "ema_gap": float(row.get("ema_gap", 0)) if pd.notna(row.get("ema_gap")) else 0,
-            "bull_strength_5": float(row.get("bull_strength_5", 0.5))
-            if pd.notna(row.get("bull_strength_5"))
-            else 0.5,
-            "entry_price": float(row.get("close", 0)),
-        }
-        if direction == "long":
-            payload["stop_loss"] = float(row.get("low", 0))
-            risk = payload["entry_price"] - payload["stop_loss"]
-            payload["target_price"] = payload["entry_price"] + 2 * risk if risk > 0 else payload["entry_price"]
-        else:
-            payload["stop_loss"] = float(row.get("high", 0))
-            risk = payload["stop_loss"] - payload["entry_price"]
-            payload["target_price"] = payload["entry_price"] - 2 * risk if risk > 0 else payload["entry_price"]
-
-        # 生成蜡烛图（失败不阻断通知）
-        chart_png = None
-        try:
-            chart_png = self._generate_chart(pair, self.timeframe, dataframe)
-        except Exception:
-            logger.warning("Failed to generate chart for %s", pair, exc_info=True)
-
-        try:
-            if chart_png:
-                http_requests.post(
-                    f"{tg_api}/signal",
-                    files={"chart": ("chart.png", chart_png, "image/png")},
-                    data={"payload": json.dumps(payload)},
-                    # tg-bot 收到信号后会同步向 Telegram 发图，上传图片 + Telegram
-                    # 偶发延迟可能超过 10s；调大到 30s 避免策略侧误判超时
-                    # （消息其实已发出，只是 HTTP 响应未及时返回）。
-                    timeout=30,
-                )
-            else:
-                http_requests.post(
-                    f"{tg_api}/signal",
-                    data={"payload": json.dumps(payload)},
-                    timeout=30,
-                )
-            logger.info("Signal notified to tg-bot: %s %s %s", pair, direction, quality)
-        except Exception:
-            logger.warning("Failed to notify tg-bot for %s", pair, exc_info=True)
+        notifier = self._get_notifier()
+        notifier.notify_tg_bot(
+            pair,
+            row,
+            dataframe,
+            chart_generator=self._generate_chart,
+        )
 
     def _notify_ema_cross(
         self, pair: str, row: pd.Series, dataframe: DataFrame, direction: str,
