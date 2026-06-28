@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 import requests as http_requests
 from pandas import DataFrame
+from price_action.background import MarketBackgroundAnalyzer
 from price_action.models import PaKline, PaSignal, WatchPair, _Base
 from price_action.notification import SignalNotifier
 from price_action.repository import PriceActionRepository
@@ -74,7 +75,7 @@ class PriceActionMonitor(IStrategy):
     # 基础配置（可通过 config 覆盖）
     timeframe = "1h"
     process_only_new_candles = True
-    startup_candle_count: int = 30
+    startup_candle_count: int = 120
 
     # --- 信号质量阈值 (V2, 经 6 个月数据评估优化) ---
     # V1: good 胜率 45.0% → V2: 51.9%, 净收益 +0.297 ATR, 盈亏比 1.38
@@ -117,6 +118,7 @@ class PriceActionMonitor(IStrategy):
         self._chart_http_server = None
         self._market = "crypto"
         self._rules = PriceActionSignalRules()
+        self._background = MarketBackgroundAnalyzer()
         self._repository: PriceActionRepository | None = None
         self._notifier: SignalNotifier | None = None
 
@@ -300,6 +302,7 @@ class PriceActionMonitor(IStrategy):
         dataframe = self._detect_special_bars(dataframe)
         dataframe = self._classify_signal_quality(dataframe)
         dataframe = self._evaluate_context(dataframe)
+        dataframe = self._evaluate_background(dataframe)
         dataframe = self._detect_ema20_cross(dataframe)
         return dataframe
 
@@ -356,6 +359,10 @@ class PriceActionMonitor(IStrategy):
     def _evaluate_context(self, df: DataFrame) -> DataFrame:
         """背景评估指标 — signal-bar-spec.md §4"""
         return self._rules.evaluate_context(df)
+
+    def _evaluate_background(self, df: DataFrame) -> DataFrame:
+        """PA_AGENT-inspired multi-window market background detection."""
+        return self._background.evaluate(df)
 
     def _detect_ema20_cross(self, df: DataFrame) -> DataFrame:
         """标记 EMA20 穿越:上穿(long)/ 下穿(short)/ 无(none)。
