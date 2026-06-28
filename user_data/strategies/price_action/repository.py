@@ -11,7 +11,7 @@ import pandas as pd
 from pandas import DataFrame
 from sqlalchemy import text
 
-from .models import PaSignal, WatchPair
+from .models import PaAnalysis, PaExperience, PaSignal, WatchPair
 from .rules import PriceActionSignalRules
 
 
@@ -194,3 +194,169 @@ class PriceActionRepository:
                 )
         except Exception:
             logger.warning("K-line write failed for %s", pair, exc_info=True)
+
+    def save_analysis(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        timeframe: str,
+        candle_time: datetime,
+        status: str,
+        kline_table: str | None = None,
+        feature_table: str | None = None,
+        l1_features: dict | None = None,
+        market_diagnosis: dict | None = None,
+        selected_strategies: list | None = None,
+        experience_cases: list | None = None,
+        trade_decision: dict | None = None,
+        validation_status: str | None = None,
+        validation_errors: list | None = None,
+        prompt_metadata: dict | None = None,
+        raw_responses: dict | None = None,
+    ) -> bool:
+        """Upsert a full PA_Agent-style analysis row."""
+        if not self._session_factory:
+            return False
+
+        ct = self._normalize_time(candle_time)
+        try:
+            with self._session_factory() as session:
+                row = (
+                    session.query(PaAnalysis)
+                    .filter_by(symbol=symbol, timeframe=timeframe, candle_time=ct)
+                    .first()
+                )
+                if row is None:
+                    row = PaAnalysis(
+                        market=market,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        candle_time=ct,
+                    )
+                    session.add(row)
+
+                row.market = market
+                row.status = status
+                row.kline_table = kline_table
+                row.feature_table = feature_table
+                row.l1_features = l1_features
+                row.market_diagnosis = market_diagnosis
+                row.selected_strategies = selected_strategies
+                row.experience_cases = experience_cases
+                row.trade_decision = trade_decision
+                row.validation_status = validation_status
+                row.validation_errors = validation_errors
+                row.prompt_metadata = prompt_metadata
+                row.raw_responses = raw_responses
+                session.commit()
+                return True
+        except Exception:
+            logger.warning("PA analysis write failed for %s %s", symbol, timeframe, exc_info=True)
+            return False
+
+    def get_previous_successful_analysis(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        before_time: datetime,
+    ) -> dict | None:
+        """Return the latest successful prior decision for incremental context."""
+        if not self._session_factory:
+            return None
+
+        ct = self._normalize_time(before_time)
+        try:
+            with self._session_factory() as session:
+                row = (
+                    session.query(PaAnalysis)
+                    .filter(
+                        PaAnalysis.symbol == symbol,
+                        PaAnalysis.timeframe == timeframe,
+                        PaAnalysis.candle_time < ct,
+                        PaAnalysis.status == "success",
+                    )
+                    .order_by(PaAnalysis.candle_time.desc())
+                    .first()
+                )
+                if row is None:
+                    return None
+                return {
+                    "candle_time": row.candle_time.isoformat() if row.candle_time else None,
+                    "decision": row.trade_decision,
+                    "diagnosis": row.market_diagnosis,
+                    "validation_status": row.validation_status,
+                }
+        except Exception:
+            logger.debug("Previous PA analysis lookup failed for %s", symbol, exc_info=True)
+            return None
+
+    def query_experience(
+        self,
+        *,
+        market: str,
+        timeframe: str,
+        cycle_position: str | None,
+        direction: str | None,
+        patterns: list[str] | None,
+        limit: int = 3,
+    ) -> list[dict]:
+        """Fetch simple keyword-matched PA experience cases from PostgreSQL."""
+        if not self._session_factory:
+            return []
+
+        patterns = [str(p).lower() for p in (patterns or []) if p]
+        try:
+            with self._session_factory() as session:
+                rows = (
+                    session.query(PaExperience)
+                    .filter(PaExperience.enabled.is_(True))
+                    .filter(PaExperience.market.in_([market, "any"]))
+                    .limit(50)
+                    .all()
+                )
+        except Exception:
+            logger.debug("PA experience lookup failed", exc_info=True)
+            return []
+
+        scored: list[tuple[int, PaExperience]] = []
+        for row in rows:
+            score = 0
+            if row.timeframe in (None, timeframe):
+                score += 1
+            if cycle_position and row.cycle_position:
+                if cycle_position.lower() in row.cycle_position.lower():
+                    score += 3
+            if direction and row.direction:
+                if direction.lower() == row.direction.lower():
+                    score += 2
+            row_patterns = [str(p).lower() for p in (row.patterns or [])]
+            score += len(set(patterns) & set(row_patterns)) * 2
+            haystack = " ".join(
+                str(v or "").lower()
+                for v in (row.title, row.content, row.case_type, row.cycle_position, row.direction)
+            )
+            score += sum(1 for p in patterns if p and p in haystack)
+            if score > 0:
+                scored.append((score, row))
+
+        scored.sort(key=lambda item: (item[0], item[1].id), reverse=True)
+        return [
+            {
+                "id": row.id,
+                "title": row.title,
+                "case_type": row.case_type,
+                "cycle_position": row.cycle_position,
+                "direction": row.direction,
+                "patterns": row.patterns or [],
+                "content": row.content,
+                "score": score,
+            }
+            for score, row in scored[:limit]
+        ]
+
+    def _normalize_time(self, value: datetime) -> datetime:
+        if getattr(value, "tzinfo", None) is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
