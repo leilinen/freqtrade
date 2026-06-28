@@ -351,6 +351,20 @@ def _health_threshold(market: str, tf: str, now_utc: datetime) -> tuple[int | No
     return 24, ""
 
 
+def _fetch_kline_health_rows(conn):
+    """Fetch latest persisted K-line time per enabled market/timeframe."""
+    return conn.execute(text(
+        "SELECT "
+        "  wp.market, "
+        "  k.timeframe, MAX(k.candle_time) as last_candle, "
+        "  COUNT(DISTINCT k.symbol) as pair_count "
+        "FROM pa_kline k "
+        "JOIN watch_pair wp ON wp.symbol = k.symbol "
+        "WHERE wp.enabled = true "
+        "GROUP BY wp.market, k.timeframe"
+    )).fetchall()
+
+
 def db_add_pair(symbol: str, market: str) -> str:
     symbol = symbol.upper()
     with db_engine.begin() as conn:
@@ -996,15 +1010,7 @@ async def main() -> None:
             ):
                 alert_items = []
                 with db_engine.connect() as conn:
-                    rows = conn.execute(text(
-                        "SELECT "
-                        "  CASE WHEN symbol LIKE '%/SH' OR symbol LIKE '%/SZ' "
-                        "       THEN 'ashare' ELSE 'crypto' END AS market, "
-                        "  timeframe, MAX(candle_time) as last_candle, "
-                        "  COUNT(DISTINCT symbol) as pair_count "
-                        "FROM pa_kline "
-                        "GROUP BY market, timeframe"
-                    )).fetchall()
+                    rows = _fetch_kline_health_rows(conn)
                 for r in rows:
                     market, tf, last_candle, pair_count = r[0], r[1], r[2], r[3]
                     if last_candle.tzinfo is None:

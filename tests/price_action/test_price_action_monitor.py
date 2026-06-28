@@ -181,12 +181,12 @@ class TestPersistKline:
         # session_factory should not have been called
         s._pg_session_factory.assert_not_called()
 
-    def test_writes_all_closed_candles_batch(self):
-        """Should batch-UPSERT every closed candle except the in-progress last one."""
+    def test_writes_all_strategy_candles_batch(self):
+        """Should batch-UPSERT every candle Freqtrade passes to the strategy."""
         s = _make_strategy(timeframe="1h")
 
         # 5 hourly candles ending at 10:00 — tz-naive (like Binance/freqtrade).
-        # The last candle (10:00) is in-progress; 06:00-09:00 are closed.
+        # Freqtrade has already dropped incomplete exchange candles before analysis.
         df = _make_ohlcv_df(5, "1h", pd.Timestamp("2025-01-15 10:00"), tz_naive=True)
 
         s._persist_kline("BTC/USDT", df)
@@ -205,25 +205,20 @@ class TestPersistKline:
 
         params = call_args[0][1]
         assert isinstance(params, list)
-        # 4 closed candles (the in-progress last one at 10:00 is skipped)
-        assert len(params) == 4
+        assert len(params) == 5
         for row in params:
             assert row["symbol"] == "BTC/USDT"
             assert row["timeframe"] == "1h"
-        # The newest closed candle is the one at 09:00 (index 3)
         candle_times = [r["candle_time"] for r in params]
-        assert max(candle_times) == pd.Timestamp("2025-01-15 09:00")
-        # The in-progress candle at 10:00 must NOT be written
-        assert pd.Timestamp("2025-01-15 10:00") not in candle_times
-        # Close of the newest closed row matches the source dataframe
+        assert max(candle_times) == pd.Timestamp("2025-01-15 10:00")
+        # Close of the newest row matches the source dataframe
         newest = max(params, key=lambda r: r["candle_time"])
-        assert newest["close"] == pytest.approx(df.iloc[3]["close"])
+        assert newest["close"] == pytest.approx(df.iloc[4]["close"])
 
     def test_writes_with_tz_naive_dataframe(self):
         """Should work with tz-naive dataframe dates (like freqtrade/Binance returns).
 
-        Regression guard: batch UPSERT must not break on tz-naive dates, and
-        the in-progress last candle is still skipped.
+        Regression guard: batch UPSERT must not break on tz-naive dates.
         """
         s = _make_strategy(timeframe="1h")
 
@@ -244,7 +239,7 @@ class TestPersistKline:
 
         params = session.execute.call_args[0][1]
         assert isinstance(params, list)
-        assert len(params) == 4
+        assert len(params) == 5
         for row in params:
             assert row["symbol"] == "BTC/USDT"
             assert row["timeframe"] == "1h"
@@ -272,25 +267,27 @@ class TestPersistKline:
         session = s._pg_session_factory.return_value.__enter__.return_value
         params = session.execute.call_args[0][1]
         assert isinstance(params, list)
-        assert len(params) == 4
-        # candle_time params must be tz-naive datetimes (DB column has no tz)
+        assert len(params) == 5
+        # candle_time params must be UTC tz-naive datetimes (DB column has no tz)
         for row in params:
             assert row["symbol"] == "515050/SH"
             ct = row["candle_time"]
-            # to_pydatetime on a tz-aware Timestamp yields a tz-aware datetime;
-            # SQLAlchemy stores it as-is. Just assert it's a datetime, not tz-naive
-            # enforcement here — the key contract is "no crash + 4 rows written".
             assert ct is not None
+            assert ct.tzinfo is None
 
-    def test_skips_when_only_one_candle(self):
-        """A single candle is by definition the in-progress one; nothing to write."""
+    def test_writes_single_strategy_candle(self):
+        """A single strategy candle is still a valid analyzed candle."""
         s = _make_strategy(timeframe="1h")
 
         df = _make_ohlcv_df(1, "1h", pd.Timestamp("2025-01-15 10:00"), tz_naive=True)
 
         s._persist_kline("BTC/USDT", df)
 
-        s._pg_session_factory.assert_not_called()
+        s._pg_session_factory.assert_called_once()
+        session = s._pg_session_factory.return_value.__enter__.return_value
+        params = session.execute.call_args[0][1]
+        assert len(params) == 1
+        assert params[0]["candle_time"] == pd.Timestamp("2025-01-15 10:00")
 
     def test_handles_db_exception_gracefully(self, caplog):
         """DB errors should be caught and logged, not propagated."""

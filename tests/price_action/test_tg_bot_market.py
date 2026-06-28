@@ -291,6 +291,25 @@ class TestHealthThreshold:
             assert tg_bot._health_threshold("ashare", "1d", now) == (36, "")
 
 
+class TestKlineHealthRows:
+    """Health check should only count enabled watch pairs."""
+
+    def test_query_joins_enabled_watch_pairs(self):
+        result = MagicMock()
+        result.fetchall.return_value = [("crypto", "1h", datetime(2026, 6, 26, 21), 4)]
+        conn = MagicMock()
+        conn.execute.return_value = result
+
+        with patch.object(tg_bot, "text", side_effect=lambda sql: sql):
+            rows = tg_bot._fetch_kline_health_rows(conn)
+
+        sql = conn.execute.call_args[0][0]
+        assert "JOIN watch_pair wp ON wp.symbol = k.symbol" in sql
+        assert "WHERE wp.enabled = true" in sql
+        assert "COUNT(DISTINCT k.symbol)" in sql
+        assert rows == result.fetchall.return_value
+
+
 # ===================================================================
 # Tests: db_get_signals_by_symbol
 # ===================================================================
