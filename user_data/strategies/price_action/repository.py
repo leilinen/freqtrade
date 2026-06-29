@@ -205,7 +205,9 @@ class PriceActionRepository:
         status: str,
         kline_table: str | None = None,
         feature_table: str | None = None,
-        l1_features: dict | None = None,
+        price_action_features: dict | None = None,
+        market_diagnosis_messages: list | None = None,
+        trade_decision_messages: list | None = None,
         market_diagnosis: dict | None = None,
         selected_strategies: list | None = None,
         experience_cases: list | None = None,
@@ -240,7 +242,9 @@ class PriceActionRepository:
                 row.status = status
                 row.kline_table = kline_table
                 row.feature_table = feature_table
-                row.l1_features = l1_features
+                row.price_action_features = price_action_features
+                row.market_diagnosis_messages = market_diagnosis_messages
+                row.trade_decision_messages = trade_decision_messages
                 row.market_diagnosis = market_diagnosis
                 row.selected_strategies = selected_strategies
                 row.experience_cases = experience_cases

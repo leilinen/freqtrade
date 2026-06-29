@@ -1,4 +1,4 @@
-"""Deterministic L3 routing from Stage 1 diagnosis to strategy templates."""
+"""Deterministic routing from market diagnosis to strategy templates."""
 from __future__ import annotations
 
 from typing import Any
@@ -11,7 +11,7 @@ RANGE_CYCLES = {"broad_channel", "trending_tr", "trading_range"}
 
 
 def route_strategies(diagnosis: dict[str, Any]) -> list[StrategyTemplate]:
-    """Select one or two strategy templates from Stage 1 market diagnosis."""
+    """Select one or two strategy templates from market diagnosis."""
     bar_analysis = diagnosis.get("bar_analysis") or {}
 
     cycle = str(diagnosis.get("cycle_position", "unknown")).lower()

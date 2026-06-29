@@ -1,13 +1,15 @@
 """
 价格行为 LLM 决策盯盘策略 (Price Action LLM Decision Monitor)
 
-基于 Al Brooks 价格行为学 + 两阶段 LLM 管道（L1 特征 → L2 诊断 → L3 路由 → L4 决策），
-架构对齐 PA_Agent。每根新 K 收盘后在后台异步运行 LLM 分析，产出交易决策，
-写入 PostgreSQL（pa_analysis 表）并通过 HTTP POST 推送到独立 tg-bot 的 /decision 端点。
+基于 Al Brooks 价格行为学 + PA 分析管道
+（特征工程 -> 市场诊断 -> 策略路由 -> 交易决策），
+架构对齐 PA_Agent。每根新 K 收盘后在后台异步运行 LLM 分析，
+产出交易决策，写入 PostgreSQL（pa_analysis 表），
+并通过 HTTP POST 推送到独立 tg-bot 的 /decision 端点。
 纯盯盘工具，不执行实际交易。
 
 LLM 调用使用 OpenAI SDK 兼容方式（base_url + api_key 可配置，默认 DeepSeek），
-api_key 优先从 config 读，其次 DEEPSEEK_API_KEY 环境变量（推荐用环境变量注入）。
+api_key 优先从 config 读，其次 DEEPSEEK_API_KEY 环境变量。
 
 配置要求 (config JSON):
   pa_db_url: PostgreSQL 连接串
@@ -17,7 +19,8 @@ api_key 优先从 config 读，其次 DEEPSEEK_API_KEY 环境变量（推荐用�
   pa_agent_enabled: 是否启用 LLM 管道（默认 true，需 api_key 才真正生效）
   pa_llm_base_url / pa_llm_model / pa_llm_temperature / pa_llm_timeout:
     LLM 服务地址、模型、采样温度、超时（默认 DeepSeek deepseek-chat）
-  pa_llm_window / pa_llm_warmup: L1 取最近 N 根已收盘 K、warmup 预热根数（默认 30 / 50）
+  pa_llm_window / pa_llm_warmup:
+    特征工程取最近 N 根已收盘 K、warmup 预热根数（默认 30 / 50）
   pa_experience_limit: 经验库检索条数（默认 3）
   pa_notify_wait: wait/avoid 是否也推送（默认 false，仅 enter 推送）
 """
@@ -62,9 +65,11 @@ class PriceActionMonitor(IStrategy):
     """
     价格行为 LLM 决策盯盘策略。
 
-    每根新 K 收盘后，在后台异步运行 L1-L4 两阶段 LLM 管道：
-    L1 纯 Python 特征工程 → L2 市场诊断 → L3 本地策略路由 → L4 交易决策（四重校验）。
-    决策写入 PostgreSQL（pa_analysis 表），仅 enter_long/enter_short 推送 tg-bot /decision。
+    每根新 K 收盘后，在后台异步运行 PA 分析管道：
+    纯 Python 特征工程 -> 市场诊断 -> 本地策略路由
+    -> 交易决策（四重校验）。
+    决策写入 PostgreSQL（pa_analysis 表），仅 enter_long/enter_short
+    推送 tg-bot /decision。
 
     盯盘标的从 PG watch_pair 表动态读取。必须以 dry_run: true 模式运行，
     config 中需设置 pa_db_url；启用 LLM 管道需配置 pa_llm_api_key 或注入
@@ -130,7 +135,7 @@ class PriceActionMonitor(IStrategy):
 
         logger.info("PG persistence initialized: %s", db_url)
 
-        # 初始化 LLM 决策管道（L1-L4）
+        # 初始化 PA LLM 决策管道
         self._init_pa_pipeline()
 
         # 启动 /quote HTTP server（供 tg-bot 调用获取 K 线图）
@@ -139,7 +144,11 @@ class PriceActionMonitor(IStrategy):
             try:
                 self._start_chart_http_server(int(chart_port))
             except Exception:
-                logger.warning("Failed to start chart HTTP server on port %s", chart_port, exc_info=True)
+                logger.warning(
+                    "Failed to start chart HTTP server on port %s",
+                    chart_port,
+                    exc_info=True,
+                )
 
     def _init_pa_pipeline(self) -> None:
         """构建 OpenAIJsonClient + Orchestrator + Worker；无 api_key 时优雅降级。"""
@@ -311,9 +320,9 @@ class PriceActionMonitor(IStrategy):
     # ================================================================
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """计算价格行为几何指标（L1 输入）+ 市场背景。
+        """计算价格行为几何指标（特征工程输入）+ 市场背景。
 
-        不再产出信号；信号完全由 LLM L4 决策给出。
+        不再产出信号；信号完全由 LLM 交易决策给出。
         """
         dataframe = self._calc_basic_indicators(dataframe)
         dataframe = self._calc_ema_atr(dataframe)
@@ -349,9 +358,10 @@ class PriceActionMonitor(IStrategy):
         return df
 
     def _calc_ema_atr(self, df: DataFrame) -> DataFrame:
-        """EMA20 和 ATR14，使用与 L1 一致的纯 pandas 实现（SMA/Wilder seed）。
+        """EMA20 和 ATR14，使用与特征工程一致的纯 pandas 实现。
 
-        统一这一处指标计算，避免 L1 特征与策略背景判断用两套 EMA/ATR 导致不一致。
+        统一这一处指标计算，避免特征工程与策略背景判断用两套
+        EMA/ATR 导致不一致。
         """
         df = df.copy()
         df["ema20"] = calculate_ema(df["close"], 20)
@@ -367,7 +377,7 @@ class PriceActionMonitor(IStrategy):
     # ================================================================
 
     def _submit_pa_analysis(self, pair: str, dataframe: DataFrame) -> None:
-        """把最新已收盘 K 提交给后台 worker 跑 L1-L4 管道（去重 + 异步）。"""
+        """把最新已收盘 K 提交给后台 worker 跑 PA 分析管道。"""
         if self._worker is None:
             return
         submitted = self._worker.submit(

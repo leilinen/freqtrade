@@ -1,4 +1,4 @@
-"""Tests for the PA_Agent-style L1-L4 pipeline modules."""
+"""Tests for the PA_Agent-style price-action pipeline modules."""
 from __future__ import annotations
 
 import json
@@ -42,17 +42,20 @@ if "freqtrade.strategy" not in sys.modules:
     sys.modules["freqtrade.strategy"] = _ft_strategy_mod
 
 from price_action.features import (  # noqa: E402
-    build_l1_features,
+    build_price_action_features,
     calculate_atr,
     calculate_ema,
 )
 from price_action.experience import retrieve_experience_cases  # noqa: E402
 from price_action.llm import OpenAIJsonClient  # noqa: E402
 from price_action.orchestrator import PriceActionOrchestrator  # noqa: E402
-from price_action.prompts import build_market_diagnosis_messages  # noqa: E402
+from price_action.prompts import (  # noqa: E402
+    build_market_diagnosis_messages,
+    prompt_template_metadata,
+)
 from price_action.repository import PriceActionRepository  # noqa: E402
 from price_action.router import route_strategies  # noqa: E402
-from price_action.validation import DecisionValidator, validate_stage1_diagnosis  # noqa: E402
+from price_action.validation import DecisionValidator, validate_market_diagnosis  # noqa: E402
 from price_action.worker import PaAnalysisWorker  # noqa: E402
 
 
@@ -70,14 +73,14 @@ def _df_from_ohlc(ohlc, start="2026-06-01 08:00", freq="1h"):
     )
 
 
-def _stage1_diagnosis(
-    l1,
+def _market_diagnosis(
+    features,
     *,
     gate_result="proceed",
     cycle_position="normal_channel",
     direction="bullish",
 ):
-    rows = l1.rows[:5]
+    rows = features.rows[:5]
     if gate_result == "proceed":
         gate_trace = [
             {
@@ -118,9 +121,9 @@ def _stage1_diagnosis(
             },
             {
                 "node_id": "2.5",
-                "question": "当前惯性强度是否足以进入阶段二？",
+                "question": "当前惯性强度是否足以进入交易决策？",
                 "answer": "是",
-                "reason": "闸门通过，进入阶段二",
+                "reason": "闸门通过，进入交易决策",
                 "branch": direction,
                 "section": "闸门",
                 "bar_range": "K3-K1",
@@ -162,7 +165,7 @@ def _stage1_diagnosis(
                 "neutral": "neutral",
             }[direction],
             "last_closed_bar": "K1",
-            "bar_type": l1.latest_features["bar_type"],
+            "bar_type": features.latest_features["bar_type"],
             "signal_bar": {
                 "bar": "K1",
                 "quality": "medium",
@@ -170,7 +173,7 @@ def _stage1_diagnosis(
                 "reason": "测试信号",
             },
             "entry_setup_type": "breakout_pullback",
-            "follow_through": l1.latest_features["follow_through_1_2"],
+            "follow_through": features.latest_features["follow_through_1_2"],
         },
         "bar_by_bar_summary": [
             {
@@ -189,7 +192,7 @@ def _stage1_diagnosis(
     }
 
 
-class TestL1Features:
+class TestPriceActionFeatures:
     def test_latest_closed_k_is_k1_and_forming_tail_is_dropped(self):
         df = _df_from_ohlc(
             [
@@ -201,7 +204,7 @@ class TestL1Features:
             start="2026-06-01 08:00",
         )
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -249,7 +252,7 @@ class TestL1Features:
             ]
         )
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -271,7 +274,7 @@ class TestL1Features:
             ]
         )
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -295,7 +298,7 @@ class TestL1Features:
         ]
         df = _df_from_ohlc(base + ioi_tail)
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -322,7 +325,7 @@ class TestL1Features:
             ]
         )
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -344,7 +347,7 @@ class TestL1Features:
             ]
         )
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -363,7 +366,7 @@ class TestL1Features:
                 (8.0, 9.0, 7.5, 7.8),
             ]
         )
-        bull_result = build_l1_features(
+        bull_result = build_price_action_features(
             bull_df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -380,7 +383,7 @@ class TestL1Features:
                 (11.5, 12.0, 10.5, 11.2),
             ]
         )
-        bear_result = build_l1_features(
+        bear_result = build_price_action_features(
             bear_df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -401,7 +404,7 @@ class TestL1Features:
             freq="D",
         )
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="588290/SH",
             timeframe="1d",
@@ -418,7 +421,7 @@ class TestMarketStructureFeatures:
     def test_range_position_upper_third(self):
         df = _df_from_ohlc([(105.0, 110.0, 100.0, 108.0)] * 8)
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -446,7 +449,7 @@ class TestMarketStructureFeatures:
             ]
         )
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -471,7 +474,7 @@ class TestMarketStructureFeatures:
             ]
         )
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -498,7 +501,7 @@ class TestMarketStructureFeatures:
             ]
         )
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -518,7 +521,7 @@ class TestMarketStructureFeatures:
     def test_measured_move_range_projection_and_prompt_render(self):
         df = _df_from_ohlc([(105.0, 110.0, 100.0, 105.0)] * 6)
 
-        result = build_l1_features(
+        result = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -543,10 +546,17 @@ class TestMarketStructureFeatures:
         assert "Measured Move" in messages[1]["content"]
 
 
-class TestStage1MarketDiagnosis:
-    def test_prompt_uses_pa_agent_stage1_contract(self):
+class TestMarketDiagnosisPrompt:
+    def test_prompt_template_metadata_exposes_file_hashes(self):
+        metadata = prompt_template_metadata()
+
+        assert metadata["market_diagnosis"][0]["name"] == "market_diagnosis_system.txt"
+        assert metadata["trade_decision"][1]["name"] == "trade_decision_user.txt"
+        assert len(metadata["market_diagnosis"][0]["sha256"]) == 64
+
+    def test_prompt_uses_pa_agent_market_diagnosis_contract(self):
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
-        l1 = build_l1_features(
+        features = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -556,10 +566,10 @@ class TestStage1MarketDiagnosis:
             now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
         )
 
-        messages = build_market_diagnosis_messages(l1)
+        messages = build_market_diagnosis_messages(features)
         content = messages[1]["content"]
 
-        assert "阶段一 Stage 1 市场诊断" in content
+        assert "任务：完成市场诊断" in content
         assert '"cycle_position"' in content
         assert '"gate_trace"' in content
         assert '"gate_result"' in content
@@ -567,9 +577,9 @@ class TestStage1MarketDiagnosis:
         assert '"market_state"' not in content
         assert '"signal_chain"' not in content
 
-    def test_stage1_validation_accepts_pa_agent_contract(self):
+    def test_market_diagnosis_validation_accepts_pa_agent_contract(self):
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
-        l1 = build_l1_features(
+        features = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -579,13 +589,13 @@ class TestStage1MarketDiagnosis:
             now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
         )
 
-        errors = validate_stage1_diagnosis(_stage1_diagnosis(l1), l1_rows=l1.rows)
+        errors = validate_market_diagnosis(_market_diagnosis(features), feature_rows=features.rows)
 
         assert errors == []
 
-    def test_stage1_validation_rejects_bar_type_mismatch(self):
+    def test_market_diagnosis_validation_rejects_bar_type_mismatch(self):
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
-        l1 = build_l1_features(
+        features = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -594,16 +604,16 @@ class TestStage1MarketDiagnosis:
             warmup=0,
             now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
         )
-        diagnosis = _stage1_diagnosis(l1)
+        diagnosis = _market_diagnosis(features)
         diagnosis["bar_analysis"]["bar_type"] = "trend_bear"
 
-        errors = validate_stage1_diagnosis(diagnosis, l1_rows=l1.rows)
+        errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
 
-        assert "stage1_bar_analysis_bar_type_mismatch" in errors
+        assert "market_diagnosis_bar_analysis_bar_type_mismatch" in errors
 
-    def test_stage1_validation_requires_proceed_gate_nodes(self):
+    def test_market_diagnosis_validation_requires_proceed_gate_nodes(self):
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
-        l1 = build_l1_features(
+        features = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -612,15 +622,15 @@ class TestStage1MarketDiagnosis:
             warmup=0,
             now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
         )
-        diagnosis = _stage1_diagnosis(l1)
+        diagnosis = _market_diagnosis(features)
         diagnosis["gate_trace"] = diagnosis["gate_trace"][:2]
 
-        errors = validate_stage1_diagnosis(diagnosis, l1_rows=l1.rows)
+        errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
 
-        assert "stage1_gate_trace_missing_proceed_nodes" in errors
+        assert "market_diagnosis_gate_trace_missing_proceed_nodes" in errors
 
 
-class TestStage1Routing:
+class TestMarketDiagnosisRouting:
     def test_routes_from_cycle_position_direction_and_detected_patterns(self):
         diagnosis = {
             "cycle_position": "normal_channel",
@@ -650,7 +660,7 @@ class TestStage1Routing:
 
         assert routed[0].template_id == "breakout_continuation_long"
 
-    def test_experience_lookup_uses_stage1_fields(self):
+    def test_experience_lookup_uses_market_diagnosis_fields(self):
         repository = MagicMock()
         repository.query_experience.return_value = [{"id": 1}]
         diagnosis = {
@@ -678,10 +688,10 @@ class TestStage1Routing:
         )
 
 
-class TestStage1Orchestrator:
-    def test_gate_wait_short_circuits_stage2_model_call(self):
+class TestMarketDiagnosisOrchestrator:
+    def test_gate_wait_short_circuits_trade_decision_model_call(self):
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
-        l1 = build_l1_features(
+        features = build_price_action_features(
             df,
             symbol="BTC/USDT",
             timeframe="1h",
@@ -690,8 +700,8 @@ class TestStage1Orchestrator:
             warmup=0,
             now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
         )
-        diagnosis = _stage1_diagnosis(
-            l1,
+        diagnosis = _market_diagnosis(
+            features,
             gate_result="wait",
             cycle_position="unknown",
             direction="neutral",
@@ -715,8 +725,71 @@ class TestStage1Orchestrator:
 
         assert outcome.status == "success"
         assert outcome.decision["decision"]["type"] == "wait"
-        assert "stage2_model_call=skipped" in outcome.decision["decision_trace"]
+        assert "trade_decision_model_call=skipped" in outcome.decision["decision_trace"]
         llm.complete_json.assert_called_once()
+
+    def test_successful_analysis_persists_prompt_messages_and_template_metadata(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        features = build_price_action_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+        diagnosis = _market_diagnosis(features)
+        decision = {
+            "stage": "trade_decision",
+            "decision": {
+                "type": "wait",
+                "direction": "neutral",
+                "order_type": "none",
+                "entry": None,
+                "stop_loss": None,
+                "take_profit_1": None,
+                "take_profit_2": None,
+                "risk_reward": None,
+                "confidence": 0.6,
+                "reason": "等待",
+            },
+            "decision_trace": ["trade_decision"],
+            "watch_points": [],
+            "invalidations": [],
+        }
+        llm = MagicMock()
+        llm.model = "test-model"
+        llm.base_url = "https://example.test"
+        llm.complete_json.side_effect = [
+            json.dumps(diagnosis, ensure_ascii=False),
+            json.dumps(decision, ensure_ascii=False),
+        ]
+        repository = MagicMock()
+        repository.query_experience.return_value = []
+        repository.get_previous_successful_analysis.return_value = None
+        repository.save_analysis.return_value = True
+        orchestrator = PriceActionOrchestrator(
+            repository=repository,
+            llm_client=llm,
+            config={"pa_llm_window": 6, "pa_llm_warmup": 0},
+        )
+
+        outcome = orchestrator.analyze(
+            symbol="BTC/USDT",
+            dataframe=df,
+            timeframe="1h",
+            market="crypto",
+        )
+
+        assert outcome.status == "success"
+        assert llm.complete_json.call_count == 2
+        kwargs = repository.save_analysis.call_args.kwargs
+        assert kwargs["market_diagnosis_messages"][0]["role"] == "system"
+        assert kwargs["trade_decision_messages"][1]["role"] == "user"
+        assert "任务：完成市场诊断" in kwargs["market_diagnosis_messages"][1]["content"]
+        assert "任务：完成交易决策" in kwargs["trade_decision_messages"][1]["content"]
+        assert kwargs["prompt_metadata"]["prompt_templates"]["market_diagnosis"][0]["sha256"]
 
 
 class TestOpenAIJsonClient:
@@ -747,7 +820,7 @@ class TestDecisionValidator:
         "direction": "bullish",
         "gate_result": "proceed",
     }
-    l1 = {
+    features = {
         "high": 105.0,
         "low": 95.0,
         "atr14": 2.0,
@@ -759,7 +832,7 @@ class TestDecisionValidator:
         parsed, result = DecisionValidator().validate(
             "{bad",
             diagnosis=self.diagnosis,
-            l1_features=self.l1,
+            price_action_features=self.features,
         )
 
         assert parsed is None
@@ -780,7 +853,11 @@ class TestDecisionValidator:
             }
         )
 
-        _, result = DecisionValidator().validate(raw, diagnosis=self.diagnosis, l1_features=self.l1)
+        _, result = DecisionValidator().validate(
+            raw,
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+        )
 
         assert result.checks == ["json_syntax", "stage_consistency"]
         assert "stage_must_be_trade_decision" in result.errors
@@ -800,7 +877,11 @@ class TestDecisionValidator:
             }
         )
 
-        _, result = DecisionValidator().validate(raw, diagnosis=self.diagnosis, l1_features=self.l1)
+        _, result = DecisionValidator().validate(
+            raw,
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+        )
 
         assert result.checks == [
             "json_syntax",
@@ -825,7 +906,11 @@ class TestDecisionValidator:
             }
         )
 
-        _, result = DecisionValidator().validate(raw, diagnosis=self.diagnosis, l1_features=self.l1)
+        _, result = DecisionValidator().validate(
+            raw,
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+        )
 
         assert result.checks == [
             "json_syntax",
@@ -836,7 +921,7 @@ class TestDecisionValidator:
         assert "confidence_must_be_0_to_1" in result.errors
 
     def test_atr_expansion_veto_is_semantic(self):
-        l1 = {**self.l1, "gate_break": "up", "atr_expand_ratio": 2.1}
+        features = {**self.features, "gate_break": "up", "atr_expand_ratio": 2.1}
         raw = json.dumps(
             {
                 "stage": "trade_decision",
@@ -852,7 +937,11 @@ class TestDecisionValidator:
             }
         )
 
-        _, result = DecisionValidator().validate(raw, diagnosis=self.diagnosis, l1_features=l1)
+        _, result = DecisionValidator().validate(
+            raw,
+            diagnosis=self.diagnosis,
+            price_action_features=features,
+        )
 
         assert result.checks[-1] == "semantic_reasonableness"
         assert "atr_expansion_over_2x_vetoes_breakout_entry" in result.errors
@@ -867,7 +956,7 @@ class TestPriceActionRepository:
         ctx.__exit__.return_value = False
         factory = MagicMock(return_value=ctx)
         repository = PriceActionRepository(factory, timeframe="1h", market="crypto")
-        stage1 = {
+        market_diagnosis = {
             "cycle_position": "normal_channel",
             "direction": "bullish",
             "gate_result": "proceed",
@@ -879,26 +968,34 @@ class TestPriceActionRepository:
             timeframe="1h",
             candle_time=datetime(2026, 6, 1, tzinfo=timezone.utc),
             status="success",
-            market_diagnosis=stage1,
+            market_diagnosis_messages=[{"role": "user", "content": "market diagnosis"}],
+            trade_decision_messages=[{"role": "user", "content": "trade decision"}],
+            market_diagnosis=market_diagnosis,
             trade_decision={"stage": "trade_decision"},
             raw_responses={
-                "market_diagnosis": json.dumps(stage1),
+                "market_diagnosis": json.dumps(market_diagnosis),
                 "trade_decision": '{"stage":"trade_decision"}',
             },
         )
 
         assert saved is True
         row = session.add.call_args.args[0]
-        assert row.market_diagnosis == stage1
+        assert row.market_diagnosis_messages == [
+            {"role": "user", "content": "market diagnosis"}
+        ]
+        assert row.trade_decision_messages == [
+            {"role": "user", "content": "trade decision"}
+        ]
+        assert row.market_diagnosis == market_diagnosis
         assert row.trade_decision == {"stage": "trade_decision"}
         assert row.raw_responses == {
-            "market_diagnosis": json.dumps(stage1),
+            "market_diagnosis": json.dumps(market_diagnosis),
             "trade_decision": '{"stage":"trade_decision"}',
         }
         session.commit.assert_called_once()
 
     def test_previous_successful_analysis_reads_semantic_analysis_fields(self):
-        stage1 = {
+        market_diagnosis = {
             "cycle_position": "normal_channel",
             "direction": "bullish",
             "gate_result": "proceed",
@@ -906,7 +1003,7 @@ class TestPriceActionRepository:
         row = SimpleNamespace(
             candle_time=datetime(2026, 6, 1, tzinfo=timezone.utc),
             trade_decision={"stage": "trade_decision"},
-            market_diagnosis=stage1,
+            market_diagnosis=market_diagnosis,
             validation_status="valid",
         )
         query = MagicMock()
@@ -928,7 +1025,7 @@ class TestPriceActionRepository:
         assert previous == {
             "candle_time": "2026-06-01T00:00:00+00:00",
             "decision": {"stage": "trade_decision"},
-            "diagnosis": stage1,
+            "diagnosis": market_diagnosis,
             "validation_status": "valid",
         }
 

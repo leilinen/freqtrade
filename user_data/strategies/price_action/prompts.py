@@ -1,11 +1,25 @@
 """Prompt assembly for the two semantic PA LLM calls."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
-from .features import L1FeatureResult
+from .features import PriceActionFeatureResult
 from .strategy_templates import StrategyTemplate
+
+
+TEMPLATE_DIR = Path(__file__).with_name("prompt_templates")
+MARKET_DIAGNOSIS_TEMPLATE_FILES = (
+    "market_diagnosis_system.txt",
+    "market_diagnosis_user.txt",
+)
+TRADE_DECISION_TEMPLATE_FILES = (
+    "trade_decision_system.txt",
+    "trade_decision_user.txt",
+)
 
 
 MARKET_DIAGNOSIS_SCHEMA: dict[str, Any] = {
@@ -98,102 +112,119 @@ TRADE_DECISION_SCHEMA: dict[str, Any] = {
 }
 
 
-def build_market_diagnosis_messages(l1: L1FeatureResult) -> list[dict[str, str]]:
+@dataclass(frozen=True)
+class PromptTemplate:
+    """Loaded prompt template with deterministic version metadata."""
+
+    name: str
+    content: str
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+
+    def render(self, **values: Any) -> str:
+        return self.content.format(**values).strip()
+
+    def as_metadata(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "sha256": self.sha256,
+        }
+
+
+class PromptAssembler:
+    """Load text prompt templates and render PA_Agent-style LLM messages."""
+
+    def __init__(self, template_dir: Path | None = None) -> None:
+        self.template_dir = template_dir or TEMPLATE_DIR
+
+    def build_market_diagnosis_messages(
+        self,
+        features: PriceActionFeatureResult,
+    ) -> list[dict[str, str]]:
+        system = self._load("market_diagnosis_system.txt").render()
+        user = self._load("market_diagnosis_user.txt").render(
+            schema_json=json.dumps(MARKET_DIAGNOSIS_SCHEMA, ensure_ascii=False, indent=2),
+            symbol=features.symbol,
+            market=features.market,
+            timeframe=features.timeframe,
+            candle_time=features.candle_time.isoformat(),
+            kline_table=features.kline_table,
+            feature_table=features.feature_table,
+            market_features_text=features.market_features_text,
+        )
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    def build_trade_decision_messages(
+        self,
+        *,
+        features: PriceActionFeatureResult,
+        diagnosis: dict[str, Any],
+        strategies: list[StrategyTemplate],
+        experience_cases: list[dict[str, Any]] | None = None,
+        previous_decision: dict[str, Any] | None = None,
+    ) -> list[dict[str, str]]:
+        system = self._load("trade_decision_system.txt").render()
+        strategy_text = "\n\n".join(strategy.render() for strategy in strategies)
+        user = self._load("trade_decision_user.txt").render(
+            diagnosis_json=json.dumps(diagnosis, ensure_ascii=False, indent=2),
+            strategy_text=strategy_text,
+            kline_table=features.kline_table,
+            latest_features_json=json.dumps(features.latest_features, ensure_ascii=False, indent=2),
+            experience_text=json.dumps(experience_cases or [], ensure_ascii=False, indent=2),
+            previous_text=json.dumps(previous_decision or {}, ensure_ascii=False, indent=2),
+            schema_json=json.dumps(TRADE_DECISION_SCHEMA, ensure_ascii=False, indent=2),
+        )
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    def metadata(self) -> dict[str, Any]:
+        market_diagnosis = [
+            self._load(name).as_metadata()
+            for name in MARKET_DIAGNOSIS_TEMPLATE_FILES
+        ]
+        trade_decision = [
+            self._load(name).as_metadata()
+            for name in TRADE_DECISION_TEMPLATE_FILES
+        ]
+        return {
+            "template_dir": str(self.template_dir),
+            "market_diagnosis": market_diagnosis,
+            "trade_decision": trade_decision,
+        }
+
+    def _load(self, name: str) -> PromptTemplate:
+        path = self.template_dir / name
+        content = path.read_text(encoding="utf-8")
+        return PromptTemplate(name=name, content=content)
+
+
+DEFAULT_ASSEMBLER = PromptAssembler()
+
+
+def build_market_diagnosis_messages(features: PriceActionFeatureResult) -> list[dict[str, str]]:
     """Assemble the market-diagnosis prompt."""
-    system = (
-        "你是 Al Brooks 价格行为分析助手。"
-        "阶段一只负责市场诊断与闸门判断，"
-        "不评估具体下单、止损、止盈或仓位。"
-        "只基于用户提供的已收盘 K 线和"
-        "程序特征判断，不得编造外部行情。你必须只输出一个 JSON object，"
-        "不要 Markdown。"
-    )
-    user = f"""
-任务：完成阶段一 Stage 1 市场诊断。
-
-约束：
-- K1 是最新已收盘 K，未收盘 K 不在表内。
-- 输出只描述市场周期、方向、结构、信号质量、支撑阻力与闸门结论。
-- 禁止在阶段一给入场、止损、止盈或仓位建议。
-- `cycle_position` 必须在 PA_Agent 周期枚举中选择，
-  不要使用 trend/breakout/reversal。
-- `direction` 只能是 bullish、bearish 或 neutral。
-- `diagnosis_confidence` 必须是 0-100 的整数，不能写 high/medium/low。
-- `support_levels` 只填当前价格下方支撑，
-  `resistance_levels` 只填当前价格上方阻力。
-- `bar_by_bar_summary` 分析窗口>=5根时必须恰好 5 条，覆盖 K5-K1。
-- `bar_by_bar_summary[].bar_type` 必须照抄特征汇总表中的 `bar_type`，
-  禁止自行改写。
-- `gate_trace` 按二元决策树前半段输出；gate_result=proceed 时必须包含
-  1.2、1.3、2.1、2.2、2.5 五个节点。
-- `gate_result=wait/unknown` 只允许出现在 1.2 无法识别周期或 1.3 极端混乱时。
-- 2.1/2.5 为否或中性不代表阶段一阻断，通常仍应 gate_result=proceed。
-- 每条 gate_trace 必须有 `bar_range`，只能引用 K1 到当前表内最大 K，禁止 K0。
-- 输出必须符合这个 JSON contract：
-{json.dumps(MARKET_DIAGNOSIS_SCHEMA, ensure_ascii=False, indent=2)}
-
-标的：{l1.symbol}
-市场：{l1.market}
-周期：{l1.timeframe}
-最新已收盘 K：{l1.candle_time.isoformat()}
-
-K线文本表：
-{l1.kline_table}
-
-特征汇总表：
-{l1.feature_table}
-
-市场结构辅助特征：
-{l1.market_features_text}
-""".strip()
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    return DEFAULT_ASSEMBLER.build_market_diagnosis_messages(features)
 
 
 def build_trade_decision_messages(
     *,
-    l1: L1FeatureResult,
+    features: PriceActionFeatureResult,
     diagnosis: dict[str, Any],
     strategies: list[StrategyTemplate],
     experience_cases: list[dict[str, Any]] | None = None,
     previous_decision: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     """Assemble the trade-decision prompt."""
-    system = (
-        "你是价格行为交易决策助手。你只做监控决策，不代表真实下单。"
-        "必须返回裸 JSON object，禁止 Markdown、解释性前后缀。"
+    return DEFAULT_ASSEMBLER.build_trade_decision_messages(
+        features=features,
+        diagnosis=diagnosis,
+        strategies=strategies,
+        experience_cases=experience_cases,
+        previous_decision=previous_decision,
     )
-    strategy_text = "\n\n".join(strategy.render() for strategy in strategies)
-    experience_text = json.dumps(experience_cases or [], ensure_ascii=False, indent=2)
-    previous_text = json.dumps(previous_decision or {}, ensure_ascii=False, indent=2)
-    user = f"""
-任务：完成 L4 交易决策。
 
-输入：
-1. 阶段一市场诊断 JSON
-{json.dumps(diagnosis, ensure_ascii=False, indent=2)}
 
-2. L3 本地路由策略模板
-{strategy_text}
-
-3. 最新 K 线表
-{l1.kline_table}
-
-4. L1 最新 K 特征
-{json.dumps(l1.latest_features, ensure_ascii=False, indent=2)}
-
-5. 可选经验库案例
-{experience_text}
-
-6. 上一轮成功决策 trace（用于增量延续，不存在则为空）
-{previous_text}
-
-硬性约束：
-- 若 ATR_x / atr_expand_ratio > 2 且正在突破闸门，
-  必须视作假突破风险，不能直接追价。
-- 入场、止损、止盈必须与方向一致：
-  多单止损低于入场，止盈高于入场；空单反之。
-- 不满足策略模板信号链时输出 wait 或 avoid。
-- 输出必须符合这个 JSON contract：
-{json.dumps(TRADE_DECISION_SCHEMA, ensure_ascii=False, indent=2)}
-""".strip()
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+def prompt_template_metadata() -> dict[str, Any]:
+    """Return version metadata for all prompt templates used by default."""
+    return DEFAULT_ASSEMBLER.metadata()

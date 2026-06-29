@@ -1,4 +1,4 @@
-"""L1-L4 PA_Agent-style analysis orchestration."""
+"""PA_Agent-style price-action analysis orchestration."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,12 +9,16 @@ from typing import Any, Callable
 from pandas import DataFrame
 
 from .experience import retrieve_experience_cases
-from .features import L1FeatureResult, build_l1_features
+from .features import PriceActionFeatureResult, build_price_action_features
 from .llm import OpenAIJsonClient
-from .prompts import build_market_diagnosis_messages, build_trade_decision_messages
+from .prompts import (
+    build_market_diagnosis_messages,
+    build_trade_decision_messages,
+    prompt_template_metadata,
+)
 from .repository import PriceActionRepository
 from .router import route_strategies
-from .validation import DecisionValidator, parse_json_object, validate_stage1_diagnosis
+from .validation import DecisionValidator, parse_json_object, validate_market_diagnosis
 
 
 logger = logging.getLogger(__name__)
@@ -33,7 +37,7 @@ class AnalysisOutcome:
 
 
 class PriceActionOrchestrator:
-    """Run L1 features, Stage 1 diagnosis, L3 routing, and L4 decision."""
+    """Run feature engineering, market diagnosis, strategy routing, and trade decision."""
 
     def __init__(
         self,
@@ -59,11 +63,13 @@ class PriceActionOrchestrator:
         chart_generator: Callable | None = None,
     ) -> AnalysisOutcome:
         """Run the full pipeline for one symbol/timeframe closed candle."""
-        l1: L1FeatureResult | None = None
+        features: PriceActionFeatureResult | None = None
         raw_market_diagnosis: str | None = None
         raw_trade_decision: str | None = None
         diagnosis: dict[str, Any] | None = None
         decision_json: dict[str, Any] | None = None
+        market_diagnosis_messages: list[dict[str, str]] | None = None
+        trade_decision_messages: list[dict[str, str]] | None = None
         validation_status: str | None = None
         validation_errors: list[str] = []
         selected = []
@@ -72,10 +78,11 @@ class PriceActionOrchestrator:
             "model": self.llm_client.model,
             "base_url": self.llm_client.base_url,
             "response_format": {"type": "json_object"},
+            "prompt_templates": prompt_template_metadata(),
         }
 
         try:
-            l1 = build_l1_features(
+            features = build_price_action_features(
                 dataframe,
                 symbol=symbol,
                 timeframe=timeframe,
@@ -84,15 +91,20 @@ class PriceActionOrchestrator:
                 warmup=int(self.config.get("pa_llm_warmup", 50)),
             )
 
-            market_diagnosis_messages = build_market_diagnosis_messages(l1)
+            market_diagnosis_messages = build_market_diagnosis_messages(features)
             raw_market_diagnosis = self.llm_client.complete_json(
                 market_diagnosis_messages,
                 stage="market_diagnosis",
             )
             diagnosis = parse_json_object(raw_market_diagnosis)
-            stage1_errors = validate_stage1_diagnosis(diagnosis, l1_rows=l1.rows)
-            if stage1_errors:
-                raise ValueError(f"stage1_invalid:{','.join(stage1_errors)}")
+            market_diagnosis_errors = validate_market_diagnosis(
+                diagnosis,
+                feature_rows=features.rows,
+            )
+            if market_diagnosis_errors:
+                raise ValueError(
+                    f"market_diagnosis_invalid:{','.join(market_diagnosis_errors)}"
+                )
 
             strategies = route_strategies(diagnosis)
             selected = [strategy.as_dict() for strategy in strategies]
@@ -111,7 +123,7 @@ class PriceActionOrchestrator:
                 decision_json, validation = self.validator.validate(
                     raw_trade_decision,
                     diagnosis=diagnosis,
-                    l1_features=l1.latest_features,
+                    price_action_features=features.latest_features,
                     strategies=selected,
                 )
                 validation_status = validation.status
@@ -119,8 +131,10 @@ class PriceActionOrchestrator:
                 status = "success" if validation.valid else "invalid"
 
                 self._save(
-                    l1=l1,
+                    features=features,
                     status=status,
+                    market_diagnosis_messages=market_diagnosis_messages,
+                    trade_decision_messages=[],
                     diagnosis=diagnosis,
                     selected=selected,
                     experience_cases=experience_cases,
@@ -139,7 +153,7 @@ class PriceActionOrchestrator:
                         notifier=notifier,
                         symbol=symbol,
                         dataframe=dataframe,
-                        l1=l1,
+                        price_action_features=features,
                         diagnosis=diagnosis,
                         selected=selected,
                         decision=decision_json,
@@ -151,7 +165,7 @@ class PriceActionOrchestrator:
                     status=status,
                     symbol=symbol,
                     timeframe=timeframe,
-                    candle_time=l1.candle_time,
+                    candle_time=features.candle_time,
                     decision=decision_json,
                     errors=validation_errors,
                 )
@@ -160,14 +174,14 @@ class PriceActionOrchestrator:
                 self.repository.get_previous_successful_analysis(
                     symbol=symbol,
                     timeframe=timeframe,
-                    before_time=l1.candle_time,
+                    before_time=features.candle_time,
                 )
                 if self.repository
                 else None
             )
 
             trade_decision_messages = build_trade_decision_messages(
-                l1=l1,
+                features=features,
                 diagnosis=diagnosis,
                 strategies=strategies,
                 experience_cases=experience_cases,
@@ -180,7 +194,7 @@ class PriceActionOrchestrator:
             decision_json, validation = self.validator.validate(
                 raw_trade_decision,
                 diagnosis=diagnosis,
-                l1_features=l1.latest_features,
+                price_action_features=features.latest_features,
                 strategies=selected,
             )
             validation_status = validation.status
@@ -188,8 +202,10 @@ class PriceActionOrchestrator:
             status = "success" if validation.valid else "invalid"
 
             self._save(
-                l1=l1,
+                features=features,
                 status=status,
+                market_diagnosis_messages=market_diagnosis_messages,
+                trade_decision_messages=trade_decision_messages,
                 diagnosis=diagnosis,
                 selected=selected,
                 experience_cases=experience_cases,
@@ -208,7 +224,7 @@ class PriceActionOrchestrator:
                     notifier=notifier,
                     symbol=symbol,
                     dataframe=dataframe,
-                    l1=l1,
+                    price_action_features=features,
                     diagnosis=diagnosis,
                     selected=selected,
                     decision=decision_json,
@@ -220,7 +236,7 @@ class PriceActionOrchestrator:
                 status=status,
                 symbol=symbol,
                 timeframe=timeframe,
-                candle_time=l1.candle_time,
+                candle_time=features.candle_time,
                 decision=decision_json,
                 errors=validation_errors,
             )
@@ -233,10 +249,12 @@ class PriceActionOrchestrator:
                 exc_info=True,
             )
             validation_errors = [f"{type(exc).__name__}:{exc}"]
-            if l1 is not None:
+            if features is not None:
                 self._save(
-                    l1=l1,
+                    features=features,
                     status="failed",
+                    market_diagnosis_messages=market_diagnosis_messages,
+                    trade_decision_messages=trade_decision_messages,
                     diagnosis=diagnosis,
                     selected=selected,
                     experience_cases=experience_cases,
@@ -253,7 +271,7 @@ class PriceActionOrchestrator:
                 status="failed",
                 symbol=symbol,
                 timeframe=timeframe,
-                candle_time=l1.candle_time if l1 else None,
+                candle_time=features.candle_time if features else None,
                 decision=decision_json,
                 errors=validation_errors,
             )
@@ -261,8 +279,10 @@ class PriceActionOrchestrator:
     def _save(
         self,
         *,
-        l1: L1FeatureResult,
+        features: PriceActionFeatureResult,
         status: str,
+        market_diagnosis_messages: list[dict[str, str]] | None,
+        trade_decision_messages: list[dict[str, str]] | None,
         diagnosis: dict[str, Any] | None,
         selected: list[dict[str, Any]],
         experience_cases: list[dict[str, Any]],
@@ -275,14 +295,16 @@ class PriceActionOrchestrator:
         if not self.repository:
             return
         self.repository.save_analysis(
-            market=l1.market,
-            symbol=l1.symbol,
-            timeframe=l1.timeframe,
-            candle_time=l1.candle_time,
+            market=features.market,
+            symbol=features.symbol,
+            timeframe=features.timeframe,
+            candle_time=features.candle_time,
             status=status,
-            kline_table=l1.kline_table,
-            feature_table=l1.feature_table,
-            l1_features=l1.as_dict(),
+            kline_table=features.kline_table,
+            feature_table=features.feature_table,
+            price_action_features=features.as_dict(),
+            market_diagnosis_messages=market_diagnosis_messages,
+            trade_decision_messages=trade_decision_messages,
             market_diagnosis=diagnosis,
             selected_strategies=selected,
             experience_cases=experience_cases,
@@ -307,7 +329,7 @@ class PriceActionOrchestrator:
         final_reason = ""
         if trace and isinstance(trace[-1], dict):
             final_reason = str(trace[-1].get("reason") or "")
-        reason = final_reason or str(diagnosis.get("risk_warning") or "阶段一闸门未通过")
+        reason = final_reason or str(diagnosis.get("risk_warning") or "市场诊断闸门未通过")
         confidence = diagnosis.get("diagnosis_confidence")
         try:
             confidence_value = max(0.0, min(float(confidence) / 100.0, 1.0))
@@ -325,11 +347,11 @@ class PriceActionOrchestrator:
                 "take_profit_2": None,
                 "risk_reward": None,
                 "confidence": confidence_value,
-                "reason": f"阶段一 gate_result={gate_result}，跳过阶段二：{reason}",
+                "reason": f"市场诊断 gate_result={gate_result}，跳过交易决策：{reason}",
             },
             "decision_trace": [
-                f"stage1_gate_result={gate_result}",
-                "stage2_model_call=skipped",
+                f"market_diagnosis_gate_result={gate_result}",
+                "trade_decision_model_call=skipped",
             ],
             "watch_points": [reason],
             "invalidations": [],
@@ -341,7 +363,7 @@ class PriceActionOrchestrator:
         notifier: Any | None,
         symbol: str,
         dataframe: DataFrame,
-        l1: L1FeatureResult,
+        price_action_features: PriceActionFeatureResult,
         diagnosis: dict[str, Any],
         selected: list[dict[str, Any]],
         decision: dict[str, Any],
@@ -354,7 +376,7 @@ class PriceActionOrchestrator:
             symbol,
             dataframe,
             {
-                "l1": l1.as_dict(),
+                "price_action_features": price_action_features.as_dict(),
                 "diagnosis": diagnosis,
                 "selected_strategies": selected,
                 "decision": decision,

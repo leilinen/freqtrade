@@ -1,0 +1,29 @@
+任务：完成交易决策。
+
+输入：
+1. 市场诊断 JSON
+{diagnosis_json}
+
+2. 本地路由策略模板
+{strategy_text}
+
+3. 最新 K 线表
+{kline_table}
+
+4. 价格行为最新 K 特征
+{latest_features_json}
+
+5. 可选经验库案例
+{experience_text}
+
+6. 上一轮成功决策 trace（用于增量延续，不存在则为空）
+{previous_text}
+
+硬性约束：
+- 若 ATR_x / atr_expand_ratio > 2 且正在突破闸门，
+  必须视作假突破风险，不能直接追价。
+- 入场、止损、止盈必须与方向一致：
+  多单止损低于入场，止盈高于入场；空单反之。
+- 不满足策略模板信号链时输出 wait 或 avoid。
+- 输出必须符合这个 JSON contract：
+{schema_json}

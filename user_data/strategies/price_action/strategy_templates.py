@@ -1,4 +1,4 @@
-"""Deterministic L3 strategy templates for PA routing."""
+"""Deterministic strategy templates for PA routing."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,7 +9,7 @@ ATR_VETO = "ATR 突变否决：若最新 K 的 ATR_x/atr_expand_ratio > 2 且突
 
 @dataclass(frozen=True)
 class StrategyTemplate:
-    """Local strategy template routed from L2 diagnosis."""
+    """Local strategy template routed from market diagnosis."""
 
     template_id: str
     name: str

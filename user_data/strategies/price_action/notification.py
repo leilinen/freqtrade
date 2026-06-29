@@ -170,19 +170,19 @@ class SignalNotifier:
         *,
         chart_generator: Callable[[str, str, DataFrame], bytes] | None = None,
     ) -> None:
-        """POST an L4 trade-decision payload (with optional chart) to tg-bot /decision.
+        """POST a trade-decision payload (with optional chart) to tg-bot /decision.
 
         ``payload`` is the orchestrator decision bundle::
 
-            {"l1": ..., "diagnosis": ..., "selected_strategies": [...],
-             "decision": {...}, "validation": {...}}
+            {"price_action_features": ..., "diagnosis": ...,
+             "selected_strategies": [...], "decision": {...}, "validation": {...}}
 
         Only actionable decisions (enter_long / enter_short) reach this method;
         wait / avoid are persisted but not pushed (see orchestrator._should_notify).
         """
         tg_api = self._config.get("tg_api_url", "http://tg-bot:8090")
         decision = payload.get("decision") or {}
-        l1 = payload.get("l1") or {}
+        price_action_features = payload.get("price_action_features") or {}
         decision_type = str(decision.get("type", "")).lower()
 
         display_name = None
@@ -192,7 +192,7 @@ class SignalNotifier:
                 if wp:
                     display_name = wp.display_name
 
-        candle_time = l1.get("candle_time")
+        candle_time = price_action_features.get("candle_time")
         try:
             ct = datetime.fromisoformat(str(candle_time)) if candle_time else datetime.now(UTC)
         except (TypeError, ValueError):

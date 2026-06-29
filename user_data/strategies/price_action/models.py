@@ -106,7 +106,7 @@ class PaKline(_Base):
 
 
 class PaAnalysis(_Base):
-    """PA_Agent-style L1-L4 analysis record."""
+    """PA_Agent-style price-action analysis record."""
 
     __tablename__ = "pa_analysis"
 
@@ -124,7 +124,9 @@ class PaAnalysis(_Base):
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
     kline_table: Mapped[str | None] = mapped_column(Text, nullable=True)
     feature_table: Mapped[str | None] = mapped_column(Text, nullable=True)
-    l1_features: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    price_action_features: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    market_diagnosis_messages: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    trade_decision_messages: Mapped[list | None] = mapped_column(JSON, nullable=True)
     market_diagnosis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     selected_strategies: Mapped[list | None] = mapped_column(JSON, nullable=True)
     experience_cases: Mapped[list | None] = mapped_column(JSON, nullable=True)

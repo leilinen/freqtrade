@@ -1,4 +1,4 @@
-"""L1 feature engineering for PA_Agent-style price-action analysis."""
+"""Price-action feature engineering for PA_Agent-style analysis."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,8 +13,8 @@ from pandas import DataFrame
 
 
 @dataclass(frozen=True)
-class L1FeatureResult:
-    """Pure-Python feature output consumed by L2/L4 prompts."""
+class PriceActionFeatureResult:
+    """Pure-Python feature output consumed by diagnosis and decision prompts."""
 
     symbol: str
     timeframe: str
@@ -171,7 +171,7 @@ def calculate_atr(df: DataFrame, period: int = 14) -> pd.Series:
     return atr
 
 
-def build_l1_features(
+def build_price_action_features(
     dataframe: DataFrame,
     *,
     symbol: str,
@@ -180,7 +180,7 @@ def build_l1_features(
     window: int = 30,
     warmup: int = 50,
     now: datetime | pd.Timestamp | None = None,
-) -> L1FeatureResult:
+) -> PriceActionFeatureResult:
     """Build newest-first K-line and feature tables from OHLCV."""
     closed = select_closed_candles(dataframe, timeframe, market=market, now=now)
     if closed.empty:
@@ -297,7 +297,7 @@ def build_l1_features(
     market_features_text = _build_market_features_text(market_features)
     candle_time = _to_utc_naive(newest_first.iloc[0]["date"])
 
-    return L1FeatureResult(
+    return PriceActionFeatureResult(
         symbol=symbol,
         timeframe=timeframe,
         market=market,
@@ -633,7 +633,7 @@ def _build_market_features(rows: list[dict[str, Any]], lookback: int = 40) -> di
 
 
 def _build_market_features_text(features: dict[str, Any]) -> str:
-    """Render compact Chinese market-structure facts for the Stage 1 prompt."""
+    """Render compact Chinese market-structure facts for the market-diagnosis prompt."""
     if not features:
         return "程序结构辅助特征：无可用数据"
     lines = [

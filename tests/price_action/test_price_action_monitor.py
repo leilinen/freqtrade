@@ -452,16 +452,16 @@ class TestGenerateChart:
 
 
 # ===================================================================
-# Tests: SignalNotifier.notify_decision (L4 decision → /decision)
+# Tests: SignalNotifier.notify_decision (trade decision -> /decision)
 # ===================================================================
 
 
 class TestNotifyDecision:
-    """Tests for the LLM L4 decision notification path (tg-bot /decision)."""
+    """Tests for the LLM trade-decision notification path (tg-bot /decision)."""
 
     def _make_decision_payload(self):
         return {
-            "l1": {"candle_time": "2026-06-01T10:00:00"},
+            "price_action_features": {"candle_time": "2026-06-01T10:00:00"},
             "diagnosis": {},
             "selected_strategies": [],
             "decision": {
@@ -482,7 +482,7 @@ class TestNotifyDecision:
 
     @patch("price_action.notification.http_requests.post")
     def test_posts_decision_to_decision_endpoint(self, mock_post):
-        """notify_decision should POST the L4 payload to /decision with chart."""
+        """notify_decision should POST the trade decision to /decision with chart."""
         s = _make_strategy()
         s.config = {"tg_api_url": "http://tg-bot:8090"}
         df = _make_ohlcv_df(25)
@@ -560,7 +560,7 @@ class TestStructureContextRules:
 
     These now exercise the rules engine (PriceActionSignalRules) directly,
     since the strategy no longer wraps the signal-bar flow (replaced by the
-    LLM L1-L4 pipeline). The rules engine is still used by repository/notifier.
+    LLM PA analysis pipeline). The rules engine is still used by repository/notifier.
     """
 
     def _rules(self):
