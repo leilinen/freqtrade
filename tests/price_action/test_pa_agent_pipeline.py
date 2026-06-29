@@ -6,7 +6,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -17,6 +17,29 @@ _STRAT_DIR = os.path.abspath(
 )
 if _STRAT_DIR not in sys.path:
     sys.path.insert(0, _STRAT_DIR)
+
+# Stub freqtrade.strategy so price_action_monitor can import without a full
+# freqtrade install. Provide a concrete IStrategy base (with a real __init__)
+# so PriceActionMonitor subclasses work and attribute access behaves normally.
+# talib is expected to be installed (Docker) or stubbed by the conftest;
+# rules.py imports it eagerly via repository.
+if "freqtrade" not in sys.modules:
+    sys.modules["freqtrade"] = MagicMock()
+
+
+class _FakeIStrategy:
+    """Minimal concrete IStrategy base for strategy wiring tests."""
+
+    def __init__(self, config: dict) -> None:
+        self.config = config
+        self.dp = None
+        self.timeframe = "1h"
+
+
+if "freqtrade.strategy" not in sys.modules:
+    _ft_strategy_mod = MagicMock()
+    _ft_strategy_mod.IStrategy = _FakeIStrategy
+    sys.modules["freqtrade.strategy"] = _ft_strategy_mod
 
 from price_action.features import (  # noqa: E402
     build_l1_features,
@@ -361,3 +384,71 @@ class TestPaAnalysisWorker:
 
         assert first is True
         assert second is False
+
+
+class TestPriceActionMonitorPipeline:
+    """Verify the strategy wires the LLM pipeline and degrades gracefully."""
+
+    def _make_strategy(self, config=None):
+        # Import lazily so the freqtrade stub is in place.
+        from price_action_monitor import PriceActionMonitor
+
+        s = PriceActionMonitor(config=config or {})
+        s.timeframe = "1h"
+        return s
+
+    def test_pipeline_disabled_by_config(self):
+        """pa_agent_enabled=false → no worker/orchestrator created."""
+        s = self._make_strategy({"pa_agent_enabled": False})
+        s._init_pa_pipeline()
+
+        assert s._worker is None
+        assert s._orchestrator is None
+        assert s._llm_client is None
+
+    def test_pipeline_disabled_without_api_key(self):
+        """No api_key (no config, no env var) → graceful disable, no exception."""
+        s = self._make_strategy({})
+        # Ensure no key in env
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+            os.environ.pop("OPENAI_API_KEY", None)
+            s._init_pa_pipeline()
+
+        assert s._worker is None
+        assert s._llm_client is None
+
+    def test_pipeline_starts_with_api_key(self):
+        """With pa_llm_api_key set, worker + orchestrator are created and started."""
+        s = self._make_strategy({"pa_llm_api_key": "sk-test"})
+
+        started = []
+        with patch.object(PaAnalysisWorker, "start", lambda self: started.append(self)):
+            s._init_pa_pipeline()
+
+        assert s._llm_client is not None
+        assert s._llm_client.api_key == "sk-test"
+        assert s._orchestrator is not None
+        assert s._worker is not None
+        assert len(started) == 1
+        # stop the worker thread pool cleanly
+        s._worker._started = False
+
+    def test_should_notify_only_for_enter_decisions(self):
+        from price_action.orchestrator import PriceActionOrchestrator
+
+        orc = PriceActionOrchestrator(
+            repository=None,
+            llm_client=MagicMock(),
+            config={},
+        )
+        assert orc._should_notify({"decision": {"type": "enter_long"}}) is True
+        assert orc._should_notify({"decision": {"type": "enter_short"}}) is True
+        assert orc._should_notify({"decision": {"type": "wait"}}) is False
+        assert orc._should_notify({"decision": {"type": "avoid"}}) is False
+        assert orc._should_notify(None) is False
+        # pa_notify_wait=True surfaces wait/avoid too
+        orc_wait = PriceActionOrchestrator(
+            repository=None, llm_client=MagicMock(), config={"pa_notify_wait": True}
+        )
+        assert orc_wait._should_notify({"decision": {"type": "wait"}}) is True

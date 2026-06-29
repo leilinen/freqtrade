@@ -1,16 +1,25 @@
 """
-价格行为信号K线盯盘策略 (Price Action Signal Bar Monitor)
+价格行为 LLM 决策盯盘策略 (Price Action LLM Decision Monitor)
 
-基于 Al Brooks 价格行为学，量化识别信号K线并通过独立 TG Bot 推送通知。
-纯盯盘工具，不执行实际交易。信号数据写入 PostgreSQL，通知通过 HTTP POST 发送到 tg-bot。
+基于 Al Brooks 价格行为学 + 两阶段 LLM 管道（L1 特征 → L2 诊断 → L3 路由 → L4 决策），
+架构对齐 PA_Agent。每根新 K 收盘后在后台异步运行 LLM 分析，产出交易决策，
+写入 PostgreSQL（pa_analysis 表）并通过 HTTP POST 推送到独立 tg-bot 的 /decision 端点。
+纯盯盘工具，不执行实际交易。
 
-量化规则来源: signal-bar-spec.md, breakout-scoring.md
+LLM 调用使用 OpenAI SDK 兼容方式（base_url + api_key 可配置，默认 DeepSeek），
+api_key 优先从 config 读，其次 DEEPSEEK_API_KEY 环境变量（推荐用环境变量注入）。
 
 配置要求 (config JSON):
   pa_db_url: PostgreSQL 连接串
     例: "postgresql://postgres:postgres@localhost:15432/freqtrade_monitor"
   tg_api_url: TG Bot HTTP API 地址
     例: "http://tg-bot:8090"
+  pa_agent_enabled: 是否启用 LLM 管道（默认 true，需 api_key 才真正生效）
+  pa_llm_base_url / pa_llm_model / pa_llm_temperature / pa_llm_timeout:
+    LLM 服务地址、模型、采样温度、超时（默认 DeepSeek deepseek-chat）
+  pa_llm_window / pa_llm_warmup: L1 取最近 N 根已收盘 K、warmup 预热根数（默认 30 / 50）
+  pa_experience_limit: 经验库检索条数（默认 3）
+  pa_notify_wait: wait/avoid 是否也推送（默认 false，仅 enter 推送）
 """
 
 import atexit
@@ -20,14 +29,16 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-import pandas as pd
 import requests as http_requests
 from pandas import DataFrame
 from price_action.background import MarketBackgroundAnalyzer
-from price_action.models import PaKline, PaSignal, WatchPair, _Base
+from price_action.features import calculate_atr, calculate_ema
+from price_action.llm import OpenAIJsonClient
+from price_action.models import PaKline, WatchPair, _Base
 from price_action.notification import SignalNotifier
+from price_action.orchestrator import PriceActionOrchestrator
 from price_action.repository import PriceActionRepository
-from price_action.rules import PriceActionSignalRules
+from price_action.worker import PaAnalysisWorker
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -38,7 +49,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "PaKline",
-    "PaSignal",
     "PriceActionMonitor",
     "WatchPair",
     "_Base",
@@ -50,16 +60,15 @@ DEFAULT_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 
 class PriceActionMonitor(IStrategy):
     """
-    价格行为信号K线盯盘策略。
+    价格行为 LLM 决策盯盘策略。
 
-    检测信号K线质量分级（好/可接受/一般）和特殊K线类型
-    （内包线、吞噬线、惊喜K线、2K反转），
-    将信号写入 PostgreSQL 并通过 HTTP POST 通知独立 TG Bot 服务。
+    每根新 K 收盘后，在后台异步运行 L1-L4 两阶段 LLM 管道：
+    L1 纯 Python 特征工程 → L2 市场诊断 → L3 本地策略路由 → L4 交易决策（四重校验）。
+    决策写入 PostgreSQL（pa_analysis 表），仅 enter_long/enter_short 推送 tg-bot /decision。
 
-    盯盘标的从 PG watch_pair 表动态读取。
-
-    必须以 dry_run: true 模式运行。
-    config 中需设置 pa_db_url。
+    盯盘标的从 PG watch_pair 表动态读取。必须以 dry_run: true 模式运行，
+    config 中需设置 pa_db_url；启用 LLM 管道需配置 pa_llm_api_key 或注入
+    DEEPSEEK_API_KEY 环境变量。
     """
 
     INTERFACE_VERSION = 3
@@ -77,50 +86,18 @@ class PriceActionMonitor(IStrategy):
     process_only_new_candles = True
     startup_candle_count: int = 120
 
-    # --- 信号质量阈值 (V2, 经 6 个月数据评估优化) ---
-    # V1: good 胜率 45.0% → V2: 51.9%, 净收益 +0.297 ATR, 盈亏比 1.38
-
-    GOOD_LONG_BODY_PCT = 0.85
-    GOOD_LONG_CLOSE_LOC = 0.90
-    GOOD_LONG_UPPER_SHADOW = 0.05
-    GOOD_MIN_BODY_RATIO = 1.5
-
-    ACCEPT_LONG_BODY_PCT = 0.65
-    ACCEPT_LONG_CLOSE_LOC = 0.75
-    ACCEPT_LONG_UPPER_SHADOW = 0.15
-    ACCEPT_MIN_BODY_RATIO = 1.2
-
-    FAIR_LONG_BODY_PCT = 0.5
-    FAIR_LONG_CLOSE_LOC = 0.6
-
-    GOOD_SHORT_CLOSE_LOC = 0.10
-    GOOD_SHORT_LOWER_SHADOW = 0.05
-
-    ACCEPT_SHORT_CLOSE_LOC = 0.25
-    ACCEPT_SHORT_LOWER_SHADOW = 0.15
-
-    FAIR_SHORT_CLOSE_LOC = 0.4
-
-    # EMA20 背景过滤
-    EMA_MAX_GAP = 2.0
-    BULL_STRENGTH_LONG_MIN = 0.5
-    BULL_STRENGTH_SHORT_MAX = 0.5
-    FOLLOW_THROUGH_WINDOW = 3
-
-    # 特殊K线参数
-    SURPRISE_LOOKBACK = 20
-    SURPRISE_MIN_BODY_PCT = 0.5
-
     def __init__(self, config: dict) -> None:
         super().__init__(config)
         self._pg_engine = None
         self._pg_session_factory = None
         self._chart_http_server = None
         self._market = "crypto"
-        self._rules = PriceActionSignalRules()
         self._background = MarketBackgroundAnalyzer()
         self._repository: PriceActionRepository | None = None
         self._notifier: SignalNotifier | None = None
+        self._llm_client: OpenAIJsonClient | None = None
+        self._orchestrator: PriceActionOrchestrator | None = None
+        self._worker: PaAnalysisWorker | None = None
 
     # ================================================================
     # 生命周期回调
@@ -140,13 +117,11 @@ class PriceActionMonitor(IStrategy):
             self._pg_session_factory,
             timeframe=self.timeframe,
             market=self._market,
-            rules=self._rules,
         )
         self._notifier = SignalNotifier(
             self._pg_session_factory,
             config=self.config,
             timeframe=self.timeframe,
-            rules=self._rules,
         )
         atexit.register(self._cleanup)
 
@@ -154,6 +129,9 @@ class PriceActionMonitor(IStrategy):
         self._init_default_pairs()
 
         logger.info("PG persistence initialized: %s", db_url)
+
+        # 初始化 LLM 决策管道（L1-L4）
+        self._init_pa_pipeline()
 
         # 启动 /quote HTTP server（供 tg-bot 调用获取 K 线图）
         chart_port = self.config.get("pa_chart_port")
@@ -163,7 +141,46 @@ class PriceActionMonitor(IStrategy):
             except Exception:
                 logger.warning("Failed to start chart HTTP server on port %s", chart_port, exc_info=True)
 
+    def _init_pa_pipeline(self) -> None:
+        """构建 OpenAIJsonClient + Orchestrator + Worker；无 api_key 时优雅降级。"""
+        if not self.config.get("pa_agent_enabled", True):
+            logger.info("PA LLM pipeline disabled by config (pa_agent_enabled=false)")
+            return
+        try:
+            client = OpenAIJsonClient.from_config(self.config)
+        except Exception:
+            logger.warning("PA LLM client build failed; pipeline disabled", exc_info=True)
+            return
+        # 没有可用 api_key 时不启用管道（DeepSeek 调用会失败）
+        if not client.api_key:
+            logger.warning(
+                "PA LLM pipeline disabled: no api_key (set pa_llm_api_key or DEEPSEEK_API_KEY)"
+            )
+            return
+        self._llm_client = client
+        self._orchestrator = PriceActionOrchestrator(
+            repository=self._repository,
+            llm_client=client,
+            config=self.config,
+        )
+        self._worker = PaAnalysisWorker(
+            self._orchestrator,
+            max_workers=int(self.config.get("pa_agent_workers", 1)),
+        )
+        self._worker.start()
+        logger.info(
+            "PA LLM pipeline started: model=%s base_url=%s",
+            client.model,
+            client.base_url,
+        )
+
     def _cleanup(self) -> None:
+        if self._worker is not None:
+            try:
+                self._worker.stop()
+            except Exception:
+                logger.warning("Failed to stop PA worker", exc_info=True)
+            self._worker = None
         if self._chart_http_server is not None:
             try:
                 self._chart_http_server.shutdown()
@@ -182,7 +199,6 @@ class PriceActionMonitor(IStrategy):
                 self._pg_session_factory,
                 timeframe=self.timeframe,
                 market=self._market,
-                rules=self._rules,
             )
         self._repository.market = self._market
         return self._repository
@@ -194,7 +210,6 @@ class PriceActionMonitor(IStrategy):
                 self._pg_session_factory,
                 config=self.config,
                 timeframe=self.timeframe,
-                rules=self._rules,
             )
         return self._notifier
 
@@ -296,39 +311,24 @@ class PriceActionMonitor(IStrategy):
     # ================================================================
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """计算所有价格行为指标。"""
+        """计算价格行为几何指标（L1 输入）+ 市场背景。
+
+        不再产出信号；信号完全由 LLM L4 决策给出。
+        """
         dataframe = self._calc_basic_indicators(dataframe)
         dataframe = self._calc_ema_atr(dataframe)
-        dataframe = self._detect_special_bars(dataframe)
-        dataframe = self._classify_signal_quality(dataframe)
-        dataframe = self._evaluate_context(dataframe)
-        dataframe = self._calc_structure_context(dataframe)
         dataframe = self._evaluate_background(dataframe)
-        dataframe = self._detect_ema20_cross(dataframe)
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """检测最新K线信号，发送通知并写入 PG。"""
+        """新 K 收盘后：提交 LLM 分析任务 + 持久化 K 线。"""
         if len(dataframe) == 0:
             return dataframe
 
-        # 只在 live/dry_run 模式下发送通知
+        # 只在 live/dry_run 模式下运行管道
         if self.dp and self.dp.runmode.value in ("live", "dry_run"):
-            last = dataframe.iloc[-1]
             pair = metadata.get("pair", "Unknown")
-            quality = last.get("signal_quality", "none")
-            direction = last.get("signal_direction", "none")
-            if quality != "none":
-                logger.info("Scan %s %s: %s %s", pair, self.timeframe, direction, quality)
-            else:
-                logger.debug("Scan %s %s: no signal", pair, self.timeframe)
-            self._check_and_notify(pair, last, dataframe)
-
-            # EMA20 穿越检测是状态提醒,独立于 signal-bar follow-through。
-            cross = last.get("ema20_cross", "none")
-            if cross != "none":
-                self._notify_ema_cross(pair, last, dataframe, cross)
-
+            self._submit_pa_analysis(pair, dataframe)
             self._persist_kline(pair, dataframe)
 
         return dataframe
@@ -342,127 +342,48 @@ class PriceActionMonitor(IStrategy):
     # ================================================================
 
     def _calc_basic_indicators(self, df: DataFrame) -> DataFrame:
-        """K线基础指标 — signal-bar-spec.md §2.1"""
-        return self._rules.calc_basic_indicators(df)
+        """K 线基础几何指标：body/range/影线/方向。"""
+        df = df.copy()
+        df["body"] = (df["close"] - df["open"]).abs()
+        df["range"] = df["high"] - df["low"]
+        return df
 
     def _calc_ema_atr(self, df: DataFrame) -> DataFrame:
-        """EMA20 和 ATR14 — signal-bar-spec.md §4.3"""
-        return self._rules.calc_ema_atr(df)
+        """EMA20 和 ATR14，使用与 L1 一致的纯 pandas 实现（SMA/Wilder seed）。
 
-    def _detect_special_bars(self, df: DataFrame) -> DataFrame:
-        """特殊K线类型检测 — signal-bar-spec.md §3"""
-        return self._rules.detect_special_bars(df)
-
-    def _classify_signal_quality(self, df: DataFrame) -> DataFrame:
-        """信号K线质量分级 — V2 收紧阈值 + body_ratio 过滤"""
-        return self._rules.classify_signal_quality(df)
-
-    def _evaluate_context(self, df: DataFrame) -> DataFrame:
-        """背景评估指标 — signal-bar-spec.md §4"""
-        return self._rules.evaluate_context(df)
-
-    def _calc_structure_context(self, df: DataFrame) -> DataFrame:
-        """确定性结构上下文:区间位置、铁丝网、微观组合形态。"""
-        return self._rules.calc_structure_context(df)
+        统一这一处指标计算，避免 L1 特征与策略背景判断用两套 EMA/ATR 导致不一致。
+        """
+        df = df.copy()
+        df["ema20"] = calculate_ema(df["close"], 20)
+        df["atr14"] = calculate_atr(df, 14)
+        return df
 
     def _evaluate_background(self, df: DataFrame) -> DataFrame:
         """PA_AGENT-inspired multi-window market background detection."""
         return self._background.evaluate(df)
 
-    def _detect_ema20_cross(self, df: DataFrame) -> DataFrame:
-        """标记 EMA20 穿越:上穿(long)/ 下穿(short)/ 无(none)。
-
-        上穿:前一根 close < ema20,当前 close > ema20
-        下穿:前一根 close > ema20,当前 close < ema20
-        首行因 shift(1) 产生 NaN,被视为无穿越。
-        """
-        return self._rules.detect_ema20_cross(df)
-
     # ================================================================
-    # 通知 + PG 持久化
+    # LLM 决策管道
     # ================================================================
 
-    def _ema_context_ok(self, row: pd.Series, direction: str) -> bool:
-        """EMA20 背景过滤: 方向一致性 + ema_gap 限制。"""
-        return self._rules.ema_context_ok(row, direction)
-
-    def _candidate_signal_ok(self, row: pd.Series) -> bool:
-        """Return whether a row is a signal-bar candidate worth tracking."""
-        return self._rules.candidate_signal_ok(row)
-
-    def _follow_through_ok(self, candidate: pd.Series, future: DataFrame) -> bool:
-        """Brooks-style confirmation: signal-bar extreme breaks and is not quickly rejected."""
-        return self._rules.follow_through_ok(candidate, future)
-
-    def _confirm_recent_candidates(self, pair: str, dataframe: DataFrame) -> None:
-        """Confirm prior candidates once follow-through appears within 3 bars."""
-        if len(dataframe) < 2:
+    def _submit_pa_analysis(self, pair: str, dataframe: DataFrame) -> None:
+        """把最新已收盘 K 提交给后台 worker 跑 L1-L4 管道（去重 + 异步）。"""
+        if self._worker is None:
             return
-
-        current_pos = len(dataframe) - 1
-        start_pos = max(0, current_pos - self.FOLLOW_THROUGH_WINDOW)
-        for pos in range(start_pos, current_pos):
-            candidate = dataframe.iloc[pos]
-            if not self._candidate_signal_ok(candidate):
-                continue
-
-            future = dataframe.iloc[pos + 1: current_pos + 1]
-            if len(future) > self.FOLLOW_THROUGH_WINDOW:
-                future = future.iloc[: self.FOLLOW_THROUGH_WINDOW]
-            if not self._follow_through_ok(candidate, future):
-                continue
-
-            row = candidate.copy()
-            quality = row.get("signal_quality", "none")
-            row["signal_type"] = f"confirmed_signal_bar_{quality}"
-            msg = self._format_signal_message(pair, row)
-            saved = self._save_signal(
-                pair,
-                row,
-                f"follow_through_confirmed:{msg}",
-                signal_type=f"confirmed_signal_bar_{quality}",
-            )
-            if saved:
-                self._notify_tg_bot(pair, row, dataframe)
-
-    def _check_and_notify(self, pair: str, last: pd.Series, dataframe: DataFrame) -> None:
-        """Record candidates immediately; notify only after follow-through confirmation."""
-        quality = last.get("signal_quality", "none")
-        direction = last.get("signal_direction", "none")
-
-        if quality != "none" and not self._ema_context_ok(last, direction):
-            logger.debug("Signal filtered by EMA context: %s %s %s", pair, direction, quality)
-
-        if self._candidate_signal_ok(last):
-            logger.info(
-                "Candidate signal waiting for follow-through: %s %s %s",
-                pair, direction, quality,
-            )
-
-        self._confirm_recent_candidates(pair, dataframe)
-
-    def _get_bar_types(self, row: pd.Series) -> list[str]:
-        """收集当前K线的特殊类型标签。"""
-        return self._rules.get_bar_types(row)
-
-    def _save_signal(
-        self, pair: str, row: pd.Series, reason: str,
-        signal_type: str | None = None,
-    ) -> bool:
-        """将信号写入 PostgreSQL。
-
-        :param signal_type: 自定义 signal_type(默认 signal_bar_{quality})
-        :return: True when a new row was committed, False when skipped or duplicate.
-        """
-        repository = self._get_repository()
-        if not repository:
-            return False
-        return repository.save_signal(
-            pair,
-            row,
-            reason,
-            signal_type=signal_type,
+        submitted = self._worker.submit(
+            symbol=pair,
+            dataframe=dataframe,
+            timeframe=self.timeframe,
+            market=self._market,
+            notifier=self._get_notifier(),
+            chart_generator=self._generate_chart,
         )
+        if submitted:
+            logger.info("PA analysis submitted: %s %s", pair, self.timeframe)
+
+    # ================================================================
+    # PG 持久化
+    # ================================================================
 
     def _persist_kline(self, pair: str, dataframe: DataFrame) -> None:
         """持久化 Freqtrade 传入策略的 K 线到 PostgreSQL（批量 UPSERT）。
@@ -497,84 +418,3 @@ class PriceActionMonitor(IStrategy):
             timeframe = self.timeframe
         notifier = self._get_notifier()
         return notifier.generate_chart(pair, str(timeframe), dataframe, num_candles)
-
-    # ================================================================
-    # TG Bot 通知 (HTTP POST)
-    # ================================================================
-
-    def _notify_tg_bot(self, pair: str, row: pd.Series, dataframe: DataFrame) -> None:
-        """POST 信号数据 + K线图表到独立 tg-bot 的 HTTP API。"""
-        notifier = self._get_notifier()
-        notifier.notify_tg_bot(
-            pair,
-            row,
-            dataframe,
-            chart_generator=self._generate_chart,
-        )
-
-    def _notify_ema_cross(
-        self, pair: str, row: pd.Series, dataframe: DataFrame, direction: str,
-    ) -> None:
-        """EMA20 穿越信号:落库 + 复用 _notify_tg_bot 发 K 线图。
-
-        :param direction: "long"(上穿)或 "short"(下穿)
-        """
-        reason = f"ema20_cross_{'up' if direction == 'long' else 'down'}"
-        # 用副本设置 signal_type / direction / quality,避免污染原 row
-        row = row.copy()
-        row["signal_direction"] = direction
-        row["signal_quality"] = "cross"
-        row["signal_type"] = "ema20_cross"
-        self._save_signal(pair, row, reason, signal_type="ema20_cross")
-        self._notify_tg_bot(pair, row, dataframe)
-
-    # ================================================================
-    # 消息格式化
-    # ================================================================
-
-    def _format_signal_message(self, pair: str, row: pd.Series) -> str:
-        """格式化 Telegram 消息。"""
-        direction = row.get("signal_direction", "none")
-        quality = row.get("signal_quality", "none")
-
-        emoji = "+" if direction == "long" else "-"
-        quality_map = {"good": "Good", "acceptable": "OK", "fair": "Fair"}
-        quality_cn = quality_map.get(quality, quality)
-
-        lines = [
-            f"{emoji} {pair} {self.timeframe}",
-            f"{direction.upper()} [{quality_cn}]",
-            f"body={row.get('body_pct', 0):.2f} "
-            f"close_loc={row.get('close_location', 0):.2f} "
-            f"ratio={row.get('body_ratio', 0):.1f}",
-        ]
-
-        types = []
-        if row.get("is_surprise", False):
-            types.append("Surprise")
-        if row.get("is_engulfing", False):
-            types.append("Engulfing")
-        if row.get("is_inside", False):
-            types.append("Inside")
-        if row.get("is_2k_reversal", False):
-            types.append("2K-Reversal")
-        if row.get("is_doji", False):
-            types.append("Doji")
-        if types:
-            lines.append("Types: " + " | ".join(types))
-
-        above_ema = row.get("above_ema20", False)
-        ema_gap = row.get("ema_gap", 0)
-        ema_str = "above" if above_ema else "below"
-        lines.append(f"EMA20: {ema_str} (gap={ema_gap:.1f}x ATR)")
-
-        bs = row.get("bull_strength_5", 0.5)
-        if bs > 0.6:
-            bias = "bullish"
-        elif bs < 0.4:
-            bias = "bearish"
-        else:
-            bias = "neutral"
-        lines.append(f"5-bar: {bias} ({bs:.0%})")
-
-        return "\n".join(lines)

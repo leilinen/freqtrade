@@ -161,3 +161,86 @@ class SignalNotifier:
             logger.info("Signal notified to tg-bot: %s %s %s", pair, direction, quality)
         except Exception:
             logger.warning("Failed to notify tg-bot for %s", pair, exc_info=True)
+
+    def notify_decision(
+        self,
+        pair: str,
+        dataframe: DataFrame,
+        payload: dict,
+        *,
+        chart_generator: Callable[[str, str, DataFrame], bytes] | None = None,
+    ) -> None:
+        """POST an L4 trade-decision payload (with optional chart) to tg-bot /decision.
+
+        ``payload`` is the orchestrator decision bundle::
+
+            {"l1": ..., "diagnosis": ..., "selected_strategies": [...],
+             "decision": {...}, "validation": {...}}
+
+        Only actionable decisions (enter_long / enter_short) reach this method;
+        wait / avoid are persisted but not pushed (see orchestrator._should_notify).
+        """
+        tg_api = self._config.get("tg_api_url", "http://tg-bot:8090")
+        decision = payload.get("decision") or {}
+        l1 = payload.get("l1") or {}
+        decision_type = str(decision.get("type", "")).lower()
+
+        display_name = None
+        if self._session_factory:
+            with self._session_factory() as session:
+                wp = session.query(WatchPair).filter_by(symbol=pair).first()
+                if wp:
+                    display_name = wp.display_name
+
+        candle_time = l1.get("candle_time")
+        try:
+            ct = datetime.fromisoformat(str(candle_time)) if candle_time else datetime.now(UTC)
+        except (TypeError, ValueError):
+            ct = datetime.now(UTC)
+
+        body = {
+            "symbol": pair,
+            "display_name": display_name,
+            "signal_time": ct.isoformat(),
+            "timeframe": self._timeframe,
+            "decision_type": decision_type,
+            "direction": str(decision.get("direction", "")).lower(),
+            "order_type": str(decision.get("order_type", "")).lower(),
+            "entry": decision.get("entry"),
+            "stop_loss": decision.get("stop_loss"),
+            "take_profit_1": decision.get("take_profit_1"),
+            "take_profit_2": decision.get("take_profit_2"),
+            "risk_reward": decision.get("risk_reward"),
+            "confidence": decision.get("confidence"),
+            "reason": decision.get("reason", ""),
+            "decision_trace": decision.get("decision_trace")
+            or payload.get("decision_trace", []),
+            "validation": payload.get("validation", {}),
+        }
+
+        chart_png = None
+        try:
+            generator = chart_generator or self.generate_chart
+            chart_png = generator(pair, self._timeframe, dataframe)
+        except Exception:
+            logger.warning("Failed to generate chart for %s", pair, exc_info=True)
+
+        try:
+            if chart_png:
+                http_requests.post(
+                    f"{tg_api}/decision",
+                    files={"chart": ("chart.png", chart_png, "image/png")},
+                    data={"payload": json.dumps(body)},
+                    timeout=30,
+                )
+            else:
+                http_requests.post(
+                    f"{tg_api}/decision",
+                    data={"payload": json.dumps(body)},
+                    timeout=30,
+                )
+            logger.info(
+                "Decision notified to tg-bot: %s %s %s", pair, body["direction"], decision_type
+            )
+        except Exception:
+            logger.warning("Failed to notify tg-bot decision for %s", pair, exc_info=True)

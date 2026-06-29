@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -49,6 +48,7 @@ from price_action_monitor import (  # noqa: E402
     WatchPair,
     _Base,
 )
+from price_action.rules import PriceActionSignalRules  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +325,7 @@ class TestPersistKline:
 
 
 class TestPopulateEntryTrendKline:
-    """Verify _persist_kline is called from populate_entry_trend."""
+    """Verify _persist_kline + PA submission flow from populate_entry_trend."""
 
     def test_calls_persist_kline_in_dry_run(self):
         """In dry_run mode, _persist_kline should be called."""
@@ -335,12 +335,8 @@ class TestPopulateEntryTrendKline:
         s.dp.runmode.value = "dry_run"
 
         df = _make_ohlcv_df(5)
-        # Need signal columns to avoid _check_and_notify errors
-        df["signal_quality"] = "none"
-        df["signal_direction"] = "none"
 
-        with patch.object(s, "_persist_kline") as mock_persist, \
-             patch.object(s, "_check_and_notify"):
+        with patch.object(s, "_persist_kline") as mock_persist:
             s.populate_entry_trend(df, {"pair": "BTC/USDT"})
 
         mock_persist.assert_called_once_with("BTC/USDT", df)
@@ -377,14 +373,42 @@ class TestPopulateEntryTrendKline:
         s.dp.runmode.value = "dry_run"
 
         df = _make_ohlcv_df(5)
-        df["signal_quality"] = "none"
-        df["signal_direction"] = "none"
 
-        with patch.object(s, "_persist_kline"), \
-             patch.object(s, "_check_and_notify"):
+        with patch.object(s, "_persist_kline"):
             result = s.populate_entry_trend(df, {"pair": "BTC/USDT"})
 
         assert result is df
+
+    def test_submits_pa_analysis_when_worker_present(self):
+        """In dry_run mode with a worker, _submit_pa_analysis should be invoked."""
+        s = _make_strategy()
+        s.dp = MagicMock()
+        s.dp.runmode.value = "dry_run"
+        s._worker = MagicMock()
+        s._worker.submit.return_value = True
+
+        df = _make_ohlcv_df(5)
+
+        with patch.object(s, "_persist_kline"):
+            s.populate_entry_trend(df, {"pair": "BTC/USDT"})
+
+        s._worker.submit.assert_called_once()
+        call_kwargs = s._worker.submit.call_args.kwargs
+        assert call_kwargs["symbol"] == "BTC/USDT"
+        assert call_kwargs["timeframe"] == "1h"
+
+    def test_does_not_submit_without_worker(self):
+        """No worker (pipeline disabled) → submit must not be attempted."""
+        s = _make_strategy()
+        s.dp = MagicMock()
+        s.dp.runmode.value = "dry_run"
+        s._worker = None
+
+        df = _make_ohlcv_df(5)
+
+        with patch.object(s, "_persist_kline"):
+            s.populate_entry_trend(df, {"pair": "BTC/USDT"})
+        # No exception, no submission path exercised (worker is None)
 
 
 # ===================================================================
@@ -428,173 +452,75 @@ class TestGenerateChart:
 
 
 # ===================================================================
-# Tests: _notify_tg_bot with chart
+# Tests: SignalNotifier.notify_decision (L4 decision → /decision)
 # ===================================================================
 
 
-class TestNotifyTgBotChart:
-    """Tests for _notify_tg_bot multipart POST with chart."""
+class TestNotifyDecision:
+    """Tests for the LLM L4 decision notification path (tg-bot /decision)."""
 
-    def _make_signal_row(self):
-        """Create a mock signal row (pd.Series)."""
-        return pd.Series({
-            "signal_direction": "long",
-            "signal_quality": "good",
-            "body_pct": 0.8,
-            "close_location": 0.9,
-            "body_ratio": 1.5,
-            "above_ema20": True,
-            "ema_gap": 0.5,
-            "bull_strength_5": 0.7,
-            "close": 42000.0,
-            "low": 41800.0,
-            "high": 42100.0,
-            "is_inside": False,
-            "is_engulfing": False,
-            "is_surprise": False,
-            "is_2k_reversal": False,
-            "is_doji": False,
-        })
+    def _make_decision_payload(self):
+        return {
+            "l1": {"candle_time": "2026-06-01T10:00:00"},
+            "diagnosis": {},
+            "selected_strategies": [],
+            "decision": {
+                "type": "enter_long",
+                "direction": "long",
+                "order_type": "stop",
+                "entry": 42000.0,
+                "stop_loss": 41800.0,
+                "take_profit_1": 42400.0,
+                "take_profit_2": None,
+                "risk_reward": 2.0,
+                "confidence": 0.7,
+                "reason": "EMA20 pullback reversal",
+                "decision_trace": ["trend up", "pullback to EMA20", "strong close"],
+            },
+            "validation": {"valid": True},
+        }
 
-    @patch("price_action_monitor.http_requests.post")
-    @patch.object(PriceActionMonitor, "_generate_chart", return_value=b"\x89PNG_fake")
-    def test_posts_multipart_with_chart(self, mock_chart, mock_post):
-        """Should POST multipart with chart file and payload JSON."""
+    @patch("price_action.notification.http_requests.post")
+    def test_posts_decision_to_decision_endpoint(self, mock_post):
+        """notify_decision should POST the L4 payload to /decision with chart."""
         s = _make_strategy()
         s.config = {"tg_api_url": "http://tg-bot:8090"}
         df = _make_ohlcv_df(25)
-        row = self._make_signal_row()
+        notifier = s._get_notifier()
+        payload = self._make_decision_payload()
 
-        s._notify_tg_bot("BTC/USDT", row, df)
+        notifier.notify_decision(
+            "BTC/USDT",
+            df,
+            payload,
+            chart_generator=lambda *a, **kw: b"\x89PNG_fake",
+        )
 
-        # Verify chart was generated
-        mock_chart.assert_called_once_with("BTC/USDT", "1h", df)
-
-        # Verify POST was called with multipart
         mock_post.assert_called_once()
-        call_kwargs = mock_post.call_args
-        assert call_kwargs[0][0] == "http://tg-bot:8090/signal"
-        assert "files" in call_kwargs[1]
-        assert "chart" in call_kwargs[1]["files"]
-        assert "data" in call_kwargs[1]
+        call_args = mock_post.call_args
+        assert call_args[0][0] == "http://tg-bot:8090/decision"
+        assert "files" in call_args[1]
+        assert "chart" in call_args[1]["files"]
+        body = json.loads(call_args[1]["data"]["payload"])
+        assert body["symbol"] == "BTC/USDT"
+        assert body["decision_type"] == "enter_long"
+        assert body["entry"] == 42000.0
+        assert body["stop_loss"] == 41800.0
+        assert body["risk_reward"] == 2.0
 
-        # Verify payload contains expected fields
-        payload_json = call_kwargs[1]["data"]["payload"]
-        payload = json.loads(payload_json)
-        assert payload["symbol"] == "BTC/USDT"
-        assert payload["direction"] == "long"
-        assert payload["quality"] == "good"
-        assert payload["entry_price"] == 42000.0
-        assert payload["stop_loss"] == 41800.0
-
-    @patch("price_action_monitor.http_requests.post", side_effect=Exception("timeout"))
-    @patch.object(PriceActionMonitor, "_generate_chart", return_value=b"\x89PNG_fake")
-    def test_handles_http_error_gracefully(self, mock_chart, mock_post):
+    @patch("price_action.notification.http_requests.post", side_effect=Exception("timeout"))
+    def test_handles_http_error_gracefully(self, mock_post):
         """HTTP errors should be caught, not propagated."""
         s = _make_strategy()
         s.config = {"tg_api_url": "http://tg-bot:8090"}
         df = _make_ohlcv_df(25)
-        row = self._make_signal_row()
+        notifier = s._get_notifier()
+        payload = self._make_decision_payload()
 
         # Must not raise
-        s._notify_tg_bot("BTC/USDT", row, df)
-
-    @patch("price_action_monitor.http_requests.post")
-    @patch.object(PriceActionMonitor, "_generate_chart", return_value=b"\x89PNG_fake")
-    def test_posts_to_default_url_when_no_config(self, mock_chart, mock_post):
-        """Should POST to default URL when tg_api_url is not in config."""
-        s = _make_strategy()
-        s.config = {}  # no tg_api_url
-        df = _make_ohlcv_df(25)
-        row = self._make_signal_row()
-
-        s._notify_tg_bot("BTC/USDT", row, df)
-
-        mock_post.assert_called_once()
-        assert mock_post.call_args[0][0] == "http://tg-bot:8090/signal"
-
-
-# ===================================================================
-# Tests: _check_and_notify passes dataframe
-# ===================================================================
-
-
-class TestCheckAndNotifyDataframe:
-    """Verify _check_and_notify passes dataframe through to _notify_tg_bot."""
-
-    @patch.object(PriceActionMonitor, "_notify_tg_bot")
-    @patch.object(PriceActionMonitor, "_save_signal")
-    def test_candidate_waits_without_save_or_immediate_notify(self, mock_save, mock_notify):
-        """A fresh signal bar waits for follow-through without polluting signal history."""
-        s = _make_strategy()
-        df = _make_ohlcv_df(25)
-        # Make the last row a "good long" signal that passes EMA filter
-        last = df.iloc[-1].copy()
-        last["signal_quality"] = "good"
-        last["signal_direction"] = "long"
-        last["above_ema20"] = True
-        last["bull_strength_5"] = 0.8
-
-        s._check_and_notify("BTC/USDT", last, df)
-
-        mock_save.assert_not_called()
-        mock_notify.assert_not_called()
-
-    @patch.object(PriceActionMonitor, "_notify_tg_bot")
-    @patch.object(PriceActionMonitor, "_save_signal", return_value=True)
-    def test_confirmed_candidate_passes_dataframe_to_notify(self, mock_save, mock_notify):
-        """A prior candidate with follow-through should be saved as confirmed and notified."""
-        s = _make_strategy()
-        df = _make_ohlcv_df(25)
-        df["signal_quality"] = "none"
-        df["signal_direction"] = "none"
-        idx = len(df) - 2
-        df.loc[idx, "open"] = 100.0
-        df.loc[idx, "high"] = 102.0
-        df.loc[idx, "low"] = 99.0
-        df.loc[idx, "close"] = 101.8
-        df.loc[idx, "signal_quality"] = "good"
-        df.loc[idx, "signal_direction"] = "long"
-        df.loc[idx, "above_ema20"] = True
-        df.loc[idx, "bull_strength_5"] = 0.8
-        df.loc[idx, "ema_gap"] = 0.5
-        df.loc[idx + 1, "high"] = 103.0
-        df.loc[idx + 1, "low"] = 101.0
-        df.loc[idx + 1, "close"] = 102.5
-
-        s._check_and_notify("BTC/USDT", df.iloc[-1], df)
-
-        mock_notify.assert_called_once()
-        # Third argument should be the dataframe
-        assert mock_notify.call_args[0][2] is df
-        assert mock_save.call_args.kwargs["signal_type"] == "confirmed_signal_bar_good"
-
-    @patch.object(PriceActionMonitor, "_notify_tg_bot")
-    @patch.object(PriceActionMonitor, "_save_signal", return_value=True)
-    def test_untriggered_candidate_is_not_confirmed(self, mock_save, mock_notify):
-        """A candidate without a break of its signal-bar high/low should not notify."""
-        s = _make_strategy()
-        df = _make_ohlcv_df(25)
-        df["signal_quality"] = "none"
-        df["signal_direction"] = "none"
-        idx = len(df) - 2
-        df.loc[idx, "open"] = 100.0
-        df.loc[idx, "high"] = 102.0
-        df.loc[idx, "low"] = 99.0
-        df.loc[idx, "close"] = 101.8
-        df.loc[idx, "signal_quality"] = "good"
-        df.loc[idx, "signal_direction"] = "long"
-        df.loc[idx, "above_ema20"] = True
-        df.loc[idx, "bull_strength_5"] = 0.8
-        df.loc[idx, "ema_gap"] = 0.5
-        df.loc[idx + 1, "high"] = 101.9
-        df.loc[idx + 1, "low"] = 100.5
-        df.loc[idx + 1, "close"] = 101.0
-
-        s._check_and_notify("BTC/USDT", df.iloc[-1], df)
-
-        mock_save.assert_not_called()
-        mock_notify.assert_not_called()
+        notifier.notify_decision(
+            "BTC/USDT", df, payload, chart_generator=lambda *a, **kw: b"\x89PNG_fake"
+        )
 
 
 # ===================================================================
@@ -603,7 +529,15 @@ class TestCheckAndNotifyDataframe:
 
 
 class TestStructureContextRules:
-    """Unit tests for PA_Agent-inspired deterministic context filters."""
+    """Unit tests for PA_Agent-inspired deterministic context filters.
+
+    These now exercise the rules engine (PriceActionSignalRules) directly,
+    since the strategy no longer wraps the signal-bar flow (replaced by the
+    LLM L1-L4 pipeline). The rules engine is still used by repository/notifier.
+    """
+
+    def _rules(self):
+        return PriceActionSignalRules()
 
     def _base_row(self, **overrides):
         row = {
@@ -627,41 +561,41 @@ class TestStructureContextRules:
         return pd.Series(row)
 
     def test_barbwire_filters_even_good_signal(self):
-        s = _make_strategy()
+        rules = self._rules()
         row = self._base_row(signal_quality="good", is_barbwire=True)
 
-        assert s._candidate_signal_ok(row) is False
+        assert rules.candidate_signal_ok(row) is False
 
     def test_middle_range_filters_plain_acceptable_signal(self):
-        s = _make_strategy()
+        rules = self._rules()
         row = self._base_row(signal_quality="acceptable", range_zone="middle")
 
-        assert s._candidate_signal_ok(row) is False
+        assert rules.candidate_signal_ok(row) is False
 
     def test_middle_range_allows_acceptable_with_breakout_context(self):
-        s = _make_strategy()
+        rules = self._rules()
         row = self._base_row(
             signal_quality="acceptable",
             range_zone="middle",
             breakout_prev_5="up",
         )
 
-        assert s._candidate_signal_ok(row) is True
+        assert rules.candidate_signal_ok(row) is True
 
     def test_fair_signal_allowed_at_range_edge(self):
-        s = _make_strategy()
+        rules = self._rules()
         row = self._base_row(signal_quality="fair", range_zone="lower")
 
-        assert s._candidate_signal_ok(row) is True
+        assert rules.candidate_signal_ok(row) is True
 
     def test_fair_signal_filtered_in_middle_without_context(self):
-        s = _make_strategy()
+        rules = self._rules()
         row = self._base_row(signal_quality="fair", range_zone="middle")
 
-        assert s._candidate_signal_ok(row) is False
+        assert rules.candidate_signal_ok(row) is False
 
     def test_detects_inside_sequences_ioi_micro_double_and_breakout(self):
-        s = _make_strategy()
+        rules = self._rules()
         df = pd.DataFrame({
             "open": [5.0, 4.0, 5.0, 6.0, 5.5, 7.0],
             "high": [10.0, 9.0, 11.0, 10.0, 10.0, 12.0],
@@ -669,10 +603,10 @@ class TestStructureContextRules:
             "close": [5.0, 6.0, 4.0, 7.0, 6.0, 11.0],
         })
         df["volume"] = 100.0
-        df = s._calc_basic_indicators(df)
+        df = rules.calc_basic_indicators(df)
         df["atr14"] = 10.0
-        df = s._detect_special_bars(df)
-        df = s._rules.calc_structure_context(df)
+        df = rules.detect_special_bars(df)
+        df = rules.calc_structure_context(df)
 
         assert bool(df.loc[3, "is_ioi"]) is True
         assert bool(df.loc[3, "is_inside"]) is True
@@ -681,13 +615,13 @@ class TestStructureContextRules:
         assert bool(df.loc[4, "is_mdt"]) is True
         assert df.loc[5, "breakout_prev_5"] == "both"
 
-        tags = s._get_bar_types(df.loc[5])
+        tags = rules.get_bar_types(df.loc[5])
         assert "breakout_up" in tags
         assert "breakout_down" in tags
 
 
 # ===================================================================
-# Tests: _market attribute and _save_signal market field
+# Tests: _market attribute derivation from config
 # ===================================================================
 
 
@@ -740,82 +674,6 @@ class TestMarketAttribute:
         s._init_default_pairs()
         assert s._market == "crypto"
 
-    def test_save_signal_uses_self_market(self):
-        """_save_signal should use self._market, not hardcoded 'crypto'."""
-        s = _make_strategy()
-        # Simulate an ashare container
-        s._market = "ashare"
-        s.timeframe = "1h"
-
-        row = pd.Series({
-            "signal_quality": "good",
-            "signal_direction": "long",
-            "body_pct": 0.8,
-            "close_location": 0.9,
-            "body_ratio": 1.5,
-            "above_ema20": True,
-            "ema_gap": 0.5,
-            "bull_strength_5": 0.7,
-            "close": 42000.0,
-            "low": 41800.0,
-            "high": 42100.0,
-            "open": 41900.0,
-            "volume": 100.0,
-            "ema20": 41950.0,
-            "atr14": 200.0,
-            "ema20_position": 0.6,
-            "is_inside": False,
-            "is_engulfing": False,
-            "is_surprise": False,
-            "is_2k_reversal": False,
-            "is_doji": False,
-            "date": pd.Timestamp("2025-06-18 10:00", tz="UTC"),
-        })
-
-        s._save_signal("588290/SH", row, "test_reason")
-
-        # Get the PaSignal object added to the mock session
-        session = s._pg_session_factory.return_value.__enter__.return_value
-        added_signal = session.add.call_args[0][0]
-        assert added_signal.market == "ashare"
-
-    def test_save_signal_crypto_market(self):
-        """_save_signal with default crypto market should save market='crypto'."""
-        s = _make_strategy()
-        # Default is crypto, no need to set
-        assert s._market == "crypto"
-
-        row = pd.Series({
-            "signal_quality": "good",
-            "signal_direction": "short",
-            "body_pct": 0.6,
-            "close_location": 0.2,
-            "body_ratio": 0.8,
-            "above_ema20": False,
-            "ema_gap": -0.3,
-            "bull_strength_5": 0.3,
-            "close": 50000.0,
-            "low": 49500.0,
-            "high": 50500.0,
-            "open": 50200.0,
-            "volume": 200.0,
-            "ema20": 50100.0,
-            "atr14": 500.0,
-            "ema20_position": 0.4,
-            "is_inside": False,
-            "is_engulfing": False,
-            "is_surprise": False,
-            "is_2k_reversal": False,
-            "is_doji": False,
-            "date": pd.Timestamp("2025-06-18 10:00", tz="UTC"),
-        })
-
-        s._save_signal("BTC/USDT", row, "test_reason")
-
-        session = s._pg_session_factory.return_value.__enter__.return_value
-        added_signal = session.add.call_args[0][0]
-        assert added_signal.market == "crypto"
-
 
 # ===================================================================
 # Tests: _detect_ema20_cross
@@ -831,7 +689,13 @@ def _make_ema_df(closes, ema_vals):
 
 
 class TestDetectEma20Cross:
-    """Unit tests for EMA20 crossover detection."""
+    """Unit tests for EMA20 crossover detection (PriceActionSignalRules).
+
+    The strategy no longer wraps this; tested directly on the rules engine.
+    """
+
+    def _rules(self):
+        return PriceActionSignalRules()
 
     def test_cross_up(self):
         """prev_close < prev_ema20 and curr_close > curr_ema20 → long."""
@@ -839,8 +703,7 @@ class TestDetectEma20Cross:
             closes=[95.0, 105.0],   # 95 < 100, 105 > 100
             ema_vals=[100.0, 100.0],
         )
-        s = _make_strategy()
-        s._detect_ema20_cross(df)
+        self._rules().detect_ema20_cross(df)
         assert df.loc[1, "ema20_cross"] == "long"
 
     def test_cross_down(self):
@@ -849,8 +712,7 @@ class TestDetectEma20Cross:
             closes=[105.0, 95.0],   # 105 > 100, 95 < 100
             ema_vals=[100.0, 100.0],
         )
-        s = _make_strategy()
-        s._detect_ema20_cross(df)
+        self._rules().detect_ema20_cross(df)
         assert df.loc[1, "ema20_cross"] == "short"
 
     def test_no_cross_when_above_both(self):
@@ -859,8 +721,7 @@ class TestDetectEma20Cross:
             closes=[105.0, 110.0],
             ema_vals=[100.0, 100.0],
         )
-        s = _make_strategy()
-        s._detect_ema20_cross(df)
+        self._rules().detect_ema20_cross(df)
         assert df.loc[1, "ema20_cross"] == "none"
 
     def test_no_cross_when_below_both(self):
@@ -869,8 +730,7 @@ class TestDetectEma20Cross:
             closes=[95.0, 90.0],
             ema_vals=[100.0, 100.0],
         )
-        s = _make_strategy()
-        s._detect_ema20_cross(df)
+        self._rules().detect_ema20_cross(df)
         assert df.loc[1, "ema20_cross"] == "none"
 
     def test_first_row_always_none(self):
@@ -879,8 +739,7 @@ class TestDetectEma20Cross:
             closes=[105.0, 95.0],
             ema_vals=[100.0, 100.0],
         )
-        s = _make_strategy()
-        s._detect_ema20_cross(df)
+        self._rules().detect_ema20_cross(df)
         # First row cannot cross — no previous bar
         assert df.loc[0, "ema20_cross"] == "none"
 
@@ -889,8 +748,7 @@ class TestDetectEma20Cross:
         closes = [95.0, 95.0, 105.0, 110.0, 95.0]
         ema_vals = [100.0] * 5
         df = _make_ema_df(closes, ema_vals)
-        s = _make_strategy()
-        s._detect_ema20_cross(df)
+        self._rules().detect_ema20_cross(df)
         # row 2: prev 95<100, curr 105>100 → long
         # row 4: prev 110>100, curr 95<100 → short
         assert df.loc[2, "ema20_cross"] == "long"

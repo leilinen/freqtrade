@@ -463,12 +463,14 @@ def db_get_signals_by_symbol(symbol: str, limit: int = 10) -> list[dict]:
 # Signal notification (HTTP POST handler)
 # ================================================================
 
-async def handle_signal(request: web.Request) -> web.Response:
-    """HTTP POST /signal — 接收 freqtrade 推送的信号 + K线图表并转发到 TG。"""
+async def _parse_payload_request(request: web.Request):
+    """共享解析：支持 multipart/form-data（带图表）和 JSON（纯文字）。
+
+    :return: (data dict, chart_bytes or None, error_response or None)
+    """
     chart_bytes = None
     payload_str = None
 
-    # 支持 multipart/form-data（带图表）和 JSON（纯文字，向后兼容）
     content_type = request.content_type
     if content_type and "multipart" in content_type:
         reader = await request.multipart()
@@ -481,41 +483,55 @@ async def handle_signal(request: web.Request) -> web.Response:
         try:
             payload_str = await request.text()
         except Exception:
-            return web.json_response({"error": "invalid request"}, status=400)
+            return None, None, web.json_response({"error": "invalid request"}, status=400)
 
     try:
         data = json.loads(payload_str) if payload_str else {}
     except Exception:
-        return web.json_response({"error": "invalid json"}, status=400)
+        return None, None, web.json_response({"error": "invalid json"}, status=400)
 
-    msg = format_signal_message(data)
+    return data, chart_bytes, None
+
+
+async def _push_tg_message(request: web.Request, msg: str, chart_bytes, label: str) -> None:
+    """共享推送：带图发 photo，失败或无图回退到纯文本。"""
+    bot = request.app["tg_bot"].bot
     try:
         if chart_bytes:
             # aiohttp multipart part.read() returns bytearray, but python-telegram-bot
             # only treats `bytes` as a file upload. Convert to avoid Telegram treating
             # it as a string file_id ("Wrong remote file identifier" error).
-            photo = bytes(chart_bytes)
             try:
-                await request.app["tg_bot"].bot.send_photo(
-                    chat_id=TG_CHAT_ID,
-                    photo=photo,
-                    caption=msg,
-                )
+                await bot.send_photo(chat_id=TG_CHAT_ID, photo=bytes(chart_bytes), caption=msg)
             except Exception:
-                logger.warning("send_photo failed, falling back to text for %s", data.get("symbol"), exc_info=True)
-                await request.app["tg_bot"].bot.send_message(
-                    chat_id=TG_CHAT_ID,
-                    text=msg,
-                )
+                logger.warning("send_photo failed, falling back to text for %s", label, exc_info=True)
+                await bot.send_message(chat_id=TG_CHAT_ID, text=msg)
         else:
-            await request.app["tg_bot"].bot.send_message(
-                chat_id=TG_CHAT_ID,
-                text=msg,
-            )
-        logger.info("Signal pushed to TG: %s %s %s", data.get("symbol"), data.get("direction"), data.get("quality"))
+            await bot.send_message(chat_id=TG_CHAT_ID, text=msg)
+        logger.info("%s pushed to TG", label)
     except Exception:
-        logger.exception("Failed to push signal to TG")
+        logger.exception("Failed to push %s to TG", label)
 
+
+async def handle_signal(request: web.Request) -> web.Response:
+    """HTTP POST /signal — 接收 freqtrade 推送的信号 + K线图表并转发到 TG。"""
+    data, chart_bytes, err = await _parse_payload_request(request)
+    if err is not None:
+        return err
+
+    msg = format_signal_message(data)
+    await _push_tg_message(request, msg, chart_bytes, f"signal {data.get('symbol')}")
+    return web.json_response({"ok": True})
+
+
+async def handle_decision(request: web.Request) -> web.Response:
+    """HTTP POST /decision — 接收 PA L4 交易决策 + K线图表并转发到 TG。"""
+    data, chart_bytes, err = await _parse_payload_request(request)
+    if err is not None:
+        return err
+
+    msg = format_decision_message(data)
+    await _push_tg_message(request, msg, chart_bytes, f"decision {data.get('symbol')}")
     return web.json_response({"ok": True})
 
 
@@ -606,6 +622,119 @@ def format_signal_message(data: dict) -> str:
     else:
         bias = "中性"
     lines.append(f"近5K偏向: {bias} ({bs:.0%})")
+
+    return "\n".join(lines)
+
+
+# decision_type -> (箭头, 中文动作)
+_DECISION_TYPE_LABELS = {
+    "enter_long": ("+", "做多进场"),
+    "enter_short": ("-", "做空进场"),
+}
+
+
+def _fmt_decision_price(v):
+    """与 format_signal_message 一致的价格精度。"""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "-"
+    if v >= 1000:
+        return f"{v:.2f}"
+    elif v >= 1:
+        return f"{v:.4f}"
+    return f"{v:.6f}"
+
+
+def format_decision_message(data: dict) -> str:
+    """格式化 PA L4 交易决策推送消息（中文）。
+
+    payload 字段（由 freqtrade SignalNotifier.notify_decision 构造）::
+        symbol, display_name, signal_time, timeframe,
+        decision_type, direction, order_type,
+        entry, stop_loss, take_profit_1, take_profit_2,
+        risk_reward, confidence, reason,
+        decision_trace[list], validation{dict}
+    """
+    symbol = data.get("symbol", "?")
+    tf = data.get("timeframe", "?")
+    display_name = data.get("display_name")
+    label = f"{display_name}({symbol})" if display_name else symbol
+    decision_type = str(data.get("decision_type", "")).lower()
+    direction = str(data.get("direction", "")).lower()
+
+    arrow, action = _DECISION_TYPE_LABELS.get(decision_type, ("•", "观望/回避"))
+
+    # 信号时间 → 北京时间
+    time_str = ""
+    raw_time = data.get("signal_time")
+    if raw_time:
+        try:
+            ct = datetime.fromisoformat(str(raw_time))
+            if ct.tzinfo is None:
+                ct = ct.replace(tzinfo=timezone.utc)
+            time_str = ct.astimezone(timezone(timedelta(hours=8))).strftime("%m-%d %H:%M")
+        except (ValueError, TypeError):
+            time_str = ""
+
+    header = f"{arrow} PA决策 {label} {tf}"
+    if time_str:
+        header += f" @{time_str}"
+
+    lines = [header, f"{action} [{decision_type}] 方向: {direction or '-'}"]
+
+    entry = data.get("entry")
+    stop = data.get("stop_loss")
+    tp1 = data.get("take_profit_1")
+    tp2 = data.get("take_profit_2")
+    rr = data.get("risk_reward")
+    confidence = data.get("confidence")
+
+    if entry is not None:
+        lines.append(f"入场 {_fmt_decision_price(entry)}")
+    if stop is not None:
+        lines.append(f"止损 {_fmt_decision_price(stop)}")
+    if tp1 is not None:
+        lines.append(f"止盈1 {_fmt_decision_price(tp1)}")
+    if tp2 is not None:
+        lines.append(f"止盈2 {_fmt_decision_price(tp2)}")
+
+    metrics_bits = []
+    if rr is not None:
+        try:
+            metrics_bits.append(f"盈亏比 {float(rr):.1f}")
+        except (TypeError, ValueError):
+            pass
+    if confidence is not None:
+        try:
+            metrics_bits.append(f"信心 {float(confidence) * 100:.0f}%")
+        except (TypeError, ValueError):
+            pass
+    if metrics_bits:
+        lines.append(" | ".join(metrics_bits))
+
+    order_type = str(data.get("order_type", "")).lower()
+    if order_type and order_type != "none":
+        lines.append(f"下单方式: {order_type}")
+
+    reason = str(data.get("reason", "")).strip()
+    if reason:
+        lines.append(f"理由: {reason}")
+
+    trace = data.get("decision_trace") or []
+    if isinstance(trace, list) and trace:
+        # 只取前 3 条，避免消息过长
+        for item in trace[:3]:
+            text = str(item).strip()
+            if text:
+                lines.append(f"• {text}")
+
+    validation = data.get("validation") or {}
+    if isinstance(validation, dict):
+        valid = validation.get("valid")
+        if valid is not None:
+            status = "通过" if valid else "未通过"
+            lines.append(f"四重校验: {status}")
 
     return "\n".join(lines)
 
@@ -960,6 +1089,7 @@ async def main() -> None:
     app_http = web.Application()
     app_http["tg_bot"] = app_tg
     app_http.router.add_post("/signal", handle_signal)
+    app_http.router.add_post("/decision", handle_decision)
 
     runner = web.AppRunner(app_http)
     await runner.setup()

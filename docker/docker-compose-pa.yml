@@ -5,6 +5,7 @@ services:
     restart: unless-stopped
     environment:
       TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR in docker/.env}:/freqtrade/user_data
     command: >
@@ -26,6 +27,7 @@ services:
     restart: unless-stopped
     environment:
       TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR in docker/.env}:/freqtrade/user_data
     command: >
@@ -42,14 +44,12 @@ services:
       - panwatch_default
 
   ashare-1h:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.ashare
-    image: freqtrade-ashare:latest
+    image: freqtrade-pa:latest
     container_name: ashare-1h
     restart: unless-stopped
     environment:
       TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR in docker/.env}:/freqtrade/user_data
     command: >
@@ -60,11 +60,12 @@ services:
       - panwatch_default
 
   ashare-1d:
-    image: freqtrade-ashare:latest
+    image: freqtrade-pa:latest
     container_name: ashare-1d
     restart: unless-stopped
     environment:
       TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR in docker/.env}:/freqtrade/user_data
     command: >
