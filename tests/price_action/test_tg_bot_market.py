@@ -7,26 +7,23 @@ Focus: /pa_add 自动识别市场规则 (纯数字→A股, 字母→美股, 含/
 Run from repo root:
   .venv/bin/pytest tests/price_action/test_tg_bot_market.py -v
 """
+import json
 import os
 import sys
-import types
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# tg_bot.py 在模块顶层 import httpx/aiohttp/sqlalchemy/telegram,测试时必须 stub。
-# 跟同目录 test_price_action_monitor.py 的风格一致(sys.modules.setdefault)。
+# tg_bot.py 在模块顶层 import httpx/aiohttp/sqlalchemy/telegram。
+# 这些是项目运行依赖，测试使用真实包，避免污染 sys.modules 影响全量 pytest。
 # ---------------------------------------------------------------------------
-for name in ("aiohttp", "sqlalchemy", "telegram", "telegram.ext"):
-    if name not in sys.modules:
-        sys.modules[name] = MagicMock()
-
-# aiohttp.web 在模块内被用作类型注解,给个 SimpleNamespace 避免属性错误
-sys.modules["aiohttp"].web = types.SimpleNamespace(
-    Request=object, Response=object, Application=object, run_app=lambda *a, **kw: None
-)
+pytest.importorskip("aiohttp")
+pytest.importorskip("sqlalchemy")
+pytest.importorskip("telegram")
+pytest.importorskip("telegram.ext")
 
 # tg_bot 在 import 时读 TG_TOKEN/TG_CHAT_ID 环境变量
 os.environ.setdefault("TG_TOKEN", "x")
@@ -39,6 +36,103 @@ if _SERVICES_DIR not in sys.path:
     sys.path.insert(0, _SERVICES_DIR)
 
 import tg_bot  # noqa: E402
+
+
+# ===================================================================
+# Tests: /decision HTTP notification flow
+# ===================================================================
+
+
+class TestDecisionHttpFlow:
+    """主流程：freqtrade notifier -> tg-bot /decision -> Telegram 文本/图片推送。"""
+
+    def _decision_payload(self):
+        return {
+            "symbol": "BTC/USDT",
+            "signal_time": "2026-06-01T10:00:00+00:00",
+            "timeframe": "1h",
+            "decision_type": "enter_long",
+            "direction": "long",
+            "order_type": "stop",
+            "entry": 42000.0,
+            "stop_loss": 41800.0,
+            "take_profit_1": 42400.0,
+            "risk_reward": 2.0,
+            "confidence": 0.7,
+            "reason": "EMA20 pullback reversal",
+            "decision_trace": ["trend up", "pullback to EMA20"],
+            "validation": {"valid": True},
+        }
+
+    @pytest.mark.asyncio
+    async def test_decision_form_payload_without_chart_sends_text(self):
+        """图表生成失败时 notifier 会发 form payload；tg-bot 应文本兜底推送。"""
+        bot = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock())
+        payload = self._decision_payload()
+
+        class Request:
+            content_type = "application/x-www-form-urlencoded"
+            app = {"tg_bot": SimpleNamespace(bot=bot)}
+
+            async def post(self):
+                return {"payload": json.dumps(payload)}
+
+        response = await tg_bot.handle_decision(Request())
+
+        assert response.status == 200
+        bot.send_message.assert_awaited_once()
+        bot.send_photo.assert_not_awaited()
+        text = bot.send_message.await_args.kwargs["text"]
+        assert "PA决策 BTC/USDT 1h" in text
+        assert "做多进场" in text
+
+    @pytest.mark.asyncio
+    async def test_decision_multipart_payload_with_chart_sends_photo(self):
+        """正常带图路径应发 photo，并把格式化后的决策放在 caption。"""
+        bot = SimpleNamespace(send_message=AsyncMock(), send_photo=AsyncMock())
+        payload = self._decision_payload()
+
+        class Part:
+            def __init__(self, name, value):
+                self.name = name
+                self._value = value
+
+            async def text(self):
+                return self._value
+
+            async def read(self):
+                return self._value
+
+        class Multipart:
+            def __aiter__(self):
+                self._parts = iter(
+                    [
+                        Part("payload", json.dumps(payload)),
+                        Part("chart", bytearray(b"\x89PNG_fake")),
+                    ]
+                )
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._parts)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        class Request:
+            content_type = "multipart/form-data"
+            app = {"tg_bot": SimpleNamespace(bot=bot)}
+
+            async def multipart(self):
+                return Multipart()
+
+        response = await tg_bot.handle_decision(Request())
+
+        assert response.status == 200
+        bot.send_photo.assert_awaited_once()
+        bot.send_message.assert_not_awaited()
+        assert bot.send_photo.await_args.kwargs["photo"] == b"\x89PNG_fake"
+        assert "做多进场" in bot.send_photo.await_args.kwargs["caption"]
 
 
 # ===================================================================

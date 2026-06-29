@@ -522,6 +522,33 @@ class TestNotifyDecision:
             "BTC/USDT", df, payload, chart_generator=lambda *a, **kw: b"\x89PNG_fake"
         )
 
+    @patch("price_action.notification.http_requests.post")
+    def test_posts_decision_without_chart_as_form_payload(self, mock_post):
+        """If chart rendering fails, notifier still sends the decision payload."""
+        s = _make_strategy()
+        s.config = {"tg_api_url": "http://tg-bot:8090"}
+        df = _make_ohlcv_df(25)
+        notifier = s._get_notifier()
+        payload = self._make_decision_payload()
+
+        def raise_chart_error(*args, **kwargs):
+            raise RuntimeError("chart failed")
+
+        notifier.notify_decision(
+            "BTC/USDT",
+            df,
+            payload,
+            chart_generator=raise_chart_error,
+        )
+
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        assert call_args[0][0] == "http://tg-bot:8090/decision"
+        assert "files" not in call_args[1]
+        body = json.loads(call_args[1]["data"]["payload"])
+        assert body["symbol"] == "BTC/USDT"
+        assert body["decision_type"] == "enter_long"
+
 
 # ===================================================================
 # Tests: structure context filters

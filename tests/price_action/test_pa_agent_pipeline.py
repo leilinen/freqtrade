@@ -46,9 +46,13 @@ from price_action.features import (  # noqa: E402
     calculate_atr,
     calculate_ema,
 )
+from price_action.experience import retrieve_experience_cases  # noqa: E402
 from price_action.llm import OpenAIJsonClient  # noqa: E402
+from price_action.orchestrator import PriceActionOrchestrator  # noqa: E402
+from price_action.prompts import build_market_diagnosis_messages  # noqa: E402
 from price_action.repository import PriceActionRepository  # noqa: E402
-from price_action.validation import DecisionValidator  # noqa: E402
+from price_action.router import route_strategies  # noqa: E402
+from price_action.validation import DecisionValidator, validate_stage1_diagnosis  # noqa: E402
 from price_action.worker import PaAnalysisWorker  # noqa: E402
 
 
@@ -64,6 +68,125 @@ def _df_from_ohlc(ohlc, start="2026-06-01 08:00", freq="1h"):
             "volume": 1000.0,
         }
     )
+
+
+def _stage1_diagnosis(
+    l1,
+    *,
+    gate_result="proceed",
+    cycle_position="normal_channel",
+    direction="bullish",
+):
+    rows = l1.rows[:5]
+    if gate_result == "proceed":
+        gate_trace = [
+            {
+                "node_id": "1.2",
+                "question": "是否能识别出当前市场周期？",
+                "answer": "是",
+                "reason": "通道结构可识别",
+                "branch": cycle_position,
+                "section": "K线识别",
+                "bar_range": "K5-K1",
+            },
+            {
+                "node_id": "1.3",
+                "question": "市场是否不是极端混乱？",
+                "answer": "是",
+                "reason": "",
+                "branch": None,
+                "section": "K线识别",
+                "bar_range": "K5-K1",
+            },
+            {
+                "node_id": "2.1",
+                "question": "近期结构是否呈现明确惯性方向？",
+                "answer": "是",
+                "reason": "",
+                "branch": direction,
+                "section": "方向判断",
+                "bar_range": "K5-K1",
+            },
+            {
+                "node_id": "2.2",
+                "question": "长程背景是否支持近期方向？",
+                "answer": "中性",
+                "reason": "",
+                "branch": "mixed",
+                "section": "背景判断",
+                "bar_range": "K5-K1",
+            },
+            {
+                "node_id": "2.5",
+                "question": "当前惯性强度是否足以进入阶段二？",
+                "answer": "是",
+                "reason": "闸门通过，进入阶段二",
+                "branch": direction,
+                "section": "闸门",
+                "bar_range": "K3-K1",
+            },
+        ]
+    else:
+        gate_trace = [
+            {
+                "node_id": "1.2",
+                "question": "是否能识别出当前市场周期？",
+                "answer": "否",
+                "reason": "周期无法识别，等待更多 K 线",
+                "branch": "unknown",
+                "section": "K线识别",
+                "bar_range": "K5-K1",
+            }
+        ]
+    return {
+        "cycle_position": cycle_position,
+        "alternative_cycle_position": None,
+        "direction": direction,
+        "diagnosis_confidence": 75,
+        "spike_stage": None,
+        "climax_risk": "none",
+        "market_phase": "stable",
+        "transition_risk": None,
+        "detected_patterns": ["breakout_up"] if direction == "bullish" else [],
+        "key_signals": ["K1 close"],
+        "htf_context": "背景中性",
+        "entry_setup": "breakout_pullback",
+        "support_levels": ["100"],
+        "resistance_levels": ["120"],
+        "strategy_files_needed": [],
+        "risk_warning": "等待更多确认",
+        "bar_analysis": {
+            "always_in": {
+                "bullish": "long",
+                "bearish": "short",
+                "neutral": "neutral",
+            }[direction],
+            "last_closed_bar": "K1",
+            "bar_type": l1.latest_features["bar_type"],
+            "signal_bar": {
+                "bar": "K1",
+                "quality": "medium",
+                "pattern": "breakout_pullback",
+                "reason": "测试信号",
+            },
+            "entry_setup_type": "breakout_pullback",
+            "follow_through": l1.latest_features["follow_through_1_2"],
+        },
+        "bar_by_bar_summary": [
+            {
+                "bar": row["k"],
+                "role": "structure",
+                "bar_type": row["bar_type"],
+                "context_effect": "neutral",
+                "follow_through": row["follow_through_1_2"],
+                "trapped_side": "none",
+                "reason": f"{row['k']} 结构摘要",
+            }
+            for row in rows
+        ],
+        "gate_trace": gate_trace,
+        "gate_result": gate_result,
+    }
 
 
 class TestL1Features:
@@ -140,6 +263,134 @@ class TestL1Features:
         assert result.latest_features["inside_sequence"] == "iii"
         assert "iii" in result.latest_features["patterns"]
 
+    def test_bar_type_classifies_outside_and_trend_bars(self):
+        df = _df_from_ohlc(
+            [
+                (11.0, 13.0, 10.0, 12.0),
+                (10.0, 15.0, 9.0, 14.5),
+            ]
+        )
+
+        result = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=2,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 11:30", tz="UTC"),
+        )
+
+        assert result.rows[0]["bar_type"] == "outside_bull"
+        assert result.rows[0]["overlap_prev_ratio"] == pytest.approx(0.5)
+        assert result.rows[1]["bar_type"] == "trend_bull"
+
+    def test_ioi_gap_ema_gap_count_and_breakout_prev_match_pa_agent_context(self):
+        base = [(9.0, 9.5, 8.5, 9.0)] * 20
+        ioi_tail = [
+            (10.0, 15.0, 9.0, 14.0),
+            (10.5, 12.0, 10.4, 11.5),
+            (11.0, 14.0, 10.2, 13.5),
+            (12.0, 13.0, 11.0, 12.8),
+        ]
+        df = _df_from_ohlc(base + ioi_tail)
+
+        result = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=4,
+            warmup=20,
+            now=pd.Timestamp("2026-06-02 09:30", tz="UTC"),
+        )
+
+        latest = result.latest_features
+        assert latest["ioi_pattern"] is True
+        assert latest["gap_bar"] == "bull_gap"
+        assert latest["ema_gap_count"] == 3
+        assert latest["breakout_prev"] == "none"
+        assert "ioi" in latest["patterns"]
+        assert "bull_gap" in latest["patterns"]
+
+    def test_inside_sequence_and_micro_double_are_reported(self):
+        df = _df_from_ohlc(
+            [
+                (12.0, 14.0, 9.0, 13.0),
+                (11.0, 13.0, 10.0, 12.0),
+                (10.0, 12.0, 10.0, 11.0),
+            ]
+        )
+
+        result = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=3,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 12:30", tz="UTC"),
+        )
+
+        assert result.latest_features["inside_sequence"] == "ii"
+        assert result.latest_features["micro_double"] == "MDB"
+        assert "MDB" in result.latest_features["patterns"]
+
+    def test_flat_bar_type_when_zero_range_and_not_inside(self):
+        df = _df_from_ohlc(
+            [
+                (9.0, 9.0, 8.0, 8.5),
+                (10.0, 10.0, 10.0, 10.0),
+            ]
+        )
+
+        result = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=2,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 11:30", tz="UTC"),
+        )
+
+        assert result.latest_features["bar_type"] == "flat"
+
+    def test_follow_through_uses_newer_closes_for_bull_and_bear_failures(self):
+        bull_df = _df_from_ohlc(
+            [
+                (10.0, 12.0, 9.0, 11.0),
+                (8.0, 9.0, 7.5, 7.8),
+            ]
+        )
+        bull_result = build_l1_features(
+            bull_df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=2,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 11:30", tz="UTC"),
+        )
+        assert bull_result.rows[1]["follow_through_1_2"] == "failed"
+
+        bear_df = _df_from_ohlc(
+            [
+                (10.0, 11.0, 8.0, 9.0),
+                (11.5, 12.0, 10.5, 11.2),
+            ]
+        )
+        bear_result = build_l1_features(
+            bear_df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=2,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 11:30", tz="UTC"),
+        )
+        assert bear_result.rows[1]["follow_through_1_2"] == "failed"
+
     def test_ashare_daily_uses_local_market_close(self):
         df = _df_from_ohlc(
             [
@@ -161,6 +412,311 @@ class TestL1Features:
         )
 
         assert result.latest_features["time"] == "2026-06-02T00:00:00"
+
+
+class TestMarketStructureFeatures:
+    def test_range_position_upper_third(self):
+        df = _df_from_ohlc([(105.0, 110.0, 100.0, 108.0)] * 8)
+
+        result = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=8,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 16:30", tz="UTC"),
+        )
+
+        mf = result.market_features
+        assert mf["range_high"] == 110.0
+        assert mf["range_low"] == 100.0
+        assert mf["zone"] == "upper_third"
+        assert mf["price_position"] > 2 / 3
+
+    def test_swing_pivots_and_structure_label_are_exposed(self):
+        df = _df_from_ohlc(
+            [
+                (100.0, 105.0, 99.0, 104.0),
+                (104.0, 105.0, 100.0, 102.0),
+                (102.0, 108.0, 101.5, 107.0),
+                (107.0, 107.5, 104.0, 105.0),
+                (105.0, 110.0, 104.5, 109.0),
+                (109.0, 111.0, 108.0, 110.0),
+            ]
+        )
+
+        result = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+
+        swings = result.market_features["swings"]
+        assert {s["kind"] for s in swings} >= {"high", "low"}
+        swing_structure = result.market_features["swing_structure"]
+        assert swing_structure in {"HH+HL", "LL+LH", "mixed", "insufficient"}
+
+    def test_hl_count_triggers_on_high_breaks(self):
+        df = _df_from_ohlc(
+            [
+                (9.8, 10.0, 9.6, 9.9),
+                (9.9, 10.1, 9.7, 10.0),
+                (10.0, 10.2, 9.8, 10.1),
+                (10.2, 10.4, 10.0, 10.3),
+            ]
+        )
+
+        result = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=4,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 12:30", tz="UTC"),
+        )
+
+        hl_count = result.market_features["hl_count"]
+        assert hl_count["bull_count"] >= 2
+        assert hl_count["bull_candidate"] in ("h2", "h3")
+        assert hl_count["last_bull_trigger_seq"] == 1
+
+    def test_breakout_failure_detected(self):
+        df = _df_from_ohlc(
+            [
+                (97.0, 98.0, 96.5, 97.5),
+                (98.0, 99.0, 97.5, 98.5),
+                (99.0, 100.0, 98.5, 99.2),
+                (100.0, 101.5, 99.8, 101.2),
+                (99.2, 99.8, 98.8, 99.3),
+                (99.0, 99.5, 98.5, 99.0),
+            ]
+        )
+
+        result = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+
+        failed = [
+            event for event in result.market_features["breakout_events"]
+            if event["event"] == "failed"
+        ]
+        assert failed
+        assert failed[0]["level_kind"] == "range_high"
+
+    def test_measured_move_range_projection_and_prompt_render(self):
+        df = _df_from_ohlc([(105.0, 110.0, 100.0, 105.0)] * 6)
+
+        result = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+
+        range_up = [
+            move for move in result.market_features["measured_moves"]
+            if move["kind"] == "range_up"
+        ]
+        assert range_up
+        assert range_up[0]["height"] == 10.0
+        assert range_up[0]["target_price"] == 120.0
+        assert "程序结构辅助特征" in result.market_features_text
+        assert "Measured Move" in result.market_features_text
+
+        messages = build_market_diagnosis_messages(result)
+        assert "市场结构辅助特征" in messages[1]["content"]
+        assert "Measured Move" in messages[1]["content"]
+
+
+class TestStage1MarketDiagnosis:
+    def test_prompt_uses_pa_agent_stage1_contract(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        l1 = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+
+        messages = build_market_diagnosis_messages(l1)
+        content = messages[1]["content"]
+
+        assert "阶段一 Stage 1 市场诊断" in content
+        assert '"cycle_position"' in content
+        assert '"gate_trace"' in content
+        assert '"gate_result"' in content
+        assert "1.2、1.3、2.1、2.2、2.5" in content
+        assert '"market_state"' not in content
+        assert '"signal_chain"' not in content
+
+    def test_stage1_validation_accepts_pa_agent_contract(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        l1 = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+
+        errors = validate_stage1_diagnosis(_stage1_diagnosis(l1), l1_rows=l1.rows)
+
+        assert errors == []
+
+    def test_stage1_validation_rejects_bar_type_mismatch(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        l1 = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+        diagnosis = _stage1_diagnosis(l1)
+        diagnosis["bar_analysis"]["bar_type"] = "trend_bear"
+
+        errors = validate_stage1_diagnosis(diagnosis, l1_rows=l1.rows)
+
+        assert "stage1_bar_analysis_bar_type_mismatch" in errors
+
+    def test_stage1_validation_requires_proceed_gate_nodes(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        l1 = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+        diagnosis = _stage1_diagnosis(l1)
+        diagnosis["gate_trace"] = diagnosis["gate_trace"][:2]
+
+        errors = validate_stage1_diagnosis(diagnosis, l1_rows=l1.rows)
+
+        assert "stage1_gate_trace_missing_proceed_nodes" in errors
+
+
+class TestStage1Routing:
+    def test_routes_from_cycle_position_direction_and_detected_patterns(self):
+        diagnosis = {
+            "cycle_position": "normal_channel",
+            "direction": "bullish",
+            "detected_patterns": [],
+            "entry_setup": "H2",
+            "bar_analysis": {"entry_setup_type": "H2"},
+        }
+
+        routed = route_strategies(diagnosis)
+
+        assert [template.template_id for template in routed] == [
+            "trend_pullback_long",
+            "ema20_magnet_wait",
+        ]
+
+    def test_routes_breakout_pattern_without_old_gate_shape(self):
+        diagnosis = {
+            "cycle_position": "normal_channel",
+            "direction": "bullish",
+            "detected_patterns": ["breakout_up"],
+            "entry_setup": "breakout_pullback",
+            "bar_analysis": {"entry_setup_type": "breakout_pullback"},
+        }
+
+        routed = route_strategies(diagnosis)
+
+        assert routed[0].template_id == "breakout_continuation_long"
+
+    def test_experience_lookup_uses_stage1_fields(self):
+        repository = MagicMock()
+        repository.query_experience.return_value = [{"id": 1}]
+        diagnosis = {
+            "cycle_position": "trading_range",
+            "direction": "bearish",
+            "detected_patterns": ["breakout_failure"],
+        }
+
+        cases = retrieve_experience_cases(
+            repository,
+            market="crypto",
+            timeframe="1h",
+            diagnosis=diagnosis,
+            limit=2,
+        )
+
+        assert cases == [{"id": 1}]
+        repository.query_experience.assert_called_once_with(
+            market="crypto",
+            timeframe="1h",
+            cycle_position="trading_range",
+            direction="bearish",
+            patterns=["breakout_failure"],
+            limit=2,
+        )
+
+
+class TestStage1Orchestrator:
+    def test_gate_wait_short_circuits_stage2_model_call(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        l1 = build_l1_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+        diagnosis = _stage1_diagnosis(
+            l1,
+            gate_result="wait",
+            cycle_position="unknown",
+            direction="neutral",
+        )
+        llm = MagicMock()
+        llm.model = "test-model"
+        llm.base_url = "https://example.test"
+        llm.complete_json.return_value = json.dumps(diagnosis, ensure_ascii=False)
+        orchestrator = PriceActionOrchestrator(
+            repository=None,
+            llm_client=llm,
+            config={"pa_llm_window": 6, "pa_llm_warmup": 0},
+        )
+
+        outcome = orchestrator.analyze(
+            symbol="BTC/USDT",
+            dataframe=df,
+            timeframe="1h",
+            market="crypto",
+        )
+
+        assert outcome.status == "success"
+        assert outcome.decision["decision"]["type"] == "wait"
+        assert "stage2_model_call=skipped" in outcome.decision["decision_trace"]
+        llm.complete_json.assert_called_once()
 
 
 class TestOpenAIJsonClient:
@@ -186,7 +742,11 @@ class TestOpenAIJsonClient:
 
 
 class TestDecisionValidator:
-    diagnosis = {"stage": "market_diagnosis"}
+    diagnosis = {
+        "cycle_position": "normal_channel",
+        "direction": "bullish",
+        "gate_result": "proceed",
+    }
     l1 = {
         "high": 105.0,
         "low": 95.0,
@@ -307,6 +867,11 @@ class TestPriceActionRepository:
         ctx.__exit__.return_value = False
         factory = MagicMock(return_value=ctx)
         repository = PriceActionRepository(factory, timeframe="1h", market="crypto")
+        stage1 = {
+            "cycle_position": "normal_channel",
+            "direction": "bullish",
+            "gate_result": "proceed",
+        }
 
         saved = repository.save_analysis(
             market="crypto",
@@ -314,29 +879,34 @@ class TestPriceActionRepository:
             timeframe="1h",
             candle_time=datetime(2026, 6, 1, tzinfo=timezone.utc),
             status="success",
-            market_diagnosis={"stage": "market_diagnosis"},
+            market_diagnosis=stage1,
             trade_decision={"stage": "trade_decision"},
             raw_responses={
-                "market_diagnosis": '{"stage":"market_diagnosis"}',
+                "market_diagnosis": json.dumps(stage1),
                 "trade_decision": '{"stage":"trade_decision"}',
             },
         )
 
         assert saved is True
         row = session.add.call_args.args[0]
-        assert row.market_diagnosis == {"stage": "market_diagnosis"}
+        assert row.market_diagnosis == stage1
         assert row.trade_decision == {"stage": "trade_decision"}
         assert row.raw_responses == {
-            "market_diagnosis": '{"stage":"market_diagnosis"}',
+            "market_diagnosis": json.dumps(stage1),
             "trade_decision": '{"stage":"trade_decision"}',
         }
         session.commit.assert_called_once()
 
     def test_previous_successful_analysis_reads_semantic_analysis_fields(self):
+        stage1 = {
+            "cycle_position": "normal_channel",
+            "direction": "bullish",
+            "gate_result": "proceed",
+        }
         row = SimpleNamespace(
             candle_time=datetime(2026, 6, 1, tzinfo=timezone.utc),
             trade_decision={"stage": "trade_decision"},
-            market_diagnosis={"stage": "market_diagnosis"},
+            market_diagnosis=stage1,
             validation_status="valid",
         )
         query = MagicMock()
@@ -358,7 +928,7 @@ class TestPriceActionRepository:
         assert previous == {
             "candle_time": "2026-06-01T00:00:00+00:00",
             "decision": {"stage": "trade_decision"},
-            "diagnosis": {"stage": "market_diagnosis"},
+            "diagnosis": stage1,
             "validation_status": "valid",
         }
 

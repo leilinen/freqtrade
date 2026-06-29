@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 from typing import Any, Callable
 
@@ -13,7 +14,7 @@ from .llm import OpenAIJsonClient
 from .prompts import build_market_diagnosis_messages, build_trade_decision_messages
 from .repository import PriceActionRepository
 from .router import route_strategies
-from .validation import DecisionValidator, parse_json_object
+from .validation import DecisionValidator, parse_json_object, validate_stage1_diagnosis
 
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ class AnalysisOutcome:
 
 
 class PriceActionOrchestrator:
-    """Run L1 feature engineering, L2 diagnosis, L3 routing, and L4 decision."""
+    """Run L1 features, Stage 1 diagnosis, L3 routing, and L4 decision."""
 
     def __init__(
         self,
@@ -89,6 +90,9 @@ class PriceActionOrchestrator:
                 stage="market_diagnosis",
             )
             diagnosis = parse_json_object(raw_market_diagnosis)
+            stage1_errors = validate_stage1_diagnosis(diagnosis, l1_rows=l1.rows)
+            if stage1_errors:
+                raise ValueError(f"stage1_invalid:{','.join(stage1_errors)}")
 
             strategies = route_strategies(diagnosis)
             selected = [strategy.as_dict() for strategy in strategies]
@@ -99,6 +103,59 @@ class PriceActionOrchestrator:
                 diagnosis=diagnosis,
                 limit=int(self.config.get("pa_experience_limit", 3)),
             )
+
+            gate_result = str(diagnosis.get("gate_result", "proceed")).lower()
+            if gate_result in ("wait", "unknown"):
+                decision_json = self._build_gate_wait_decision(diagnosis)
+                raw_trade_decision = json.dumps(decision_json, ensure_ascii=False)
+                decision_json, validation = self.validator.validate(
+                    raw_trade_decision,
+                    diagnosis=diagnosis,
+                    l1_features=l1.latest_features,
+                    strategies=selected,
+                )
+                validation_status = validation.status
+                validation_errors = validation.errors
+                status = "success" if validation.valid else "invalid"
+
+                self._save(
+                    l1=l1,
+                    status=status,
+                    diagnosis=diagnosis,
+                    selected=selected,
+                    experience_cases=experience_cases,
+                    decision=decision_json,
+                    validation_status=validation_status,
+                    validation_errors=validation_errors,
+                    prompt_metadata={**prompt_metadata, "validation_checks": validation.checks},
+                    raw_responses={
+                        "market_diagnosis": raw_market_diagnosis,
+                        "trade_decision": raw_trade_decision,
+                    },
+                )
+
+                if validation.valid and self._should_notify(decision_json):
+                    self._notify(
+                        notifier=notifier,
+                        symbol=symbol,
+                        dataframe=dataframe,
+                        l1=l1,
+                        diagnosis=diagnosis,
+                        selected=selected,
+                        decision=decision_json,
+                        validation=validation.as_dict(),
+                        chart_generator=chart_generator,
+                    )
+
+                return AnalysisOutcome(
+                    status=status,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    candle_time=l1.candle_time,
+                    decision=decision_json,
+                    errors=validation_errors,
+                )
+
             previous = (
                 self.repository.get_previous_successful_analysis(
                     symbol=symbol,
@@ -168,7 +225,13 @@ class PriceActionOrchestrator:
                 errors=validation_errors,
             )
         except Exception as exc:
-            logger.warning("PA analysis failed for %s %s: %s", symbol, timeframe, exc, exc_info=True)
+            logger.warning(
+                "PA analysis failed for %s %s: %s",
+                symbol,
+                timeframe,
+                exc,
+                exc_info=True,
+            )
             validation_errors = [f"{type(exc).__name__}:{exc}"]
             if l1 is not None:
                 self._save(
@@ -237,6 +300,40 @@ class PriceActionOrchestrator:
         if decision_type in ("enter_long", "enter_short"):
             return True
         return bool(self.config.get("pa_notify_wait", False))
+
+    def _build_gate_wait_decision(self, diagnosis: dict[str, Any]) -> dict[str, Any]:
+        gate_result = str(diagnosis.get("gate_result", "wait")).lower()
+        trace = diagnosis.get("gate_trace") or []
+        final_reason = ""
+        if trace and isinstance(trace[-1], dict):
+            final_reason = str(trace[-1].get("reason") or "")
+        reason = final_reason or str(diagnosis.get("risk_warning") or "阶段一闸门未通过")
+        confidence = diagnosis.get("diagnosis_confidence")
+        try:
+            confidence_value = max(0.0, min(float(confidence) / 100.0, 1.0))
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        return {
+            "stage": "trade_decision",
+            "decision": {
+                "type": "wait",
+                "direction": "neutral",
+                "order_type": "none",
+                "entry": None,
+                "stop_loss": None,
+                "take_profit_1": None,
+                "take_profit_2": None,
+                "risk_reward": None,
+                "confidence": confidence_value,
+                "reason": f"阶段一 gate_result={gate_result}，跳过阶段二：{reason}",
+            },
+            "decision_trace": [
+                f"stage1_gate_result={gate_result}",
+                "stage2_model_call=skipped",
+            ],
+            "watch_points": [reason],
+            "invalidations": [],
+        }
 
     def _notify(
         self,

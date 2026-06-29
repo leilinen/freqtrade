@@ -1,4 +1,4 @@
-"""Deterministic L3 routing from L2 diagnosis to strategy templates."""
+"""Deterministic L3 routing from Stage 1 diagnosis to strategy templates."""
 from __future__ import annotations
 
 from typing import Any
@@ -6,41 +6,55 @@ from typing import Any
 from .strategy_templates import StrategyTemplate, get_template
 
 
-def route_strategies(diagnosis: dict[str, Any]) -> list[StrategyTemplate]:
-    """Select one or two strategy templates from L2 market diagnosis."""
-    market_state = diagnosis.get("market_state") or {}
-    signal_chain = diagnosis.get("signal_chain") or {}
-    gate = diagnosis.get("gate") or {}
+TREND_CYCLES = {"spike", "micro_channel", "tight_channel", "normal_channel"}
+RANGE_CYCLES = {"broad_channel", "trending_tr", "trading_range"}
 
-    cycle = str(market_state.get("cycle", "unknown")).lower()
-    direction = _normalize_direction(
-        signal_chain.get("direction") or market_state.get("direction") or "neutral"
-    )
-    gate_break = str(gate.get("breakout", "none")).lower()
-    gate_position = str(gate.get("position", "unknown")).lower()
-    patterns = {str(p).lower() for p in signal_chain.get("patterns", []) if p}
-    setup = str(signal_chain.get("setup", "")).lower()
+
+def route_strategies(diagnosis: dict[str, Any]) -> list[StrategyTemplate]:
+    """Select one or two strategy templates from Stage 1 market diagnosis."""
+    bar_analysis = diagnosis.get("bar_analysis") or {}
+
+    cycle = str(diagnosis.get("cycle_position", "unknown")).lower()
+    direction = _normalize_direction(diagnosis.get("direction", "neutral"))
+    patterns = {
+        str(p).lower()
+        for p in (diagnosis.get("detected_patterns", []) or [])
+        if p
+    }
+    setup = str(
+        diagnosis.get("entry_setup")
+        or bar_analysis.get("entry_setup_type")
+        or ""
+    ).lower()
 
     selected: list[str] = []
-    failed_up = gate_break == "failed_up" or ("failure" in setup and "up" in setup)
-    failed_down = gate_break == "failed_down" or ("failure" in setup and "down" in setup)
+    failed_up = (
+        ("failure" in setup and "up" in setup)
+        or ("breakout_failure" in patterns and direction == "short")
+    )
+    failed_down = (
+        ("failure" in setup and "down" in setup)
+        or ("breakout_failure" in patterns and direction == "long")
+    )
+    breakout_up = "breakout_up" in patterns or setup in ("breakout", "breakout_pullback")
+    breakout_down = "breakout_down" in patterns or setup in ("breakout", "breakout_pullback")
 
     if failed_down:
         selected.append("breakout_failure_long")
     elif failed_up:
         selected.append("breakout_failure_short")
-    elif gate_break in ("up", "both") and direction == "long":
+    elif breakout_up and direction == "long":
         selected.append("breakout_continuation_long")
-    elif gate_break in ("down", "both") and direction == "short":
+    elif breakout_down and direction == "short":
         selected.append("breakout_continuation_short")
-    elif cycle in ("trend", "always_in") and direction == "long":
+    elif cycle in TREND_CYCLES and direction == "long":
         selected.append("trend_pullback_long")
-    elif cycle in ("trend", "always_in") and direction == "short":
+    elif cycle in TREND_CYCLES and direction == "short":
         selected.append("trend_pullback_short")
-    elif cycle in ("trading_range", "range", "reversal"):
-        if direction == "long" or gate_position in ("below", "testing_lower"):
+    elif cycle in RANGE_CYCLES:
+        if direction == "long":
             selected.append("range_reversal_long")
-        elif direction == "short" or gate_position in ("above", "testing_upper"):
+        elif direction == "short":
             selected.append("range_reversal_short")
 
     if not selected:

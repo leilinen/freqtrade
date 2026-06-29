@@ -17,13 +17,11 @@ def retrieve_experience_cases(
     """Fetch simple cycle/direction/pattern matched cases from PostgreSQL."""
     if repository is None:
         return []
-    market_state = diagnosis.get("market_state") or {}
-    signal_chain = diagnosis.get("signal_chain") or {}
     return repository.query_experience(
         market=market,
         timeframe=timeframe,
-        cycle_position=str(market_state.get("cycle", "")) or None,
-        direction=str(signal_chain.get("direction") or market_state.get("direction") or "") or None,
-        patterns=[str(p) for p in signal_chain.get("patterns", []) if p],
+        cycle_position=str(diagnosis.get("cycle_position", "")) or None,
+        direction=str(diagnosis.get("direction", "")) or None,
+        patterns=[str(p) for p in diagnosis.get("detected_patterns", []) if p],
         limit=limit,
     )

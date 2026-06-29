@@ -479,6 +479,12 @@ async def _parse_payload_request(request: web.Request):
                 payload_str = await part.text()
             elif part.name == "chart":
                 chart_bytes = await part.read()
+    elif content_type == "application/x-www-form-urlencoded":
+        try:
+            form = await request.post()
+            payload_str = form.get("payload")
+        except Exception:
+            return None, None, web.json_response({"error": "invalid request"}, status=400)
     else:
         try:
             payload_str = await request.text()

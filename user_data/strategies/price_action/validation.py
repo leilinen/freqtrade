@@ -12,6 +12,36 @@ CHECK_STAGE_CONSISTENCY = "stage_consistency"
 CHECK_SEMANTIC_REASONABLENESS = "semantic_reasonableness"
 CHECK_NUMERIC_RANGE = "numeric_range"
 
+STAGE1_REQUIRED_FIELDS = (
+    "cycle_position",
+    "direction",
+    "diagnosis_confidence",
+    "market_phase",
+    "detected_patterns",
+    "key_signals",
+    "htf_context",
+    "entry_setup",
+    "strategy_files_needed",
+    "bar_by_bar_summary",
+    "gate_trace",
+    "gate_result",
+)
+STAGE1_CYCLE_POSITIONS = {
+    "spike",
+    "micro_channel",
+    "tight_channel",
+    "normal_channel",
+    "broad_channel",
+    "trending_tr",
+    "trading_range",
+    "extreme_tr",
+    "unknown",
+}
+STAGE1_DIRECTIONS = {"bullish", "bearish", "neutral"}
+STAGE1_MARKET_PHASES = {"stable", "transitioning"}
+STAGE1_GATE_RESULTS = {"proceed", "wait", "unknown"}
+STAGE1_PROCEED_TRACE_NODES = {"1.2", "1.3", "2.1", "2.2", "2.5"}
+
 
 @dataclass
 class ValidationResult:
@@ -26,7 +56,12 @@ class ValidationResult:
         return "valid" if self.valid else "invalid"
 
     def as_dict(self) -> dict[str, Any]:
-        return {"valid": self.valid, "status": self.status, "checks": self.checks, "errors": self.errors}
+        return {
+            "valid": self.valid,
+            "status": self.status,
+            "checks": self.checks,
+            "errors": self.errors,
+        }
 
 
 class DecisionValidator:
@@ -75,8 +110,8 @@ class DecisionValidator:
         errors: list[str] = []
         if decision_json.get("stage") != "trade_decision":
             errors.append("stage_must_be_trade_decision")
-        if diagnosis.get("stage") != "market_diagnosis":
-            errors.append("diagnosis_stage_must_be_market_diagnosis")
+        if not _looks_like_stage1_diagnosis(diagnosis):
+            errors.append("diagnosis_must_be_stage1")
 
         decision = decision_json.get("decision")
         if not isinstance(decision, dict):
@@ -187,6 +222,110 @@ def parse_json_object(raw_response: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("LLM response root must be a JSON object")
     return parsed
+
+
+def validate_stage1_diagnosis(
+    diagnosis: dict[str, Any],
+    *,
+    l1_rows: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """Validate the PA_Agent Stage 1 diagnosis contract used before routing."""
+    errors: list[str] = []
+    if not isinstance(diagnosis, dict):
+        return ["stage1_root_must_be_object"]
+
+    for field in STAGE1_REQUIRED_FIELDS:
+        if field not in diagnosis:
+            errors.append(f"stage1_missing_{field}")
+
+    cycle = str(diagnosis.get("cycle_position", "")).lower()
+    if cycle not in STAGE1_CYCLE_POSITIONS:
+        errors.append("stage1_cycle_position_invalid")
+
+    direction = str(diagnosis.get("direction", "")).lower()
+    if direction not in STAGE1_DIRECTIONS:
+        errors.append("stage1_direction_invalid")
+
+    confidence = diagnosis.get("diagnosis_confidence")
+    confidence_valid = (
+        not isinstance(confidence, bool)
+        and isinstance(confidence, int)
+        and 0 <= confidence <= 100
+    )
+    if not confidence_valid:
+        errors.append("stage1_diagnosis_confidence_must_be_0_to_100_int")
+
+    market_phase = str(diagnosis.get("market_phase", "")).lower()
+    if market_phase not in STAGE1_MARKET_PHASES:
+        errors.append("stage1_market_phase_invalid")
+
+    for field in ("detected_patterns", "key_signals", "strategy_files_needed"):
+        if field in diagnosis and not isinstance(diagnosis.get(field), list):
+            errors.append(f"stage1_{field}_must_be_array")
+
+    rows_by_k = {str(row.get("k")): row for row in (l1_rows or [])}
+    latest = rows_by_k.get("K1")
+    bar_analysis = diagnosis.get("bar_analysis")
+    if isinstance(bar_analysis, dict) and latest:
+        if bar_analysis.get("bar_type") != latest.get("bar_type"):
+            errors.append("stage1_bar_analysis_bar_type_mismatch")
+
+    summary = diagnosis.get("bar_by_bar_summary")
+    if not isinstance(summary, list) or not summary:
+        errors.append("stage1_bar_by_bar_summary_required")
+    else:
+        expected_count = min(5, len(l1_rows or summary))
+        if len(l1_rows or []) >= 5 and len(summary) != 5:
+            errors.append("stage1_bar_by_bar_summary_must_cover_k5_to_k1")
+        expected_bars = {f"K{i}" for i in range(1, expected_count + 1)}
+        seen_bars = {str(item.get("bar")) for item in summary if isinstance(item, dict)}
+        if expected_bars and seen_bars and seen_bars != expected_bars:
+            errors.append("stage1_bar_by_bar_summary_bars_invalid")
+        for item in summary:
+            if not isinstance(item, dict):
+                errors.append("stage1_bar_by_bar_summary_item_must_be_object")
+                continue
+            bar = str(item.get("bar", ""))
+            row = rows_by_k.get(bar)
+            if row and item.get("bar_type") != row.get("bar_type"):
+                errors.append(f"stage1_bar_by_bar_{bar}_bar_type_mismatch")
+
+    gate_trace = diagnosis.get("gate_trace")
+    gate_result = str(diagnosis.get("gate_result", "")).lower()
+    if gate_result not in STAGE1_GATE_RESULTS:
+        errors.append("stage1_gate_result_invalid")
+    if not isinstance(gate_trace, list) or not gate_trace:
+        errors.append("stage1_gate_trace_required")
+    else:
+        node_ids = {
+            str(item.get("node_id"))
+            for item in gate_trace
+            if isinstance(item, dict) and item.get("node_id") is not None
+        }
+        if gate_result == "proceed" and not STAGE1_PROCEED_TRACE_NODES <= node_ids:
+            errors.append("stage1_gate_trace_missing_proceed_nodes")
+        if gate_result in ("wait", "unknown"):
+            last = gate_trace[-1] if isinstance(gate_trace[-1], dict) else {}
+            if last.get("answer") not in ("否", "等待"):
+                errors.append("stage1_gate_wait_requires_negative_or_waiting_final_answer")
+        for item in gate_trace:
+            if not isinstance(item, dict):
+                errors.append("stage1_gate_trace_item_must_be_object")
+                continue
+            if not item.get("bar_range"):
+                errors.append("stage1_gate_trace_bar_range_required")
+            elif "K0" in str(item.get("bar_range")):
+                errors.append("stage1_gate_trace_bar_range_must_not_reference_k0")
+
+    return errors
+
+
+def _looks_like_stage1_diagnosis(diagnosis: dict[str, Any]) -> bool:
+    return isinstance(diagnosis, dict) and (
+        "cycle_position" in diagnosis
+        and "direction" in diagnosis
+        and "gate_result" in diagnosis
+    )
 
 
 def _number(value: Any) -> float | None:
