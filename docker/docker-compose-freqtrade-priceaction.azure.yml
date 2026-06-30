@@ -35,6 +35,8 @@ services:
       PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    extra_hosts:
+      - "ca.f-free.site:149.28.81.78"
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_1h.json
@@ -65,6 +67,8 @@ services:
       PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    extra_hosts:
+      - "ca.f-free.site:149.28.81.78"
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_4h.json
@@ -95,6 +99,8 @@ services:
       PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    extra_hosts:
+      - "ca.f-free.site:149.28.81.78"
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_ashare_1h.json
@@ -119,6 +125,8 @@ services:
       PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    extra_hosts:
+      - "ca.f-free.site:149.28.81.78"
     command: >
       trade
       --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_ashare_1d.json
@@ -129,7 +137,7 @@ services:
     networks:
       - pricedog_default
 
-  tg-bot:
+  priceaction-tg-bot:
     build:
       context: ../services
       dockerfile: Dockerfile.tg

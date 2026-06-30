@@ -10,7 +10,7 @@
   "tg_api_url": "http://freqtrade_priceaction_tg_bot:8090",
   "pa_chart_port": 8092,
   "pa_agent_enabled": true,
-  "pa_validation_retry_max": 1,
+  "pa_validation_retry_max": 3,
   "pa_llm_window": 8,
   "pa_llm_timeout": 180,
   "pa_llm_max_tokens": 2048,
