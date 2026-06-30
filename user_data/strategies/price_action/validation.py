@@ -189,8 +189,6 @@ class DecisionValidator:
         diagnosis: dict[str, Any],
     ) -> list[str]:
         errors: list[str] = []
-        if decision_json.get("stage") != "trade_decision":
-            errors.append("stage_must_be_trade_decision")
         if not _looks_like_market_diagnosis(diagnosis):
             errors.append("diagnosis_must_be_market_diagnosis")
 
@@ -199,15 +197,38 @@ class DecisionValidator:
             errors.append("decision_must_be_object")
             return errors
 
-        decision_type = str(decision.get("type", "")).lower()
-        direction = str(decision.get("direction", "")).lower()
-        valid_types = {"enter_long", "enter_short", "wait", "avoid"}
-        if decision_type not in valid_types:
-            errors.append("decision_type_invalid")
-        if decision_type == "enter_long" and direction != "long":
-            errors.append("enter_long_requires_long_direction")
-        if decision_type == "enter_short" and direction != "short":
-            errors.append("enter_short_requires_short_direction")
+        order_type = decision.get("order_type")
+        if order_type not in ("限价单", "突破单", "市价单", "不下单"):
+            errors.append("order_type_invalid")
+
+        order_direction = decision.get("order_direction")
+        if order_type in ("限价单", "突破单", "市价单"):
+            if order_direction not in ("做多", "做空"):
+                errors.append("actionable_decision_requires_order_direction")
+        elif order_direction is not None:
+            errors.append("no_trade_order_direction_must_be_null")
+
+        summary = decision_json.get("diagnosis_summary")
+        if not isinstance(summary, dict):
+            errors.append("diagnosis_summary_must_be_object")
+        else:
+            if summary.get("cycle_position") != diagnosis.get("cycle_position"):
+                errors.append("diagnosis_summary_cycle_position_mismatch")
+            if summary.get("direction") != diagnosis.get("direction"):
+                errors.append("diagnosis_summary_direction_mismatch")
+            if not isinstance(summary.get("key_signals"), list):
+                errors.append("diagnosis_summary_key_signals_must_be_array")
+
+        if not isinstance(decision_json.get("decision_trace"), list):
+            errors.append("decision_trace_must_be_array")
+        terminal = decision_json.get("terminal")
+        if not isinstance(terminal, dict):
+            errors.append("terminal_must_be_object")
+        else:
+            if terminal.get("outcome") not in ("wait", "reject", "trade", "proceed"):
+                errors.append("terminal_outcome_invalid")
+        if not isinstance(decision_json.get("next_cycle_prediction"), dict):
+            errors.append("next_cycle_prediction_must_be_object")
         return errors
 
     def _semantic_errors(
@@ -219,35 +240,70 @@ class DecisionValidator:
     ) -> list[str]:
         del diagnosis, strategies
         decision = decision_json["decision"]
-        decision_type = str(decision.get("type", "")).lower()
-        entry = _number(decision.get("entry"))
-        stop = _number(decision.get("stop_loss"))
-        tp1 = _number(decision.get("take_profit_1"))
-        tp2 = _number(decision.get("take_profit_2"))
+        order_type = str(decision.get("order_type", ""))
+        order_direction = decision.get("order_direction")
+        entry = _number(decision.get("entry_price"))
+        stop = _number(decision.get("stop_loss_price"))
+        tp1 = _number(decision.get("take_profit_price"))
+        tp2 = _number(decision.get("take_profit_price_2"))
 
-        if decision_type in ("wait", "avoid"):
-            if entry is not None and stop is not None and (tp1 is not None or tp2 is not None):
-                return ["wait_or_avoid_should_not_include_full_order_plan"]
-            return []
+        if order_type == "不下单":
+            errors = []
+            for field in (
+                "entry_price",
+                "entry_basis_bar",
+                "entry_basis_extreme",
+                "entry_rule",
+                "take_profit_price",
+                "take_profit_price_2",
+                "stop_loss_price",
+                "order_direction",
+                "estimated_win_rate",
+            ):
+                if decision.get(field) is not None:
+                    errors.append("no_trade_fields_must_be_null")
+                    break
+            terminal = decision_json.get("terminal") or {}
+            if terminal.get("outcome") == "trade":
+                errors.append("no_trade_terminal_must_not_be_trade")
+            return errors
 
-        if entry is None or stop is None:
-            return ["actionable_decision_requires_entry_and_stop"]
+        if order_type == "突破单":
+            if decision.get("entry_basis_bar") is None:
+                return ["breakout_order_requires_entry_basis_bar"]
+            if decision.get("entry_basis_extreme") not in ("high", "low"):
+                return ["breakout_order_requires_entry_basis_extreme"]
+            if not decision.get("entry_rule"):
+                return ["breakout_order_requires_entry_rule"]
+
+        if order_direction not in ("做多", "做空"):
+            return ["actionable_decision_requires_order_direction"]
+        if entry is None or stop is None or tp1 is None or tp2 is None:
+            return ["actionable_decision_requires_full_price_plan"]
+
+        terminal = decision_json.get("terminal") or {}
+        if terminal.get("outcome") != "trade":
+            return ["actionable_decision_requires_trade_terminal"]
+
+        estimated = decision.get("estimated_win_rate")
+        if estimated is None:
+            return ["actionable_decision_requires_estimated_win_rate"]
 
         errors: list[str] = []
-        if decision_type == "enter_long":
+        if order_direction == "做多":
             if not stop < entry:
                 errors.append("long_stop_must_be_below_entry")
-            if tp1 is not None and not tp1 > entry:
+            if not entry < tp1:
                 errors.append("long_tp1_must_be_above_entry")
-            if tp2 is not None and not tp2 > entry:
-                errors.append("long_tp2_must_be_above_entry")
-        elif decision_type == "enter_short":
+            if not tp1 < tp2:
+                errors.append("long_tp2_must_be_above_tp1")
+        elif order_direction == "做空":
             if not stop > entry:
                 errors.append("short_stop_must_be_above_entry")
-            if tp1 is not None and not tp1 < entry:
+            if not entry > tp1:
                 errors.append("short_tp1_must_be_below_entry")
-            if tp2 is not None and not tp2 < entry:
-                errors.append("short_tp2_must_be_below_entry")
+            if not tp1 > tp2:
+                errors.append("short_tp2_must_be_below_tp1")
 
         atr_expand = _number(price_action_features.get("atr_expand_ratio"))
         gate_break = str(price_action_features.get("gate_break", "none")).lower()
@@ -261,30 +317,45 @@ class DecisionValidator:
         price_action_features: dict[str, Any],
     ) -> list[str]:
         decision = decision_json["decision"]
-        decision_type = str(decision.get("type", "")).lower()
-        confidence = _number(decision.get("confidence"))
-        rr = _number(decision.get("risk_reward"))
+        order_type = str(decision.get("order_type", ""))
+        trade_confidence = decision.get("trade_confidence")
+        diagnosis_confidence = decision.get("diagnosis_confidence")
+        estimated_win_rate = decision.get("estimated_win_rate")
         errors: list[str] = []
 
-        if confidence is None or not 0.0 <= confidence <= 1.0:
-            errors.append("confidence_must_be_0_to_1")
-        if rr is not None and not 0.0 <= rr <= 20.0:
-            errors.append("risk_reward_out_of_range")
+        for field, value in (
+            ("trade_confidence", trade_confidence),
+            ("diagnosis_confidence", diagnosis_confidence),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+                errors.append(f"{field}_must_be_0_to_100_int")
+        if estimated_win_rate is not None:
+            if (
+                isinstance(estimated_win_rate, bool)
+                or not isinstance(estimated_win_rate, int)
+                or not 0 <= estimated_win_rate <= 100
+            ):
+                errors.append("estimated_win_rate_must_be_0_to_100_int")
 
-        if decision_type not in ("enter_long", "enter_short"):
+        prediction = decision_json.get("next_cycle_prediction")
+        if isinstance(prediction, dict):
+            if not isinstance(prediction.get("unpredictable"), bool):
+                errors.append("next_cycle_prediction_unpredictable_must_be_bool")
+
+        if order_type == "不下单":
             return errors
 
         prices = {
-            "entry": _number(decision.get("entry")),
-            "stop_loss": _number(decision.get("stop_loss")),
-            "take_profit_1": _number(decision.get("take_profit_1")),
-            "take_profit_2": _number(decision.get("take_profit_2")),
+            "entry_price": _number(decision.get("entry_price")),
+            "stop_loss_price": _number(decision.get("stop_loss_price")),
+            "take_profit_price": _number(decision.get("take_profit_price")),
+            "take_profit_price_2": _number(decision.get("take_profit_price_2")),
         }
         for name, value in prices.items():
             if value is not None and value <= 0:
                 errors.append(f"{name}_must_be_positive")
 
-        entry = prices["entry"]
+        entry = prices["entry_price"]
         latest_high = _number(price_action_features.get("high"))
         latest_low = _number(price_action_features.get("low"))
         atr = _number(price_action_features.get("atr14")) or 0.0

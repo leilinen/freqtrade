@@ -219,6 +219,79 @@ def _market_diagnosis(
     }
 
 
+def _trade_decision(
+    *,
+    order_direction="做多",
+    order_type="突破单",
+    entry=100.0,
+    stop=95.0,
+    tp1=110.0,
+    tp2=115.0,
+    trade_confidence=70,
+    estimated_win_rate=55,
+    diagnosis=None,
+):
+    diagnosis = diagnosis or {
+        "cycle_position": "normal_channel",
+        "direction": "bullish",
+        "key_signals": ["K1 close"],
+    }
+    is_trade = order_type != "不下单"
+    return {
+        "decision": {
+            "order_direction": order_direction if is_trade else None,
+            "order_type": order_type,
+            "entry_price": entry if is_trade else None,
+            "entry_basis_bar": "K1" if order_type == "突破单" else None,
+            "entry_basis_extreme": "high" if order_type == "突破单" else None,
+            "entry_rule": "突破 K1 高点" if order_type == "突破单" else None,
+            "take_profit_price": tp1 if is_trade else None,
+            "take_profit_price_2": tp2 if is_trade else None,
+            "stop_loss_price": stop if is_trade else None,
+            "reasoning": "阶段二交易决策",
+            "diagnosis_confidence": 75,
+            "diagnosis_confidence_reasoning": "沿用市场诊断置信度",
+            "trade_confidence": trade_confidence,
+            "trade_confidence_reasoning": "信号链完整",
+            "estimated_win_rate": estimated_win_rate if is_trade else None,
+            "estimated_win_rate_reasoning": "满足交易者方程" if is_trade else None,
+            "key_factors": ["signal", "risk"],
+            "watch_points": ["follow through"],
+            "risk_assessment": "risk controlled",
+            "invalidation_condition": None,
+        },
+        "diagnosis_summary": {
+            "cycle_position": diagnosis.get("cycle_position", "normal_channel"),
+            "direction": diagnosis.get("direction", "bullish"),
+            "key_signals": list(diagnosis.get("key_signals") or []),
+        },
+        "decision_trace": [
+            {
+                "node_id": "10.3",
+                "question": "交易者方程是否通过？",
+                "answer": "是" if is_trade else "否",
+                "reason": "测试 trace",
+                "branch": "trade" if is_trade else "wait",
+                "section": "交易者方程",
+                "bar_range": "K1",
+            }
+        ],
+        "terminal": {
+            "node_id": "11.1",
+            "outcome": "trade" if is_trade else "wait",
+            "label": "下单" if is_trade else "不下单",
+        },
+        "next_cycle_prediction": {
+            "cycle": "normal_channel",
+            "direction": "bullish",
+            "probabilities": {},
+            "reasoning": "延续当前结构",
+            "unpredictable": False,
+            "features_used": ["stage1_diagnosis", "stage2_decision"],
+        },
+    }
+
+
 class TestPriceActionFeatures:
     def test_latest_closed_k_is_k1_and_forming_tail_is_dropped(self):
         df = _df_from_ohlc(
@@ -884,8 +957,9 @@ class TestMarketDiagnosisOrchestrator:
         )
 
         assert outcome.status == "success"
-        assert outcome.decision["decision"]["type"] == "wait"
-        assert "trade_decision_model_call=skipped" in outcome.decision["decision_trace"]
+        assert outcome.decision["decision"]["order_type"] == "不下单"
+        assert outcome.decision["terminal"]["outcome"] == "wait"
+        assert outcome.decision["gate_shortcircuited"] is True
         llm.complete_json.assert_called_once()
 
     def test_successful_analysis_persists_prompt_messages_and_template_metadata(self):
@@ -900,24 +974,7 @@ class TestMarketDiagnosisOrchestrator:
             now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
         )
         diagnosis = _market_diagnosis(features)
-        decision = {
-            "stage": "trade_decision",
-            "decision": {
-                "type": "wait",
-                "direction": "neutral",
-                "order_type": "none",
-                "entry": None,
-                "stop_loss": None,
-                "take_profit_1": None,
-                "take_profit_2": None,
-                "risk_reward": None,
-                "confidence": 0.6,
-                "reason": "等待",
-            },
-            "decision_trace": ["trade_decision"],
-            "watch_points": [],
-            "invalidations": [],
-        }
+        decision = _trade_decision(order_type="不下单", diagnosis=diagnosis)
         llm = MagicMock()
         llm.model = "test-model"
         llm.base_url = "https://example.test"
@@ -949,6 +1006,9 @@ class TestMarketDiagnosisOrchestrator:
         assert kwargs["trade_decision_messages"][1]["role"] == "user"
         assert "任务：完成市场诊断" in kwargs["market_diagnosis_messages"][1]["content"]
         assert "任务：完成交易决策" in kwargs["trade_decision_messages"][1]["content"]
+        assert '"order_direction"' in kwargs["trade_decision_messages"][1]["content"]
+        assert '"terminal"' in kwargs["trade_decision_messages"][1]["content"]
+        assert '"next_cycle_prediction"' in kwargs["trade_decision_messages"][1]["content"]
         assert kwargs["prompt_metadata"]["prompt_templates"]["market_diagnosis"][0]["sha256"]
 
 
@@ -999,19 +1059,9 @@ class TestDecisionValidator:
         assert result.checks == ["json_syntax"]
 
     def test_stage_consistency_runs_before_semantic(self):
-        raw = json.dumps(
-            {
-                "stage": "wrong",
-                "decision": {
-                    "type": "enter_long",
-                    "direction": "long",
-                    "entry": 100,
-                    "stop_loss": 110,
-                    "take_profit_1": 120,
-                    "confidence": 2,
-                },
-            }
-        )
+        decision = _trade_decision(diagnosis=self.diagnosis)
+        decision["diagnosis_summary"]["direction"] = "bearish"
+        raw = json.dumps(decision)
 
         _, result = DecisionValidator().validate(
             raw,
@@ -1020,21 +1070,19 @@ class TestDecisionValidator:
         )
 
         assert result.checks == ["json_syntax", "stage_consistency"]
-        assert "stage_must_be_trade_decision" in result.errors
+        assert "diagnosis_summary_direction_mismatch" in result.errors
 
     def test_semantic_runs_before_numeric(self):
         raw = json.dumps(
-            {
-                "stage": "trade_decision",
-                "decision": {
-                    "type": "enter_long",
-                    "direction": "long",
-                    "entry": 100,
-                    "stop_loss": 110,
-                    "take_profit_1": 120,
-                    "confidence": 2,
-                },
-            }
+            _trade_decision(
+                order_direction="做多",
+                entry=100,
+                stop=110,
+                tp1=120,
+                tp2=130,
+                trade_confidence=200,
+                diagnosis=self.diagnosis,
+            )
         )
 
         _, result = DecisionValidator().validate(
@@ -1052,18 +1100,15 @@ class TestDecisionValidator:
 
     def test_numeric_range_runs_last(self):
         raw = json.dumps(
-            {
-                "stage": "trade_decision",
-                "decision": {
-                    "type": "enter_long",
-                    "direction": "long",
-                    "entry": 100,
-                    "stop_loss": 95,
-                    "take_profit_1": 110,
-                    "risk_reward": 2,
-                    "confidence": 2,
-                },
-            }
+            _trade_decision(
+                order_direction="做多",
+                entry=100,
+                stop=95,
+                tp1=110,
+                tp2=120,
+                trade_confidence=200,
+                diagnosis=self.diagnosis,
+            )
         )
 
         _, result = DecisionValidator().validate(
@@ -1078,24 +1123,37 @@ class TestDecisionValidator:
             "semantic_reasonableness",
             "numeric_range",
         ]
-        assert "confidence_must_be_0_to_1" in result.errors
+        assert "trade_confidence_must_be_0_to_100_int" in result.errors
+
+    def test_no_trade_requires_null_order_fields(self):
+        decision = _trade_decision(order_type="不下单", diagnosis=self.diagnosis)
+        decision["decision"]["entry_price"] = 100
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+        )
+
+        assert result.checks[-1] == "semantic_reasonableness"
+        assert "no_trade_fields_must_be_null" in result.errors
+
+    def test_breakout_order_requires_entry_basis(self):
+        decision = _trade_decision(order_type="突破单", diagnosis=self.diagnosis)
+        decision["decision"]["entry_basis_bar"] = None
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+        )
+
+        assert result.checks[-1] == "semantic_reasonableness"
+        assert "breakout_order_requires_entry_basis_bar" in result.errors
 
     def test_atr_expansion_veto_is_semantic(self):
         features = {**self.features, "gate_break": "up", "atr_expand_ratio": 2.1}
-        raw = json.dumps(
-            {
-                "stage": "trade_decision",
-                "decision": {
-                    "type": "enter_long",
-                    "direction": "long",
-                    "entry": 100,
-                    "stop_loss": 95,
-                    "take_profit_1": 110,
-                    "risk_reward": 2,
-                    "confidence": 0.7,
-                },
-            }
-        )
+        raw = json.dumps(_trade_decision(diagnosis=self.diagnosis))
 
         _, result = DecisionValidator().validate(
             raw,
@@ -1121,6 +1179,8 @@ class TestPriceActionRepository:
             "direction": "bullish",
             "gate_result": "proceed",
         }
+        trade_decision = _trade_decision(diagnosis=market_diagnosis)
+        raw_trade_decision = json.dumps(trade_decision, ensure_ascii=False)
 
         saved = repository.save_analysis(
             market="crypto",
@@ -1131,10 +1191,10 @@ class TestPriceActionRepository:
             market_diagnosis_messages=[{"role": "user", "content": "market diagnosis"}],
             trade_decision_messages=[{"role": "user", "content": "trade decision"}],
             market_diagnosis=market_diagnosis,
-            trade_decision={"stage": "trade_decision"},
+            trade_decision=trade_decision,
             raw_responses={
                 "market_diagnosis": json.dumps(market_diagnosis),
-                "trade_decision": '{"stage":"trade_decision"}',
+                "trade_decision": raw_trade_decision,
             },
         )
 
@@ -1147,10 +1207,10 @@ class TestPriceActionRepository:
             {"role": "user", "content": "trade decision"}
         ]
         assert row.market_diagnosis == market_diagnosis
-        assert row.trade_decision == {"stage": "trade_decision"}
+        assert row.trade_decision == trade_decision
         assert row.raw_responses == {
             "market_diagnosis": json.dumps(market_diagnosis),
-            "trade_decision": '{"stage":"trade_decision"}',
+            "trade_decision": raw_trade_decision,
         }
         session.commit.assert_called_once()
 
@@ -1160,9 +1220,10 @@ class TestPriceActionRepository:
             "direction": "bullish",
             "gate_result": "proceed",
         }
+        trade_decision = _trade_decision(diagnosis=market_diagnosis)
         row = SimpleNamespace(
             candle_time=datetime(2026, 6, 1, tzinfo=timezone.utc),
-            trade_decision={"stage": "trade_decision"},
+            trade_decision=trade_decision,
             market_diagnosis=market_diagnosis,
             validation_status="valid",
         )
@@ -1184,7 +1245,7 @@ class TestPriceActionRepository:
 
         assert previous == {
             "candle_time": "2026-06-01T00:00:00+00:00",
-            "decision": {"stage": "trade_decision"},
+            "decision": trade_decision,
             "diagnosis": market_diagnosis,
             "validation_status": "valid",
         }
@@ -1269,13 +1330,27 @@ class TestPriceActionMonitorPipeline:
             llm_client=MagicMock(),
             config={},
         )
-        assert orc._should_notify({"decision": {"type": "enter_long"}}) is True
-        assert orc._should_notify({"decision": {"type": "enter_short"}}) is True
-        assert orc._should_notify({"decision": {"type": "wait"}}) is False
-        assert orc._should_notify({"decision": {"type": "avoid"}}) is False
+        assert (
+            orc._should_notify(
+                {"decision": {"order_type": "突破单", "order_direction": "做多"}}
+            )
+            is True
+        )
+        assert (
+            orc._should_notify(
+                {"decision": {"order_type": "限价单", "order_direction": "做空"}}
+            )
+            is True
+        )
+        assert (
+            orc._should_notify(
+                {"decision": {"order_type": "不下单", "order_direction": None}}
+            )
+            is False
+        )
         assert orc._should_notify(None) is False
-        # pa_notify_wait=True surfaces wait/avoid too
+        # pa_notify_wait=True surfaces no-trade decisions too
         orc_wait = PriceActionOrchestrator(
             repository=None, llm_client=MagicMock(), config={"pa_notify_wait": True}
         )
-        assert orc_wait._should_notify({"decision": {"type": "wait"}}) is True
+        assert orc_wait._should_notify({"decision": {"order_type": "不下单"}}) is True

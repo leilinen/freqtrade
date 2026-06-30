@@ -318,8 +318,13 @@ class PriceActionOrchestrator:
     def _should_notify(self, decision_json: dict[str, Any] | None) -> bool:
         if not decision_json:
             return False
-        decision_type = str((decision_json.get("decision") or {}).get("type", "")).lower()
-        if decision_type in ("enter_long", "enter_short"):
+        decision = decision_json.get("decision") or {}
+        order_type = decision.get("order_type")
+        order_direction = decision.get("order_direction")
+        if order_type in ("限价单", "突破单", "市价单") and order_direction in (
+            "做多",
+            "做空",
+        ):
             return True
         return bool(self.config.get("pa_notify_wait", False))
 
@@ -334,27 +339,73 @@ class PriceActionOrchestrator:
         try:
             confidence_value = max(0.0, min(float(confidence) / 100.0, 1.0))
         except (TypeError, ValueError):
-            confidence_value = 0.0
+            confidence_value = 0
+        else:
+            confidence_value = int(round(confidence_value * 100))
         return {
-            "stage": "trade_decision",
             "decision": {
-                "type": "wait",
-                "direction": "neutral",
-                "order_type": "none",
-                "entry": None,
-                "stop_loss": None,
-                "take_profit_1": None,
-                "take_profit_2": None,
-                "risk_reward": None,
-                "confidence": confidence_value,
-                "reason": f"市场诊断 gate_result={gate_result}，跳过交易决策：{reason}",
+                "order_direction": None,
+                "order_type": "不下单",
+                "entry_price": None,
+                "entry_basis_bar": None,
+                "entry_basis_extreme": None,
+                "entry_rule": None,
+                "take_profit_price": None,
+                "take_profit_price_2": None,
+                "stop_loss_price": None,
+                "reasoning": (
+                    f"市场诊断 gate_result={gate_result}，跳过交易决策：{reason}"
+                ),
+                "diagnosis_confidence": confidence_value,
+                "diagnosis_confidence_reasoning": str(
+                    diagnosis.get("risk_warning") or reason
+                ),
+                "trade_confidence": 0,
+                "trade_confidence_reasoning": "阶段一闸门未通过，未进入交易评估。",
+                "estimated_win_rate": None,
+                "estimated_win_rate_reasoning": None,
+                "key_factors": list(diagnosis.get("key_signals") or []),
+                "watch_points": [reason],
+                "risk_assessment": str(diagnosis.get("risk_warning") or reason),
+                "invalidation_condition": None,
+            },
+            "diagnosis_summary": {
+                "cycle_position": diagnosis.get("cycle_position", "unknown"),
+                "direction": diagnosis.get("direction", "neutral"),
+                "key_signals": list(diagnosis.get("key_signals") or []),
             },
             "decision_trace": [
-                f"market_diagnosis_gate_result={gate_result}",
-                "trade_decision_model_call=skipped",
+                {
+                    "node_id": "2.5",
+                    "question": "市场诊断闸门是否允许进入交易决策？",
+                    "answer": "否" if gate_result == "wait" else "等待",
+                    "reason": reason,
+                    "branch": gate_result,
+                    "section": "市场诊断闸门",
+                    "bar_range": "全局",
+                }
             ],
-            "watch_points": [reason],
-            "invalidations": [],
+            "terminal": {
+                "node_id": "2.5",
+                "outcome": "wait",
+                "label": "市场诊断闸门短路，不进入交易决策",
+            },
+            "gate_shortcircuited": True,
+            "next_cycle_prediction": {
+                "cycle": None,
+                "direction": None,
+                "probabilities": None,
+                "reasoning": "阶段一闸门未通过，未进入阶段二周期演变评估。",
+                "unpredictable": True,
+                "features_used": ["stage1_diagnosis"],
+            },
+            "next_bar_prediction": {
+                "direction": None,
+                "probabilities": None,
+                "reasoning": "阶段一闸门未通过，未进行下一根 K 预测。",
+                "unpredictable": True,
+                "features_used": ["stage1_diagnosis"],
+            },
         }
 
     def _notify(

@@ -20,10 +20,27 @@
 {previous_text}
 
 硬性约束：
+- 你现在独立执行阶段二：交易决策、风险收益和下单方式评估。
+- 阶段一市场诊断 JSON 是权威输入，不能无依据推翻 cycle_position 和 direction。
+- 沿二元决策树 §3-§11、§14 继续评估，并在 decision_trace 中记录关键节点：
+  当前结构类型、信号棒、计划型限价、入场棒新鲜度、止损、
+  交易者方程、下单类型与禁止行为。
+- `terminal` 必须与最终 decision 一致；交易时 outcome=trade，
+  不下单时 outcome=wait 或 reject。
 - 若 ATR_x / atr_expand_ratio > 2 且正在突破闸门，
   必须视作假突破风险，不能直接追价。
 - 入场、止损、止盈必须与方向一致：
-  多单止损低于入场，止盈高于入场；空单反之。
-- 不满足策略模板信号链时输出 wait 或 avoid。
+  做多止损低于入场，止盈高于入场；做空反之。
+- 下单时 `order_type` 只能是 `限价单`、`突破单`、`市价单`；
+  不交易时必须是 `不下单`。
+- 不下单时 `order_direction`、`entry_price`、`stop_loss_price`、
+  `take_profit_price`、`take_profit_price_2`、`estimated_win_rate` 必须为 null。
+- 下单时 `order_direction` 必须是 `做多` 或 `做空`，且 entry、stop、TP1、TP2、
+  estimated_win_rate 必须齐全。
+- 突破单必须填写 `entry_basis_bar`、`entry_basis_extreme` 和 `entry_rule`。
+- 不满足策略模板信号链时输出 `order_type=不下单`。
+- 必须填写 `next_cycle_prediction`；如果不可预测，
+  cycle/direction/probabilities 写 null，unpredictable 写 true，并说明原因。
+- `next_bar_prediction` 可选；若输出，必须与 schema 一致。
 - 输出必须符合这个 JSON contract：
 {schema_json}

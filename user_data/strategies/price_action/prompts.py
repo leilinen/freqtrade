@@ -93,22 +93,64 @@ MARKET_DIAGNOSIS_SCHEMA: dict[str, Any] = {
 
 
 TRADE_DECISION_SCHEMA: dict[str, Any] = {
-    "stage": "trade_decision",
     "decision": {
-        "type": "enter_long|enter_short|wait|avoid",
-        "direction": "long|short|neutral",
-        "order_type": "market|limit|stop|none",
-        "entry": "number|null",
-        "stop_loss": "number|null",
-        "take_profit_1": "number|null",
-        "take_profit_2": "number|null",
-        "risk_reward": "number|null",
-        "confidence": "0..1",
-        "reason": "string",
+        "order_direction": "做多|做空|null",
+        "order_type": "限价单|突破单|市价单|不下单",
+        "entry_price": "number|null",
+        "entry_basis_bar": "K reference|null",
+        "entry_basis_extreme": "high|low|null",
+        "entry_rule": "string|null",
+        "take_profit_price": "number|null",
+        "take_profit_price_2": "number|null",
+        "stop_loss_price": "number|null",
+        "reasoning": "string",
+        "diagnosis_confidence": "integer 0..100",
+        "diagnosis_confidence_reasoning": "string",
+        "trade_confidence": "integer 0..100",
+        "trade_confidence_reasoning": "string",
+        "estimated_win_rate": "integer 0..100|null",
+        "estimated_win_rate_reasoning": "string|null",
+        "key_factors": ["string"],
+        "watch_points": ["string"],
+        "risk_assessment": "string",
+        "invalidation_condition": "string|null",
     },
-    "decision_trace": ["string"],
-    "watch_points": ["string"],
-    "invalidations": ["string"],
+    "diagnosis_summary": {
+        "cycle_position": "string",
+        "direction": "bullish|bearish|neutral",
+        "key_signals": ["string"],
+    },
+    "decision_trace": [
+        {
+            "node_id": "3.x-11.x or 14.x",
+            "question": "string",
+            "answer": "是|否|中性|等待|不适用",
+            "reason": "string",
+            "branch": "string|null",
+            "section": "string",
+            "bar_range": "K{older}-K{newer} or K1",
+        }
+    ],
+    "terminal": {
+        "node_id": "string",
+        "outcome": "wait|reject|trade|proceed",
+        "label": "string",
+    },
+    "next_cycle_prediction": {
+        "cycle": "cycle_position|null",
+        "direction": "bullish|bearish|neutral|null",
+        "probabilities": "object|null",
+        "reasoning": "string",
+        "unpredictable": "boolean",
+        "features_used": ["stage1_diagnosis|kline_features|experience_library|stage2_decision"],
+    },
+    "next_bar_prediction": {
+        "direction": "bullish|bearish|neutral|null",
+        "probabilities": "object|null",
+        "reasoning": "string",
+        "unpredictable": "boolean",
+        "features_used": ["stage1_diagnosis|kline_features|stage2_decision"],
+    },
 }
 
 
