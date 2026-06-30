@@ -1,3 +1,5 @@
+name: freqtrade_priceaction
+
 services:
   crypto-1h:
     build:

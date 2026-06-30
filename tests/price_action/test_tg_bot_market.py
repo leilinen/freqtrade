@@ -176,6 +176,29 @@ class TestQuoteChartRoutes:
 
 
 # ===================================================================
+# Tests: Telegram command menu
+# ===================================================================
+
+
+class TestTelegramCommandMenu:
+    """菜单只展示当前 PA 决策盯盘的主交互入口。"""
+
+    def test_menu_excludes_legacy_signal_history_commands(self):
+        commands = [command for command, _ in tg_bot.BOT_COMMAND_SPECS]
+
+        assert commands == [
+            "pa_watch",
+            "pa_add",
+            "pa_remove",
+            "quote",
+            "pa_status",
+            "pa_help",
+        ]
+        assert "pa_signals" not in commands
+        assert "pa_history" not in commands
+
+
+# ===================================================================
 # Tests: _normalize_ashare_code
 # ===================================================================
 

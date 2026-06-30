@@ -3,7 +3,7 @@
 
 功能：
 1. HTTP API 接收 freqtrade 策略推送的信号通知并转发到 Telegram
-2. 处理用户命令：/pa_watch, /pa_add, /pa_remove, /pa_signals, /pa_help
+2. 处理用户命令：/pa_watch, /pa_add, /pa_remove, /quote, /pa_status, /pa_help
 3. 直接读写 PostgreSQL (freqtrade_monitor) 管理标的和查询信号
 
 环境变量：
@@ -39,6 +39,15 @@ DB_URL = os.environ.get("DB_URL", "postgresql://postgres:postgres@postgres:5432/
 API_PORT = int(os.environ.get("API_PORT", "8090"))
 
 db_engine = create_engine(DB_URL)
+
+BOT_COMMAND_SPECS = [
+    ("pa_watch", "查看监控标的"),
+    ("pa_add", "添加标的"),
+    ("pa_remove", "禁用标的"),
+    ("quote", "查K线图"),
+    ("pa_status", "服务状态"),
+    ("pa_help", "帮助"),
+]
 
 
 # ================================================================
@@ -1053,73 +1062,89 @@ async def pa_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
     await update.message.reply_text(
-        "价格行为信号盯盘 命令:\n"
+        "Price Action 决策盯盘命令:\n"
         "/pa_watch — 查看监控标的\n"
         "/pa_add <标的> [市场] — 添加标的\n"
         "  自动识别: BTC/USDT→crypto, 510300/SH→ashare, AAPL→usstock\n"
         "  手动指定: /pa_add AAPL usstock\n"
         "/pa_remove <标的> — 禁用标的\n"
-        "/pa_signals [N] — 最近信号 (默认10条)\n"
-        "/pa_history <标的> [N] — 某标的信号历史 (默认10条)\n"
         "/quote <标的> [周期] [N] — K线图 (默认 1h、20 根)\n"
         "  crypto: 1h/4h · A股: 1h/1d\n"
         "  例: /quote BTC/USDT 4h 50\n"
-        "/pa_status — 服务健康状态\n"
-        "/pa_help — 帮助信息"
+        "/pa_status — 服务状态\n"
+        "/pa_help — 帮助"
     )
 
 
 async def pa_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """检查服务健康状态：各 timeframe 最后信号时间，超时告警。"""
+    """检查服务状态：K线写入、PA 分析记录、今日决策数。"""
     if not authorized(update):
         return
     now = datetime.now(timezone.utc)
     lines = ["服务状态:"]
     has_alert = False
 
-    # 按 market + timeframe 分组检查
-    with db_engine.connect() as conn:
-        rows = conn.execute(text(
-            "SELECT market, timeframe, MAX(candle_time) as last_candle "
-            "FROM pa_signal GROUP BY market, timeframe ORDER BY market, timeframe"
-        )).fetchall()
-
-    tz_shanghai = timezone(timedelta(hours=8))
-    for r in rows:
-        market, tf = r[0], r[1]
-        last_candle = r[2]
-        if last_candle.tzinfo is None:
-            last_candle = last_candle.replace(tzinfo=timezone.utc)
-        age_hours = (now - last_candle).total_seconds() / 3600
-        local_str = last_candle.astimezone(tz_shanghai).strftime("%m/%d %H:%M")
-
-        if market == "ashare":
-            threshold, note = _health_threshold(market, tf, now)
-        elif tf == "1h":
-            threshold, note = 3, ""
-        elif tf == "4h":
-            threshold, note = 12, ""
-        else:
-            threshold, note = 24, ""
-        if threshold is None:
-            status = f"暂停检查({note})"
-        elif age_hours > threshold:
-            status = f"⚠ 超过 {age_hours:.0f}h 无信号"
-            has_alert = True
-        else:
-            status = "正常"
-        market_tag = "A股" if market == "ashare" else "Crypto"
-        lines.append(f"  [{market_tag}] {tf}: 最后信号 {local_str} ({status})")
-
-    # 检查信号总数
-    with db_engine.connect() as conn:
-        total = conn.execute(text("SELECT COUNT(*) FROM pa_signal")).scalar()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     with db_engine.connect() as conn:
-        today_count = conn.execute(text(
-            "SELECT COUNT(*) FROM pa_signal WHERE created_at >= :ts"
-        ), {"ts": today_start}).scalar()
-    lines.append(f"\n今日信号: {today_count} | 总计: {total}")
+        kline_rows = _fetch_kline_health_rows(conn)
+        analysis_rows = conn.execute(text(
+            "SELECT "
+            "  market, timeframe, "
+            "  MAX(candle_time) as last_analysis, "
+            "  COUNT(*) as total, "
+            "  SUM(CASE WHEN created_at >= :ts THEN 1 ELSE 0 END) as today_count "
+            "FROM pa_analysis "
+            "GROUP BY market, timeframe"
+        ), {"ts": today_start}).fetchall()
+
+    tz_shanghai = timezone(timedelta(hours=8))
+    kline_by_key = {(r[0], r[1]): r for r in kline_rows}
+    analysis_by_key = {(r[0], r[1]): r for r in analysis_rows}
+    keys = sorted(kline_by_key.keys() | analysis_by_key.keys())
+    if not keys:
+        lines.append("  暂无 K线或 PA 分析记录")
+
+    today_total = 0
+    analysis_total = 0
+    for market, tf in keys:
+        market_tag = "A股" if market == "ashare" else "Crypto"
+
+        kline = kline_by_key.get((market, tf))
+        if kline:
+            last_candle = kline[2]
+            if last_candle.tzinfo is None:
+                last_candle = last_candle.replace(tzinfo=timezone.utc)
+            age_hours = (now - last_candle).total_seconds() / 3600
+            local_str = last_candle.astimezone(tz_shanghai).strftime("%m/%d %H:%M")
+            threshold, note = _health_threshold(market, tf, now)
+            if threshold is None:
+                kline_status = f"暂停检查({note})"
+            elif age_hours > threshold:
+                kline_status = f"⚠ K线 {age_hours:.0f}h 未更新"
+                has_alert = True
+            else:
+                kline_status = "K线正常"
+            kline_part = f"K线 {local_str} ({kline_status})"
+        else:
+            kline_part = "K线 -"
+
+        analysis = analysis_by_key.get((market, tf))
+        if analysis:
+            last_analysis = analysis[2]
+            if last_analysis.tzinfo is None:
+                last_analysis = last_analysis.replace(tzinfo=timezone.utc)
+            analysis_str = last_analysis.astimezone(tz_shanghai).strftime("%m/%d %H:%M")
+            total = int(analysis[3] or 0)
+            today_count = int(analysis[4] or 0)
+            analysis_total += total
+            today_total += today_count
+            analysis_part = f"PA {analysis_str} (今日 {today_count}, 总计 {total})"
+        else:
+            analysis_part = "PA -"
+
+        lines.append(f"  [{market_tag}] {tf}: {kline_part} | {analysis_part}")
+
+    lines.append(f"\n今日 PA 分析: {today_total} | 总计: {analysis_total}")
 
     if has_alert:
         lines.append("\n建议检查 freqtrade 容器是否正常运行")
@@ -1165,14 +1190,8 @@ async def main() -> None:
             # 注册 Bot Commands 菜单
             from telegram import BotCommand
             await app_tg.bot.set_my_commands([
-                BotCommand("pa_watch", "查看监控标的"),
-                BotCommand("pa_add", "添加标的"),
-                BotCommand("pa_remove", "禁用标的"),
-                BotCommand("pa_signals", "最近信号"),
-                BotCommand("pa_history", "标的信号历史"),
-                BotCommand("quote", "查 K 线图"),
-                BotCommand("pa_status", "服务健康状态"),
-                BotCommand("pa_help", "帮助信息"),
+                BotCommand(command, description)
+                for command, description in BOT_COMMAND_SPECS
             ])
             logger.info("TG bot polling started, commands registered")
             break
