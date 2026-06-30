@@ -32,6 +32,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TG_TOKEN = os.environ["TG_TOKEN"]
 TG_CHAT_ID = int(os.environ["TG_CHAT_ID"])
@@ -1180,33 +1181,16 @@ async def main() -> None:
     await site.start()
     logger.info("HTTP API listening on port %d", API_PORT)
 
-    # Start TG polling with retry on Conflict
     logger.info("Starting TG bot polling...")
-    for attempt in range(10):
-        try:
-            await app_tg.initialize()
-            await app_tg.start()
-            await app_tg.updater.start_polling(drop_pending_updates=True)
-            # 注册 Bot Commands 菜单
-            from telegram import BotCommand
-            await app_tg.bot.set_my_commands([
-                BotCommand(command, description)
-                for command, description in BOT_COMMAND_SPECS
-            ])
-            logger.info("TG bot polling started, commands registered")
-            break
-        except Exception as e:
-            wait = min(30, 5 * (attempt + 1))
-            logger.warning("TG polling failed (attempt %d): %s — retrying in %ds", attempt + 1, e, wait)
-            try:
-                await app_tg.updater.stop()
-                await app_tg.stop()
-                await app_tg.shutdown()
-            except Exception:
-                pass
-            await asyncio.sleep(wait)
-    else:
-        logger.error("Failed to start TG polling after 10 attempts, running HTTP API only")
+    await app_tg.initialize()
+    await app_tg.start()
+    from telegram import BotCommand
+    await app_tg.bot.set_my_commands([
+        BotCommand(command, description)
+        for command, description in BOT_COMMAND_SPECS
+    ])
+    polling_task = asyncio.create_task(_poll_updates(app_tg))
+    logger.info("TG bot polling started, commands registered")
 
     # Keep running + health monitor
     # Warm the A-share trade-day calendar so the first hourly check has it populated
@@ -1256,13 +1240,50 @@ async def main() -> None:
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        polling_task.cancel()
         try:
-            await app_tg.updater.stop()
+            await polling_task
+        except asyncio.CancelledError:
+            pass
+        try:
             await app_tg.stop()
             await app_tg.shutdown()
         except Exception:
             pass
         await runner.cleanup()
+
+
+async def _poll_updates(app_tg: Application) -> None:
+    """Poll Telegram sequentially and dispatch updates through handlers.
+
+    The built-in Updater can leave overlapping long-poll requests in some
+    container restarts, which Telegram reports as 409 Conflict. This loop keeps
+    exactly one getUpdates request in flight.
+    """
+    offset = None
+    try:
+        pending = await app_tg.bot.get_updates(timeout=0)
+        if pending:
+            offset = pending[-1].update_id + 1
+            logger.info("Dropped %d pending Telegram updates", len(pending))
+    except Exception:
+        logger.warning("Failed to drop pending Telegram updates", exc_info=True)
+
+    while True:
+        try:
+            updates = await app_tg.bot.get_updates(
+                offset=offset,
+                timeout=25,
+                allowed_updates=Update.ALL_TYPES,
+            )
+            for update in updates:
+                offset = update.update_id + 1
+                await app_tg.process_update(update)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("TG polling request failed; retrying", exc_info=True)
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
