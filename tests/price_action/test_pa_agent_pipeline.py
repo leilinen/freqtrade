@@ -267,12 +267,48 @@ def _trade_decision(
         },
         "decision_trace": [
             {
+                "node_id": "9.0",
+                "question": "是否存在可交易的入场信号？",
+                "answer": "是" if is_trade else "等待",
+                "reason": "测试入场信号",
+                "branch": "signal" if is_trade else "wait",
+                "section": "入场信号",
+                "bar_range": "K1",
+            },
+            {
+                "node_id": "10.1",
+                "question": "是否有明确止损位？",
+                "answer": "是" if is_trade else "否",
+                "reason": "测试止损位",
+                "branch": "stop" if is_trade else "wait",
+                "section": "止损",
+                "bar_range": "K1",
+            },
+            {
+                "node_id": "10.2",
+                "question": "是否有明确目标位？",
+                "answer": "是" if is_trade else "否",
+                "reason": "测试目标位",
+                "branch": "target" if is_trade else "wait",
+                "section": "目标",
+                "bar_range": "K1",
+            },
+            {
                 "node_id": "10.3",
                 "question": "交易者方程是否通过？",
                 "answer": "是" if is_trade else "否",
                 "reason": "测试 trace",
                 "branch": "trade" if is_trade else "wait",
                 "section": "交易者方程",
+                "bar_range": "K1",
+            },
+            {
+                "node_id": "11.1",
+                "question": "是否使用当前下单方式？",
+                "answer": "是" if is_trade else "不适用",
+                "reason": "测试下单方式",
+                "branch": order_type if is_trade else None,
+                "section": "下单方式",
                 "bar_range": "K1",
             }
         ],
@@ -284,7 +320,16 @@ def _trade_decision(
         "next_cycle_prediction": {
             "cycle": "normal_channel",
             "direction": "bullish",
-            "probabilities": {},
+            "probabilities": {
+                "spike": 5,
+                "micro_channel": 10,
+                "tight_channel": 15,
+                "normal_channel": 30,
+                "broad_channel": 15,
+                "trending_tr": 10,
+                "trading_range": 10,
+                "extreme_tr": 5,
+            },
             "reasoning": "延续当前结构",
             "unpredictable": False,
             "features_used": ["stage1_diagnosis", "stage2_decision"],
@@ -1047,6 +1092,11 @@ class TestDecisionValidator:
         "gate_break": "none",
         "atr_expand_ratio": 1.0,
     }
+    feature_rows = [
+        {"k": "K1", "high": 105.0, "low": 95.0},
+        {"k": "K2", "high": 103.0, "low": 94.0},
+        {"k": "K3", "high": 102.0, "low": 93.0},
+    ]
 
     def test_json_syntax_stops_first(self):
         parsed, result = DecisionValidator().validate(
@@ -1150,6 +1200,236 @@ class TestDecisionValidator:
 
         assert result.checks[-1] == "semantic_reasonableness"
         assert "breakout_order_requires_entry_basis_bar" in result.errors
+
+    def test_valid_breakout_uses_feature_rows_for_basis_extreme(self):
+        decision = _trade_decision(
+            order_type="突破单",
+            entry=106,
+            stop=102,
+            tp1=110,
+            tp2=112,
+            estimated_win_rate=60,
+            diagnosis=self.diagnosis,
+        )
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+            feature_rows=self.feature_rows,
+        )
+
+        assert result.valid is True
+
+    def test_long_breakout_entry_must_be_above_basis_high(self):
+        decision = _trade_decision(
+            order_type="突破单",
+            entry=105,
+            stop=99,
+            tp1=111,
+            tp2=113,
+            estimated_win_rate=60,
+            diagnosis=self.diagnosis,
+        )
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+            feature_rows=self.feature_rows,
+        )
+
+        assert result.checks[-1] == "semantic_reasonableness"
+        assert "long_breakout_entry_must_be_above_basis_high" in result.errors
+
+    def test_short_breakout_entry_must_be_below_basis_low(self):
+        diagnosis = {**self.diagnosis, "direction": "bearish"}
+        decision = _trade_decision(
+            order_direction="做空",
+            order_type="突破单",
+            entry=95,
+            stop=101,
+            tp1=89,
+            tp2=87,
+            estimated_win_rate=60,
+            diagnosis=diagnosis,
+        )
+        decision["decision"]["entry_basis_extreme"] = "low"
+        decision["decision"]["entry_rule"] = "跌破 K1 低点"
+        decision["next_cycle_prediction"]["direction"] = "bearish"
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=diagnosis,
+            price_action_features=self.features,
+            feature_rows=self.feature_rows,
+        )
+
+        assert result.checks[-1] == "semantic_reasonableness"
+        assert "short_breakout_entry_must_be_below_basis_low" in result.errors
+
+    def test_actionable_trade_requires_trader_equation_trace_node(self):
+        decision = _trade_decision(diagnosis=self.diagnosis)
+        decision["decision_trace"] = [
+            item for item in decision["decision_trace"] if item["node_id"] != "10.3"
+        ]
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+        )
+
+        assert result.checks[-1] == "semantic_reasonableness"
+        assert "actionable_decision_requires_trader_equation_node_10_3" in result.errors
+
+    def test_decision_trace_chapter_order_is_enforced(self):
+        decision = _trade_decision(diagnosis=self.diagnosis)
+        decision["decision_trace"] = [
+            item for item in decision["decision_trace"] if item["node_id"] != "11.1"
+        ]
+        decision["decision_trace"].insert(
+            0,
+            {
+                "node_id": "11.1",
+                "question": "是否使用当前下单方式？",
+                "answer": "是",
+                "reason": "过早选择下单方式",
+                "branch": "突破单",
+                "section": "下单方式",
+                "bar_range": "K1",
+            },
+        )
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+        )
+
+        assert result.checks[-1] == "semantic_reasonableness"
+        assert "order_method_nodes_must_follow_trader_equation" in result.errors
+
+    def test_order_direction_cannot_reverse_stage1_without_node_2_3(self):
+        diagnosis = {**self.diagnosis, "direction": "bearish"}
+        decision = _trade_decision(
+            order_direction="做多",
+            entry=100,
+            stop=95,
+            tp1=105,
+            tp2=107,
+            estimated_win_rate=60,
+            diagnosis=diagnosis,
+        )
+        decision["next_cycle_prediction"]["direction"] = "bearish"
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=diagnosis,
+            price_action_features=self.features,
+        )
+
+        assert result.checks[-1] == "semantic_reasonableness"
+        assert (
+            "order_direction_conflicts_with_stage1_direction_without_node_2_3"
+            in result.errors
+        )
+
+    def test_entry_basis_bar_must_exist_in_feature_rows(self):
+        decision = _trade_decision(
+            order_type="突破单",
+            entry=106,
+            stop=102,
+            tp1=110,
+            tp2=112,
+            estimated_win_rate=60,
+            diagnosis=self.diagnosis,
+        )
+        decision["decision"]["entry_basis_bar"] = "K4"
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+            feature_rows=self.feature_rows,
+        )
+
+        assert result.checks[-1] == "semantic_reasonableness"
+        assert "breakout_entry_basis_bar_out_of_frame" in result.errors
+
+    def test_decision_trace_bar_range_must_exist_in_feature_rows(self):
+        decision = _trade_decision(
+            order_type="突破单",
+            entry=106,
+            stop=102,
+            tp1=110,
+            tp2=112,
+            estimated_win_rate=60,
+            diagnosis=self.diagnosis,
+        )
+        decision["decision_trace"][0]["bar_range"] = "K4"
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+            feature_rows=self.feature_rows,
+        )
+
+        assert result.checks[-1] == "semantic_reasonableness"
+        assert "decision_trace_bar_range_out_of_frame" in result.errors
+
+    def test_next_cycle_prediction_probability_sum_and_argmax_are_checked(self):
+        decision = _trade_decision(
+            order_type="突破单",
+            entry=106,
+            stop=102,
+            tp1=110,
+            tp2=112,
+            estimated_win_rate=60,
+            diagnosis=self.diagnosis,
+        )
+        decision["next_cycle_prediction"]["probabilities"] = {
+            "spike": 40,
+            "micro_channel": 5,
+            "tight_channel": 5,
+            "normal_channel": 10,
+            "broad_channel": 5,
+            "trending_tr": 5,
+            "trading_range": 5,
+            "extreme_tr": 5,
+        }
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+        )
+
+        assert result.checks[-1] == "numeric_range"
+        assert "next_cycle_prediction_probabilities_sum_invalid" in result.errors
+        assert "next_cycle_prediction_cycle_must_match_probability_argmax" in result.errors
+
+    def test_risk_reward_and_trader_equation_must_pass(self):
+        decision = _trade_decision(
+            order_type="突破单",
+            entry=100,
+            stop=99,
+            tp1=100.5,
+            tp2=101,
+            estimated_win_rate=55,
+            diagnosis=self.diagnosis,
+        )
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+        )
+
+        assert result.checks[-1] == "semantic_reasonableness"
+        assert "risk_reward_below_minimum" in result.errors
+        assert "trader_equation_fails" in result.errors
 
     def test_atr_expansion_veto_is_semantic(self):
         features = {**self.features, "gate_break": "up", "atr_expand_ratio": 2.1}

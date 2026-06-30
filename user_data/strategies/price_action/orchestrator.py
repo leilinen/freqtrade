@@ -124,6 +124,7 @@ class PriceActionOrchestrator:
                     raw_trade_decision,
                     diagnosis=diagnosis,
                     price_action_features=features.latest_features,
+                    feature_rows=features.rows,
                     strategies=selected,
                 )
                 validation_status = validation.status
@@ -195,6 +196,7 @@ class PriceActionOrchestrator:
                 raw_trade_decision,
                 diagnosis=diagnosis,
                 price_action_features=features.latest_features,
+                feature_rows=features.rows,
                 strategies=selected,
             )
             validation_status = validation.status

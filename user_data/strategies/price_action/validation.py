@@ -96,6 +96,20 @@ MARKET_DIAGNOSIS_RANGE_CYCLES = {
     "trending_tr",
     "broad_channel",
 }
+TRADE_DECISION_ACTIONABLE_ORDER_TYPES = {"限价单", "突破单", "市价单"}
+TRADE_DECISION_TRACE_ANSWERS = {"是", "否", "中性", "等待", "不适用"}
+TRADE_DECISION_CYCLE_ORDER = (
+    "spike",
+    "micro_channel",
+    "tight_channel",
+    "normal_channel",
+    "broad_channel",
+    "trending_tr",
+    "trading_range",
+    "extreme_tr",
+)
+TRADE_DECISION_DIRECTIONS = {"bullish", "bearish", "neutral"}
+TRADE_DECISION_MIN_RISK_REWARD = 1.0
 
 _K_RANGE_RE = re.compile(r"^K(\d+)-K(\d+)$", re.IGNORECASE)
 _K_SINGLE_RE = re.compile(r"^K(\d+)$", re.IGNORECASE)
@@ -154,6 +168,7 @@ class DecisionValidator:
         *,
         diagnosis: dict[str, Any],
         price_action_features: dict[str, Any],
+        feature_rows: list[dict[str, Any]] | None = None,
         strategies: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any] | None, ValidationResult]:
         checks: list[str] = []
@@ -172,7 +187,13 @@ class DecisionValidator:
             return parsed, ValidationResult(False, checks, errors)
 
         checks.append(CHECK_SEMANTIC_REASONABLENESS)
-        errors = self._semantic_errors(parsed, diagnosis, price_action_features, strategies or [])
+        errors = self._semantic_errors(
+            parsed,
+            diagnosis,
+            price_action_features,
+            feature_rows,
+            strategies or [],
+        )
         if errors:
             return parsed, ValidationResult(False, checks, errors)
 
@@ -236,9 +257,10 @@ class DecisionValidator:
         decision_json: dict[str, Any],
         diagnosis: dict[str, Any],
         price_action_features: dict[str, Any],
+        feature_rows: list[dict[str, Any]] | None,
         strategies: list[dict[str, Any]],
     ) -> list[str]:
-        del diagnosis, strategies
+        del strategies
         decision = decision_json["decision"]
         order_type = str(decision.get("order_type", ""))
         order_direction = decision.get("order_direction")
@@ -246,9 +268,10 @@ class DecisionValidator:
         stop = _number(decision.get("stop_loss_price"))
         tp1 = _number(decision.get("take_profit_price"))
         tp2 = _number(decision.get("take_profit_price_2"))
+        errors: list[str] = []
+        errors.extend(_decision_trace_errors(decision_json, feature_rows))
 
         if order_type == "不下单":
-            errors = []
             for field in (
                 "entry_price",
                 "entry_basis_bar",
@@ -268,13 +291,11 @@ class DecisionValidator:
                 errors.append("no_trade_terminal_must_not_be_trade")
             return errors
 
-        if order_type == "突破单":
-            if decision.get("entry_basis_bar") is None:
-                return ["breakout_order_requires_entry_basis_bar"]
-            if decision.get("entry_basis_extreme") not in ("high", "low"):
-                return ["breakout_order_requires_entry_basis_extreme"]
-            if not decision.get("entry_rule"):
-                return ["breakout_order_requires_entry_rule"]
+        errors.extend(_stage2_direction_errors(decision_json, diagnosis))
+        errors.extend(_breakout_basis_errors(decision, feature_rows))
+
+        if errors:
+            return errors
 
         if order_direction not in ("做多", "做空"):
             return ["actionable_decision_requires_order_direction"]
@@ -289,7 +310,6 @@ class DecisionValidator:
         if estimated is None:
             return ["actionable_decision_requires_estimated_win_rate"]
 
-        errors: list[str] = []
         if order_direction == "做多":
             if not stop < entry:
                 errors.append("long_stop_must_be_below_entry")
@@ -304,6 +324,8 @@ class DecisionValidator:
                 errors.append("short_tp1_must_be_below_entry")
             if not tp1 > tp2:
                 errors.append("short_tp2_must_be_below_tp1")
+
+        errors.extend(_trade_metric_errors(decision))
 
         atr_expand = _number(price_action_features.get("atr_expand_ratio"))
         gate_break = str(price_action_features.get("gate_break", "none")).lower()
@@ -339,8 +361,7 @@ class DecisionValidator:
 
         prediction = decision_json.get("next_cycle_prediction")
         if isinstance(prediction, dict):
-            if not isinstance(prediction.get("unpredictable"), bool):
-                errors.append("next_cycle_prediction_unpredictable_must_be_bool")
+            errors.extend(_next_cycle_prediction_errors(prediction))
 
         if order_type == "不下单":
             return errors
@@ -366,6 +387,307 @@ class DecisionValidator:
             if not lower_bound <= entry <= upper_bound:
                 errors.append("entry_too_far_from_latest_candle")
         return errors
+
+
+def _decision_trace_errors(
+    decision_json: dict[str, Any],
+    feature_rows: list[dict[str, Any]] | None,
+) -> list[str]:
+    if decision_json.get("gate_shortcircuited"):
+        return []
+
+    errors: list[str] = []
+    trace = decision_json.get("decision_trace")
+    if not isinstance(trace, list) or not trace:
+        return ["decision_trace_must_be_non_empty"]
+
+    max_k_seq = _max_feature_k_seq(feature_rows)
+    for item in trace:
+        if not isinstance(item, dict):
+            errors.append("decision_trace_item_must_be_object")
+            continue
+        node_id = str(item.get("node_id", "") or "").strip()
+        if not node_id:
+            errors.append("decision_trace_node_id_required")
+        if node_id == "0.3":
+            errors.append("decision_trace_must_not_include_0_3")
+        if item.get("answer") not in TRADE_DECISION_TRACE_ANSWERS:
+            errors.append("decision_trace_answer_invalid")
+        for field in ("question", "reason", "bar_range"):
+            if field not in item:
+                errors.append(f"decision_trace_{field}_required")
+        if not item.get("skipped"):
+            _validate_decision_trace_bar_range(item.get("bar_range"), max_k_seq, errors)
+
+    terminal = decision_json.get("terminal") or {}
+    decision = decision_json.get("decision") or {}
+    order_type = decision.get("order_type")
+    outcome = terminal.get("outcome")
+    terminal_node = str(terminal.get("node_id", "") or "").strip()
+    node_ids = [
+        str(item.get("node_id", "") or "").strip()
+        for item in trace
+        if isinstance(item, dict) and item.get("node_id")
+    ]
+
+    if order_type == "不下单" and outcome == "trade":
+        errors.append("no_trade_terminal_must_not_be_trade")
+    if order_type in TRADE_DECISION_ACTIONABLE_ORDER_TYPES:
+        if outcome != "trade":
+            errors.append("actionable_decision_requires_trade_terminal")
+        if terminal_node.startswith("14"):
+            errors.append("trade_terminal_must_not_be_section_14")
+        idx_103 = _index_of_node(node_ids, "10.3")
+        if idx_103 < 0:
+            errors.append("actionable_decision_requires_trader_equation_node_10_3")
+        else:
+            item_103 = trace[idx_103]
+            if isinstance(item_103, dict) and item_103.get("answer") != "是":
+                errors.append("trader_equation_node_10_3_must_be_yes")
+        idx_11 = _first_node_index_with_prefix(node_ids, "11.")
+        if idx_103 >= 0 and idx_11 >= 0 and idx_11 < idx_103:
+            errors.append("order_method_nodes_must_follow_trader_equation")
+        idx_9 = _first_node_index_with_prefix(node_ids, "9.")
+        idx_101 = _index_of_node(node_ids, "10.1")
+        if idx_9 < 0:
+            errors.append("actionable_decision_requires_section_9_trace")
+        if idx_9 >= 0 and idx_101 >= 0 and idx_9 > idx_101:
+            errors.append("entry_signal_section_9_must_precede_stop_section_10_1")
+
+    for earlier, later in (("10.1", "10.2"), ("10.2", "10.3")):
+        earlier_idx = _index_of_node(node_ids, earlier)
+        later_idx = _index_of_node(node_ids, later)
+        if earlier_idx >= 0 and later_idx >= 0 and earlier_idx > later_idx:
+            errors.append(f"decision_trace_order_{earlier}_before_{later}_required")
+
+    ranks = [_decision_trace_sort_key(node_id)[0] for node_id in node_ids]
+    for index in range(1, len(ranks)):
+        if ranks[index] < ranks[index - 1]:
+            errors.append("decision_trace_chapter_order_invalid")
+            break
+
+    return errors
+
+
+def _validate_decision_trace_bar_range(
+    value: Any,
+    max_k_seq: int | None,
+    errors: list[str],
+) -> None:
+    bar_range = str(value or "").strip()
+    if not bar_range:
+        errors.append("decision_trace_bar_range_required")
+        return
+    if bar_range in ("不适用", "—", "全局", "GLOBAL"):
+        return
+    if "填写" in bar_range or bar_range.startswith("<") or "由你" in bar_range:
+        errors.append("decision_trace_bar_range_placeholder")
+        return
+    seqs = _parse_k_range(bar_range)
+    if not seqs:
+        errors.append("decision_trace_bar_range_format_invalid")
+        return
+    if any(seq == 0 for seq in seqs):
+        errors.append("decision_trace_bar_range_must_not_reference_k0")
+    if any(seq < 1 for seq in seqs):
+        errors.append("decision_trace_bar_range_invalid")
+    if max_k_seq is not None and any(seq > max_k_seq for seq in seqs):
+        errors.append("decision_trace_bar_range_out_of_frame")
+
+
+def _stage2_direction_errors(
+    decision_json: dict[str, Any],
+    diagnosis: dict[str, Any],
+) -> list[str]:
+    if decision_json.get("gate_shortcircuited"):
+        return []
+    decision = decision_json.get("decision") or {}
+    order_type = decision.get("order_type")
+    order_direction = decision.get("order_direction")
+    if order_type not in TRADE_DECISION_ACTIONABLE_ORDER_TYPES:
+        return []
+    if order_direction not in ("做多", "做空"):
+        return []
+
+    stage1_direction = str(diagnosis.get("direction", "") or "").strip().lower()
+    if stage1_direction not in ("bullish", "bearish"):
+        return []
+    needed_direction = "bullish" if order_direction == "做多" else "bearish"
+    if stage1_direction == needed_direction:
+        return []
+    if _decision_trace_documents_direction_override(
+        decision_json.get("decision_trace"),
+        needed_direction,
+    ):
+        return []
+    return ["order_direction_conflicts_with_stage1_direction_without_node_2_3"]
+
+
+def _decision_trace_documents_direction_override(trace: Any, direction: str) -> bool:
+    if not isinstance(trace, list):
+        return False
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("node_id", "") or "").strip() != "2.3":
+            continue
+        branch = _normalize_direction_branch(item.get("branch"))
+        reason = str(item.get("reason", "") or "").strip().lower()
+        if branch == direction or direction in reason:
+            return True
+    return False
+
+
+def _breakout_basis_errors(
+    decision: dict[str, Any],
+    feature_rows: list[dict[str, Any]] | None,
+) -> list[str]:
+    if decision.get("order_type") != "突破单":
+        return []
+
+    errors: list[str] = []
+    direction = decision.get("order_direction")
+    extreme = decision.get("entry_basis_extreme")
+    basis_bar = decision.get("entry_basis_bar")
+
+    if basis_bar is None:
+        errors.append("breakout_order_requires_entry_basis_bar")
+    if extreme not in ("high", "low"):
+        errors.append("breakout_order_requires_entry_basis_extreme")
+    if not decision.get("entry_rule"):
+        errors.append("breakout_order_requires_entry_rule")
+    if direction == "做多" and extreme == "low":
+        errors.append("long_breakout_order_must_use_high_extreme")
+    if direction == "做空" and extreme == "high":
+        errors.append("short_breakout_order_must_use_low_extreme")
+    if errors:
+        return errors
+
+    basis_seq = _parse_k_seq(basis_bar)
+    if basis_seq is None:
+        return ["breakout_entry_basis_bar_invalid"]
+
+    basis_row = _feature_row_by_k(feature_rows, basis_seq)
+    if feature_rows is not None and basis_row is None:
+        return ["breakout_entry_basis_bar_out_of_frame"]
+    if basis_row is None:
+        return []
+
+    entry = _number(decision.get("entry_price"))
+    if entry is None:
+        return []
+    if direction == "做多" and extreme == "high":
+        high = _number(basis_row.get("high"))
+        if high is not None and entry <= high:
+            errors.append("long_breakout_entry_must_be_above_basis_high")
+    if direction == "做空" and extreme == "low":
+        low = _number(basis_row.get("low"))
+        if low is not None and entry >= low:
+            errors.append("short_breakout_entry_must_be_below_basis_low")
+    return errors
+
+
+def _trade_metric_errors(decision: dict[str, Any]) -> list[str]:
+    if decision.get("order_type") not in TRADE_DECISION_ACTIONABLE_ORDER_TYPES:
+        return []
+    rr = _compute_risk_reward(
+        decision.get("entry_price"),
+        decision.get("take_profit_price"),
+        decision.get("stop_loss_price"),
+        decision.get("order_direction"),
+    )
+    if rr is None:
+        return ["trade_prices_must_form_positive_risk_reward"]
+
+    errors: list[str] = []
+    ratio = rr["ratio"]
+    if ratio < TRADE_DECISION_MIN_RISK_REWARD:
+        errors.append("risk_reward_below_minimum")
+
+    win_rate = _number(decision.get("estimated_win_rate"))
+    if win_rate is None:
+        errors.append("actionable_decision_requires_estimated_win_rate")
+    elif not _passes_trader_equation(win_rate, rr["risk"], rr["reward"]):
+        errors.append("trader_equation_fails")
+    return errors
+
+
+def _compute_risk_reward(
+    entry: Any,
+    take_profit: Any,
+    stop_loss: Any,
+    direction: Any,
+) -> dict[str, float] | None:
+    entry_number = _number(entry)
+    take_profit_number = _number(take_profit)
+    stop_loss_number = _number(stop_loss)
+    if entry_number is None or take_profit_number is None or stop_loss_number is None:
+        return None
+
+    if direction == "做多":
+        risk = entry_number - stop_loss_number
+        reward = take_profit_number - entry_number
+    elif direction == "做空":
+        risk = stop_loss_number - entry_number
+        reward = entry_number - take_profit_number
+    else:
+        return None
+
+    if risk <= 0 or reward <= 0:
+        return None
+    return {"risk": risk, "reward": reward, "ratio": reward / risk}
+
+
+def _passes_trader_equation(win_rate_pct: float, risk: float, reward: float) -> bool:
+    if risk <= 0 or reward <= 0:
+        return False
+    probability = max(0.0, min(100.0, win_rate_pct)) / 100.0
+    return probability * reward > (1.0 - probability) * risk
+
+
+def _next_cycle_prediction_errors(prediction: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    unpredictable = prediction.get("unpredictable")
+    if not isinstance(unpredictable, bool):
+        return ["next_cycle_prediction_unpredictable_must_be_bool"]
+
+    if unpredictable:
+        if prediction.get("cycle") is not None:
+            errors.append("next_cycle_prediction_cycle_must_be_null_when_unpredictable")
+        if prediction.get("direction") is not None:
+            errors.append("next_cycle_prediction_direction_must_be_null_when_unpredictable")
+        if prediction.get("probabilities") is not None:
+            errors.append("next_cycle_prediction_probabilities_must_be_null_when_unpredictable")
+        return errors
+
+    cycle = prediction.get("cycle")
+    if cycle not in TRADE_DECISION_CYCLE_ORDER:
+        errors.append("next_cycle_prediction_cycle_invalid")
+    direction = prediction.get("direction")
+    if direction not in TRADE_DECISION_DIRECTIONS:
+        errors.append("next_cycle_prediction_direction_invalid")
+
+    probabilities = prediction.get("probabilities")
+    if not isinstance(probabilities, dict):
+        errors.append("next_cycle_prediction_probabilities_must_be_object")
+        return errors
+
+    for key in TRADE_DECISION_CYCLE_ORDER:
+        value = probabilities.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+            errors.append(f"next_cycle_prediction_probability_{key}_invalid")
+    if errors:
+        return errors
+
+    total = sum(probabilities[key] for key in TRADE_DECISION_CYCLE_ORDER)
+    if not 99 <= total <= 101:
+        errors.append("next_cycle_prediction_probabilities_sum_invalid")
+
+    max_value = max(probabilities[key] for key in TRADE_DECISION_CYCLE_ORDER)
+    winners = [key for key in TRADE_DECISION_CYCLE_ORDER if probabilities[key] == max_value]
+    if cycle not in winners:
+        errors.append("next_cycle_prediction_cycle_must_match_probability_argmax")
+    return errors
 
 
 def parse_json_object(raw_response: str) -> dict[str, Any]:
@@ -615,6 +937,50 @@ def _parse_k_range(value: str) -> list[int]:
     if single_match:
         return [int(single_match.group(1))]
     return []
+
+
+def _parse_k_seq(value: Any) -> int | None:
+    match = _K_ANY_RE.fullmatch(str(value or "").strip())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _feature_row_by_k(
+    feature_rows: list[dict[str, Any]] | None,
+    seq: int,
+) -> dict[str, Any] | None:
+    for row in feature_rows or []:
+        if str(row.get("k", "")).strip().upper() == f"K{seq}":
+            return row
+    return None
+
+
+def _index_of_node(node_ids: list[str], node_id: str) -> int:
+    try:
+        return node_ids.index(node_id)
+    except ValueError:
+        return -1
+
+
+def _first_node_index_with_prefix(node_ids: list[str], prefix: str) -> int:
+    for index, node_id in enumerate(node_ids):
+        if node_id.startswith(prefix):
+            return index
+    return -1
+
+
+def _decision_trace_sort_key(node_id: str) -> tuple[int, int, str]:
+    parts = str(node_id or "").split(".", 1)
+    try:
+        major = int(parts[0])
+    except (ValueError, IndexError):
+        return (999, 999, node_id)
+    if len(parts) == 1:
+        return (major, 0, node_id)
+    minor_match = re.match(r"^(\d+)", parts[1])
+    minor = int(minor_match.group(1)) if minor_match else 999
+    return (major, minor, node_id)
 
 
 def _validate_gate_trace_order(
