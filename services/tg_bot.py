@@ -23,7 +23,15 @@ from datetime import datetime, timezone, timedelta, time as dt_time
 import httpx
 from aiohttp import web
 from sqlalchemy import create_engine, text
-from telegram import Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    Update,
+)
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(
@@ -51,6 +59,29 @@ BOT_COMMAND_SPECS = [
 ]
 
 TELEGRAM_POLL_LOCK = asyncio.Lock()
+
+
+async def sync_bot_commands(bot) -> None:
+    """Remove stale Telegram command menus, then publish the current PA menu."""
+    scopes = [
+        BotCommandScopeDefault(),
+        BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllGroupChats(),
+        BotCommandScopeAllChatAdministrators(),
+        BotCommandScopeChat(chat_id=TG_CHAT_ID),
+    ]
+    for scope in scopes:
+        try:
+            await bot.delete_my_commands(scope=scope)
+        except Exception:
+            logger.warning("Failed to delete Telegram commands for scope %s", scope, exc_info=True)
+
+    commands = [
+        BotCommand(command, description)
+        for command, description in BOT_COMMAND_SPECS
+    ]
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=TG_CHAT_ID))
 
 
 # ================================================================
@@ -1185,11 +1216,7 @@ async def main() -> None:
 
     logger.info("Starting TG bot polling...")
     await app_tg.initialize()
-    from telegram import BotCommand
-    await app_tg.bot.set_my_commands([
-        BotCommand(command, description)
-        for command, description in BOT_COMMAND_SPECS
-    ])
+    await sync_bot_commands(app_tg.bot)
     polling_task = asyncio.create_task(_poll_updates(app_tg))
     logger.info("TG bot polling started, commands registered")
 

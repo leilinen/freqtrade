@@ -197,6 +197,34 @@ class TestTelegramCommandMenu:
         assert "pa_signals" not in commands
         assert "pa_history" not in commands
 
+    @pytest.mark.asyncio
+    async def test_sync_bot_commands_clears_stale_scopes(self):
+        bot = SimpleNamespace(
+            delete_my_commands=AsyncMock(),
+            set_my_commands=AsyncMock(),
+        )
+
+        await tg_bot.sync_bot_commands(bot)
+
+        assert bot.delete_my_commands.await_count == 5
+        deleted_scopes = [
+            call.kwargs["scope"]
+            for call in bot.delete_my_commands.await_args_list
+        ]
+        assert any(isinstance(scope, tg_bot.BotCommandScopeAllPrivateChats) for scope in deleted_scopes)
+        assert any(isinstance(scope, tg_bot.BotCommandScopeChat) for scope in deleted_scopes)
+
+        assert bot.set_my_commands.await_count == 2
+        commands = bot.set_my_commands.await_args_list[0].args[0]
+        assert [command.command for command in commands] == [
+            "pa_watch",
+            "pa_add",
+            "pa_remove",
+            "quote",
+            "pa_status",
+            "pa_help",
+        ]
+
 
 # ===================================================================
 # Tests: _normalize_ashare_code
