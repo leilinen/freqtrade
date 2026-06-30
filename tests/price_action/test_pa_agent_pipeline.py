@@ -56,7 +56,11 @@ from price_action.prompts import (  # noqa: E402
 )
 from price_action.repository import PriceActionRepository  # noqa: E402
 from price_action.router import route_strategies  # noqa: E402
-from price_action.validation import DecisionValidator, validate_market_diagnosis  # noqa: E402
+from price_action.validation import (  # noqa: E402
+    DecisionValidator,
+    parse_json_object,
+    validate_market_diagnosis,
+)
 from price_action.worker import PaAnalysisWorker  # noqa: E402
 
 
@@ -1534,6 +1538,26 @@ class TestDecisionValidator:
 
         assert parsed is None
         assert result.checks == ["json_syntax"]
+
+    def test_markdown_fenced_json_is_accepted(self):
+        decision = _trade_decision(diagnosis=self.diagnosis)
+        raw = "```json\n" + json.dumps(decision, ensure_ascii=False) + "\n```"
+
+        parsed, result = DecisionValidator().validate(
+            raw,
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+            feature_rows=self.feature_rows,
+        )
+
+        assert parsed == decision
+        assert result.checks[0] == "json_syntax"
+        assert not any(error.startswith("invalid_json") for error in result.errors)
+
+    def test_parse_json_object_extracts_wrapped_object(self):
+        raw = "analysis follows\n" + json.dumps({"ok": True}) + "\nfinished"
+
+        assert parse_json_object(raw) == {"ok": True}
 
     def test_stage_consistency_runs_before_semantic(self):
         decision = _trade_decision(diagnosis=self.diagnosis)

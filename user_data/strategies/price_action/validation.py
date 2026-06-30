@@ -175,10 +175,10 @@ class DecisionValidator:
 
         checks.append(CHECK_JSON_SYNTAX)
         try:
-            parsed = json.loads(raw_response)
+            parsed = parse_json_object(raw_response)
         except json.JSONDecodeError as exc:
             return None, ValidationResult(False, checks, [f"invalid_json:{exc.msg}"])
-        if not isinstance(parsed, dict):
+        except ValueError:
             return None, ValidationResult(False, checks, ["json_root_must_be_object"])
 
         checks.append(CHECK_STAGE_CONSISTENCY)
@@ -691,11 +691,38 @@ def _next_cycle_prediction_errors(prediction: dict[str, Any]) -> list[str]:
 
 
 def parse_json_object(raw_response: str) -> dict[str, Any]:
-    """Parse a required JSON object response."""
-    parsed = json.loads(raw_response)
+    """Parse a required JSON object response.
+
+    Some OpenAI-compatible providers accept ``response_format`` but still wrap
+    JSON in Markdown fences. Keep raw response persistence unchanged, but make
+    validation tolerant enough to parse those provider responses.
+    """
+    try:
+        parsed = json.loads(raw_response)
+    except json.JSONDecodeError:
+        parsed = json.loads(_extract_json_object_text(raw_response))
     if not isinstance(parsed, dict):
         raise ValueError("LLM response root must be a JSON object")
     return parsed
+
+
+def _extract_json_object_text(raw_response: str) -> str:
+    text = raw_response.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        fenced = "\n".join(lines).strip()
+        if fenced:
+            return fenced
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start:end + 1]
+    return text
 
 
 def validate_market_diagnosis(
