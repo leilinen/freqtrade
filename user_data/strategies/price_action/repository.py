@@ -216,6 +216,8 @@ class PriceActionRepository:
         validation_errors: list | None = None,
         prompt_metadata: dict | None = None,
         raw_responses: dict | None = None,
+        usage_total: dict | None = None,
+        exception: dict | None = None,
     ) -> bool:
         """Upsert a full PA_Agent-style analysis row."""
         if not self._session_factory:
@@ -253,6 +255,8 @@ class PriceActionRepository:
                 row.validation_errors = validation_errors
                 row.prompt_metadata = prompt_metadata
                 row.raw_responses = raw_responses
+                row.usage_total = usage_total
+                row.exception = exception
                 session.commit()
                 return True
         except Exception:
@@ -286,12 +290,28 @@ class PriceActionRepository:
                 )
                 if row is None:
                     return None
-                return {
+                previous = {
                     "candle_time": row.candle_time.isoformat() if row.candle_time else None,
                     "decision": row.trade_decision,
                     "diagnosis": row.market_diagnosis,
                     "validation_status": row.validation_status,
+                    "usage_total": getattr(row, "usage_total", None),
                 }
+                for key, value in (
+                    (
+                        "market_diagnosis_messages",
+                        getattr(row, "market_diagnosis_messages", None),
+                    ),
+                    (
+                        "trade_decision_messages",
+                        getattr(row, "trade_decision_messages", None),
+                    ),
+                    ("price_action_features", getattr(row, "price_action_features", None)),
+                    ("raw_responses", getattr(row, "raw_responses", None)),
+                ):
+                    if value is not None:
+                        previous[key] = value
+                return previous
         except Exception:
             logger.debug("Previous PA analysis lookup failed for %s", symbol, exc_info=True)
             return None

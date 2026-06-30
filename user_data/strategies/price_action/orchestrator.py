@@ -12,6 +12,7 @@ from .experience import retrieve_experience_cases
 from .features import PriceActionFeatureResult, build_price_action_features
 from .llm import OpenAIJsonClient
 from .prompts import (
+    build_incremental_market_diagnosis_messages,
     build_market_diagnosis_messages,
     build_trade_decision_messages,
     prompt_template_metadata,
@@ -22,6 +23,12 @@ from .validation import DecisionValidator, parse_json_object, validate_market_di
 
 
 logger = logging.getLogger(__name__)
+USAGE_FIELDS = (
+    "prompt_tokens",
+    "cached_prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +79,10 @@ class PriceActionOrchestrator:
         trade_decision_messages: list[dict[str, str]] | None = None
         validation_status: str | None = None
         validation_errors: list[str] = []
+        raw_responses: dict[str, Any] = {}
+        usage_total: dict[str, Any] = {}
+        exception_info: dict[str, Any] | None = None
+        current_stage = "feature_engineering"
         selected = []
         experience_cases: list[dict[str, Any]] = []
         prompt_metadata: dict[str, Any] = {
@@ -79,6 +90,7 @@ class PriceActionOrchestrator:
             "base_url": self.llm_client.base_url,
             "response_format": {"type": "json_object"},
             "prompt_templates": prompt_template_metadata(),
+            "decision_stance": _decision_stance(self.config),
         }
 
         try:
@@ -91,20 +103,38 @@ class PriceActionOrchestrator:
                 warmup=int(self.config.get("pa_llm_warmup", 50)),
             )
 
-            market_diagnosis_messages = build_market_diagnosis_messages(features)
-            raw_market_diagnosis = self.llm_client.complete_json(
-                market_diagnosis_messages,
-                stage="market_diagnosis",
-            )
-            diagnosis = parse_json_object(raw_market_diagnosis)
-            market_diagnosis_errors = validate_market_diagnosis(
-                diagnosis,
-                feature_rows=features.rows,
-            )
-            if market_diagnosis_errors:
-                raise ValueError(
-                    f"market_diagnosis_invalid:{','.join(market_diagnosis_errors)}"
+            previous = (
+                self.repository.get_previous_successful_analysis(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    before_time=features.candle_time,
                 )
+                if self.repository
+                else None
+            )
+
+            current_stage = "market_diagnosis"
+            new_bar_count = _new_bar_count_since_previous(features, previous)
+            if _use_incremental_stage1(self.config, previous, new_bar_count):
+                market_diagnosis_messages = build_incremental_market_diagnosis_messages(
+                    features,
+                    previous_analysis=previous or {},
+                    new_bar_count=int(new_bar_count or 0),
+                )
+                prompt_metadata["market_diagnosis_mode"] = "incremental"
+                prompt_metadata["incremental_new_bar_count"] = new_bar_count
+            else:
+                market_diagnosis_messages = build_market_diagnosis_messages(features)
+                prompt_metadata["market_diagnosis_mode"] = "full"
+
+            raw_market_diagnosis, diagnosis, market_diagnosis_messages = (
+                self._call_market_diagnosis_with_retry(
+                    market_diagnosis_messages,
+                    feature_rows=features.rows,
+                    raw_responses=raw_responses,
+                )
+            )
+            usage_total = _usage_total_from_responses(raw_responses)
 
             strategies = route_strategies(diagnosis)
             selected = [strategy.as_dict() for strategy in strategies]
@@ -118,8 +148,16 @@ class PriceActionOrchestrator:
 
             gate_result = str(diagnosis.get("gate_result", "proceed")).lower()
             if gate_result in ("wait", "unknown"):
+                current_stage = "trade_decision"
                 decision_json = self._build_gate_wait_decision(diagnosis)
                 raw_trade_decision = json.dumps(decision_json, ensure_ascii=False)
+                raw_responses["trade_decision"] = {
+                    "stage": "trade_decision",
+                    "model": "program",
+                    "content": raw_trade_decision,
+                    "usage": {},
+                    "generated_by": "gate_short_circuit",
+                }
                 decision_json, validation = self.validator.validate(
                     raw_trade_decision,
                     diagnosis=diagnosis,
@@ -130,6 +168,11 @@ class PriceActionOrchestrator:
                 validation_status = validation.status
                 validation_errors = validation.errors
                 status = "success" if validation.valid else "invalid"
+                exception_info = (
+                    None
+                    if validation.valid
+                    else _validation_exception("trade_decision", validation_errors)
+                )
 
                 self._save(
                     features=features,
@@ -143,10 +186,9 @@ class PriceActionOrchestrator:
                     validation_status=validation_status,
                     validation_errors=validation_errors,
                     prompt_metadata={**prompt_metadata, "validation_checks": validation.checks},
-                    raw_responses={
-                        "market_diagnosis": raw_market_diagnosis,
-                        "trade_decision": raw_trade_decision,
-                    },
+                    raw_responses=raw_responses,
+                    usage_total=usage_total,
+                    exception=exception_info,
                 )
 
                 if validation.valid and self._should_notify(decision_json):
@@ -171,37 +213,34 @@ class PriceActionOrchestrator:
                     errors=validation_errors,
                 )
 
-            previous = (
-                self.repository.get_previous_successful_analysis(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    before_time=features.candle_time,
-                )
-                if self.repository
-                else None
-            )
-
+            current_stage = "trade_decision"
             trade_decision_messages = build_trade_decision_messages(
                 features=features,
                 diagnosis=diagnosis,
                 strategies=strategies,
                 experience_cases=experience_cases,
                 previous_decision=previous,
+                decision_stance=_decision_stance(self.config),
             )
-            raw_trade_decision = self.llm_client.complete_json(
-                trade_decision_messages,
-                stage="trade_decision",
+            raw_trade_decision, decision_json, validation, trade_decision_messages = (
+                self._call_trade_decision_with_retry(
+                    trade_decision_messages,
+                    diagnosis=diagnosis,
+                    price_action_features=features.latest_features,
+                    feature_rows=features.rows,
+                    strategies=selected,
+                    raw_responses=raw_responses,
+                )
             )
-            decision_json, validation = self.validator.validate(
-                raw_trade_decision,
-                diagnosis=diagnosis,
-                price_action_features=features.latest_features,
-                feature_rows=features.rows,
-                strategies=selected,
-            )
+            usage_total = _usage_total_from_responses(raw_responses)
             validation_status = validation.status
             validation_errors = validation.errors
             status = "success" if validation.valid else "invalid"
+            exception_info = (
+                None
+                if validation.valid
+                else _validation_exception("trade_decision", validation_errors)
+            )
 
             self._save(
                 features=features,
@@ -215,10 +254,9 @@ class PriceActionOrchestrator:
                 validation_status=validation_status,
                 validation_errors=validation_errors,
                 prompt_metadata={**prompt_metadata, "validation_checks": validation.checks},
-                raw_responses={
-                    "market_diagnosis": raw_market_diagnosis,
-                    "trade_decision": raw_trade_decision,
-                },
+                raw_responses=raw_responses,
+                usage_total=usage_total,
+                exception=exception_info,
             )
 
             if validation.valid and self._should_notify(decision_json):
@@ -243,6 +281,8 @@ class PriceActionOrchestrator:
                 errors=validation_errors,
             )
         except Exception as exc:
+            usage_total = _usage_total_from_responses(raw_responses)
+            exception_info = _exception_info(current_stage, exc)
             logger.warning(
                 "PA analysis failed for %s %s: %s",
                 symbol,
@@ -264,10 +304,9 @@ class PriceActionOrchestrator:
                     validation_status=validation_status or "failed",
                     validation_errors=validation_errors,
                     prompt_metadata=prompt_metadata,
-                    raw_responses={
-                        "market_diagnosis": raw_market_diagnosis,
-                        "trade_decision": raw_trade_decision,
-                    },
+                    raw_responses=raw_responses,
+                    usage_total=usage_total,
+                    exception=exception_info,
                 )
             return AnalysisOutcome(
                 status="failed",
@@ -293,6 +332,8 @@ class PriceActionOrchestrator:
         validation_errors: list[str],
         prompt_metadata: dict[str, Any],
         raw_responses: dict[str, Any],
+        usage_total: dict[str, Any],
+        exception: dict[str, Any] | None,
     ) -> None:
         if not self.repository:
             return
@@ -315,7 +356,114 @@ class PriceActionOrchestrator:
             validation_errors=validation_errors,
             prompt_metadata=prompt_metadata,
             raw_responses=raw_responses,
+            usage_total=usage_total,
+            exception=exception,
         )
+
+    def _capture_llm_response(self, stage: str, content: str) -> dict[str, Any]:
+        raw = getattr(self.llm_client, "last_response", None)
+        if isinstance(raw, dict) and raw.get("stage") == stage:
+            return dict(raw)
+        return {
+            "stage": stage,
+            "model": getattr(self.llm_client, "model", None),
+            "content": content,
+            "usage": {},
+        }
+
+    def _call_market_diagnosis_with_retry(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        feature_rows: list[dict[str, Any]],
+        raw_responses: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], list[dict[str, str]]]:
+        retry_limit = _validation_retry_limit(self.config)
+        failed_attempts: list[dict[str, Any]] = []
+        current_messages = list(messages)
+        last_errors: list[str] = []
+
+        for attempt in range(retry_limit + 1):
+            raw_text = self.llm_client.complete_json(
+                current_messages,
+                stage="market_diagnosis",
+            )
+            raw_record = self._capture_llm_response("market_diagnosis", raw_text)
+            try:
+                parsed = parse_json_object(raw_text)
+                errors = validate_market_diagnosis(parsed, feature_rows=feature_rows)
+            except Exception as exc:
+                parsed = None
+                errors = [f"{type(exc).__name__}:{exc}"]
+            if not errors and isinstance(parsed, dict):
+                if failed_attempts:
+                    raw_record["retry_attempts"] = failed_attempts
+                raw_responses["market_diagnosis"] = raw_record
+                return raw_text, parsed, current_messages
+
+            last_errors = errors
+            raw_record["validation_errors"] = errors
+            if attempt >= retry_limit:
+                if failed_attempts:
+                    raw_record["retry_attempts"] = failed_attempts
+                raw_responses["market_diagnosis"] = raw_record
+                break
+            failed_attempts.append(raw_record)
+            current_messages = _append_retry_feedback(
+                current_messages,
+                stage="market_diagnosis",
+                errors=errors,
+            )
+
+        raise ValueError(f"market_diagnosis_invalid:{','.join(last_errors)}")
+
+    def _call_trade_decision_with_retry(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        diagnosis: dict[str, Any],
+        price_action_features: dict[str, Any],
+        feature_rows: list[dict[str, Any]],
+        strategies: list[dict[str, Any]],
+        raw_responses: dict[str, Any],
+    ) -> tuple[str, dict[str, Any] | None, Any, list[dict[str, str]]]:
+        retry_limit = _validation_retry_limit(self.config)
+        failed_attempts: list[dict[str, Any]] = []
+        current_messages = list(messages)
+
+        for attempt in range(retry_limit + 1):
+            raw_text = self.llm_client.complete_json(
+                current_messages,
+                stage="trade_decision",
+            )
+            raw_record = self._capture_llm_response("trade_decision", raw_text)
+            decision_json, validation = self.validator.validate(
+                raw_text,
+                diagnosis=diagnosis,
+                price_action_features=price_action_features,
+                feature_rows=feature_rows,
+                strategies=strategies,
+            )
+            if validation.valid:
+                if failed_attempts:
+                    raw_record["retry_attempts"] = failed_attempts
+                raw_responses["trade_decision"] = raw_record
+                return raw_text, decision_json, validation, current_messages
+
+            raw_record["validation_errors"] = validation.errors
+            if attempt >= retry_limit:
+                if failed_attempts:
+                    raw_record["retry_attempts"] = failed_attempts
+                raw_responses["trade_decision"] = raw_record
+                return raw_text, decision_json, validation, current_messages
+            failed_attempts.append(raw_record)
+            current_messages = _append_retry_feedback(
+                current_messages,
+                stage="trade_decision",
+                errors=validation.errors,
+            )
+
+        raise RuntimeError("unreachable_trade_decision_retry_state")
 
     def _should_notify(self, decision_json: dict[str, Any] | None) -> bool:
         if not decision_json:
@@ -437,3 +585,134 @@ class PriceActionOrchestrator:
             },
             chart_generator=chart_generator,
         )
+
+
+def _usage_total_from_responses(raw_responses: dict[str, Any]) -> dict[str, Any]:
+    total = {field: 0 for field in USAGE_FIELDS}
+    has_usage = False
+
+    def add_usage(raw: dict[str, Any]) -> None:
+        nonlocal has_usage
+        usage = raw.get("usage")
+        if not isinstance(usage, dict):
+            return
+        prompt_details = usage.get("prompt_tokens_details")
+        if (
+            isinstance(prompt_details, dict)
+            and "cached_prompt_tokens" not in usage
+            and prompt_details.get("cached_tokens") is not None
+        ):
+            usage = {**usage, "cached_prompt_tokens": prompt_details.get("cached_tokens")}
+        for field in USAGE_FIELDS:
+            value = usage.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            total[field] += int(value)
+            has_usage = True
+
+    for raw in raw_responses.values():
+        if not isinstance(raw, dict):
+            continue
+        for attempt in raw.get("retry_attempts") or []:
+            if isinstance(attempt, dict):
+                add_usage(attempt)
+        add_usage(raw)
+    return total if has_usage else {}
+
+
+def _validation_retry_limit(config: dict[str, Any]) -> int:
+    try:
+        value = int(config.get("pa_validation_retry_max", 0))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(value, 3))
+
+
+def _append_retry_feedback(
+    messages: list[dict[str, str]],
+    *,
+    stage: str,
+    errors: list[str],
+) -> list[dict[str, str]]:
+    feedback = (
+        "上一次输出未通过程序校验。\n"
+        f"stage={stage}\n"
+        f"errors={json.dumps(errors, ensure_ascii=False)}\n\n"
+        "请只修正 JSON 输出，不要解释，不要输出 Markdown。"
+    )
+    return [*messages, {"role": "user", "content": feedback}]
+
+
+def _decision_stance(config: dict[str, Any]) -> str:
+    value = str(config.get("pa_decision_stance") or "conservative").strip().lower()
+    allowed = {"conservative", "balanced", "aggressive", "extreme_aggressive"}
+    return value if value in allowed else "conservative"
+
+
+def _use_incremental_stage1(
+    config: dict[str, Any],
+    previous: dict[str, Any] | None,
+    new_bar_count: int | None,
+) -> bool:
+    if config.get("pa_incremental_stage1_enabled", True) is False:
+        return False
+    if not previous or new_bar_count is None or new_bar_count <= 0:
+        return False
+    try:
+        max_new = int(config.get("pa_incremental_stage1_max_new_bars", 10))
+    except (TypeError, ValueError):
+        max_new = 10
+    return max_new > 0 and new_bar_count <= max_new
+
+
+def _new_bar_count_since_previous(
+    features: PriceActionFeatureResult,
+    previous: dict[str, Any] | None,
+) -> int | None:
+    if not previous:
+        return None
+    previous_time = _parse_iso_datetime(previous.get("candle_time"))
+    if previous_time is None:
+        return None
+    count = 0
+    for row in features.rows:
+        row_time = _parse_iso_datetime(row.get("time"))
+        if row_time is None:
+            continue
+        if row_time > previous_time:
+            count += 1
+    return count
+
+
+def _parse_iso_datetime(value: Any) -> Any | None:
+    if value is None:
+        return None
+    try:
+        from datetime import datetime
+
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=None)
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def _validation_exception(stage: str, errors: list[str]) -> dict[str, Any]:
+    return {
+        "type": "validation_error",
+        "stage": stage,
+        "message": ",".join(errors),
+        "validation_errors": list(errors),
+    }
+
+
+def _exception_info(stage: str, exc: Exception) -> dict[str, Any]:
+    return {
+        "type": type(exc).__name__,
+        "stage": stage,
+        "message": str(exc),
+    }

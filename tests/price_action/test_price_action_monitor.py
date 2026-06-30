@@ -48,6 +48,7 @@ from price_action_monitor import (  # noqa: E402
     WatchPair,
     _Base,
 )
+from price_action.models import PaAnalysis  # noqa: E402
 from price_action.rules import PriceActionSignalRules  # noqa: E402
 
 
@@ -151,6 +152,15 @@ class TestWatchPairModel:
     def test_display_name_is_nullable(self):
         col = {c.name: c for c in WatchPair.__table__.columns}["display_name"]
         assert col.nullable is True
+
+
+class TestPaAnalysisModel:
+    """Verify full PA_Agent-style analysis record fields."""
+
+    def test_usage_and_exception_columns_exist(self):
+        col_names = {c.name for c in PaAnalysis.__table__.columns}
+        assert "usage_total" in col_names
+        assert "exception" in col_names
 
 
 # ===================================================================

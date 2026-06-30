@@ -51,6 +51,7 @@ from price_action.llm import OpenAIJsonClient  # noqa: E402
 from price_action.orchestrator import PriceActionOrchestrator  # noqa: E402
 from price_action.prompts import (  # noqa: E402
     build_market_diagnosis_messages,
+    build_trade_decision_messages,
     prompt_template_metadata,
 )
 from price_action.repository import PriceActionRepository  # noqa: E402
@@ -734,6 +735,20 @@ class TestMarketDiagnosisPrompt:
         assert '"market_state"' not in content
         assert '"signal_chain"' not in content
 
+    def test_trade_decision_prompt_includes_decision_stance(self):
+        features = self._features()
+        messages = build_trade_decision_messages(
+            features=features,
+            diagnosis=_market_diagnosis(features),
+            strategies=[],
+            decision_stance="aggressive",
+        )
+        content = messages[1]["content"]
+
+        assert "用户交易倾向" in content
+        assert "aggressive" in content
+        assert "交易倾向不能覆盖价格事实" in content
+
     def test_market_diagnosis_validation_accepts_pa_agent_contract(self):
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
         features = build_price_action_features(
@@ -1023,10 +1038,36 @@ class TestMarketDiagnosisOrchestrator:
         llm = MagicMock()
         llm.model = "test-model"
         llm.base_url = "https://example.test"
-        llm.complete_json.side_effect = [
-            json.dumps(diagnosis, ensure_ascii=False),
-            json.dumps(decision, ensure_ascii=False),
+        responses = [
+            (
+                "market_diagnosis",
+                json.dumps(diagnosis, ensure_ascii=False),
+                {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+            ),
+            (
+                "trade_decision",
+                json.dumps(decision, ensure_ascii=False),
+                {
+                    "prompt_tokens": 80,
+                    "cached_prompt_tokens": 10,
+                    "completion_tokens": 30,
+                    "total_tokens": 110,
+                },
+            ),
         ]
+
+        def complete_json(_messages, *, stage):
+            expected_stage, content, usage = responses.pop(0)
+            assert stage == expected_stage
+            llm.last_response = {
+                "stage": stage,
+                "model": llm.model,
+                "content": content,
+                "usage": usage,
+            }
+            return content
+
+        llm.complete_json.side_effect = complete_json
         repository = MagicMock()
         repository.query_experience.return_value = []
         repository.get_previous_successful_analysis.return_value = None
@@ -1055,13 +1096,307 @@ class TestMarketDiagnosisOrchestrator:
         assert '"terminal"' in kwargs["trade_decision_messages"][1]["content"]
         assert '"next_cycle_prediction"' in kwargs["trade_decision_messages"][1]["content"]
         assert kwargs["prompt_metadata"]["prompt_templates"]["market_diagnosis"][0]["sha256"]
+        assert kwargs["raw_responses"]["market_diagnosis"]["content"] == json.dumps(
+            diagnosis,
+            ensure_ascii=False,
+        )
+        assert kwargs["raw_responses"]["trade_decision"]["content"] == json.dumps(
+            decision,
+            ensure_ascii=False,
+        )
+        assert kwargs["usage_total"] == {
+            "prompt_tokens": 180,
+            "cached_prompt_tokens": 10,
+            "completion_tokens": 50,
+            "total_tokens": 230,
+        }
+        assert kwargs["exception"] is None
+
+    def test_market_diagnosis_validation_retry_uses_feedback(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        features = build_price_action_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+        bad_diagnosis = {
+            "cycle_position": "normal_channel",
+            "direction": "bullish",
+            "gate_result": "proceed",
+        }
+        good_diagnosis = _market_diagnosis(features)
+        decision = _trade_decision(order_type="不下单", diagnosis=good_diagnosis)
+        responses = [
+            ("market_diagnosis", json.dumps(bad_diagnosis, ensure_ascii=False)),
+            ("market_diagnosis", json.dumps(good_diagnosis, ensure_ascii=False)),
+            ("trade_decision", json.dumps(decision, ensure_ascii=False)),
+        ]
+        llm = MagicMock()
+        llm.model = "test-model"
+        llm.base_url = "https://example.test"
+        seen_messages = []
+
+        def complete_json(messages, *, stage):
+            seen_messages.append(messages)
+            expected_stage, content = responses.pop(0)
+            assert stage == expected_stage
+            llm.last_response = {
+                "stage": stage,
+                "model": llm.model,
+                "content": content,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            }
+            return content
+
+        llm.complete_json.side_effect = complete_json
+        repository = MagicMock()
+        repository.get_previous_successful_analysis.return_value = None
+        repository.query_experience.return_value = []
+        repository.save_analysis.return_value = True
+        orchestrator = PriceActionOrchestrator(
+            repository=repository,
+            llm_client=llm,
+            config={
+                "pa_llm_window": 6,
+                "pa_llm_warmup": 0,
+                "pa_validation_retry_max": 1,
+            },
+        )
+
+        outcome = orchestrator.analyze(
+            symbol="BTC/USDT",
+            dataframe=df,
+            timeframe="1h",
+            market="crypto",
+        )
+
+        assert outcome.status == "success"
+        assert llm.complete_json.call_count == 3
+        assert "上一次输出未通过程序校验" in seen_messages[1][-1]["content"]
+        raw = repository.save_analysis.call_args.kwargs["raw_responses"]
+        assert len(raw["market_diagnosis"]["retry_attempts"]) == 1
+
+    def test_trade_decision_validation_retry_uses_feedback(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        features = build_price_action_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+        diagnosis = _market_diagnosis(features)
+        invalid_decision = _trade_decision(
+            order_direction="做多",
+            entry=100,
+            stop=110,
+            tp1=120,
+            tp2=130,
+            diagnosis=diagnosis,
+        )
+        valid_decision = _trade_decision(order_type="不下单", diagnosis=diagnosis)
+        responses = [
+            ("market_diagnosis", json.dumps(diagnosis, ensure_ascii=False)),
+            ("trade_decision", json.dumps(invalid_decision, ensure_ascii=False)),
+            ("trade_decision", json.dumps(valid_decision, ensure_ascii=False)),
+        ]
+        llm = MagicMock()
+        llm.model = "test-model"
+        llm.base_url = "https://example.test"
+        seen_messages = []
+
+        def complete_json(messages, *, stage):
+            seen_messages.append(messages)
+            expected_stage, content = responses.pop(0)
+            assert stage == expected_stage
+            llm.last_response = {
+                "stage": stage,
+                "model": llm.model,
+                "content": content,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+            }
+            return content
+
+        llm.complete_json.side_effect = complete_json
+        repository = MagicMock()
+        repository.get_previous_successful_analysis.return_value = None
+        repository.query_experience.return_value = []
+        repository.save_analysis.return_value = True
+        orchestrator = PriceActionOrchestrator(
+            repository=repository,
+            llm_client=llm,
+            config={
+                "pa_llm_window": 6,
+                "pa_llm_warmup": 0,
+                "pa_validation_retry_max": 1,
+            },
+        )
+
+        outcome = orchestrator.analyze(
+            symbol="BTC/USDT",
+            dataframe=df,
+            timeframe="1h",
+            market="crypto",
+        )
+
+        assert outcome.status == "success"
+        assert llm.complete_json.call_count == 3
+        assert "上一次输出未通过程序校验" in seen_messages[2][-1]["content"]
+        raw = repository.save_analysis.call_args.kwargs["raw_responses"]
+        assert len(raw["trade_decision"]["retry_attempts"]) == 1
+
+    def test_incremental_stage1_prompt_uses_previous_successful_analysis(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        features = build_price_action_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+        diagnosis = _market_diagnosis(features)
+        decision = _trade_decision(order_type="不下单", diagnosis=diagnosis)
+        previous = {
+            "candle_time": features.rows[1]["time"],
+            "diagnosis": diagnosis,
+            "decision": decision,
+            "market_diagnosis_messages": [
+                {"role": "system", "content": "previous system"},
+                {"role": "user", "content": "previous stage1 user"},
+            ],
+            "raw_responses": {
+                "market_diagnosis": {
+                    "content": json.dumps(diagnosis, ensure_ascii=False),
+                }
+            },
+        }
+        responses = [
+            ("market_diagnosis", json.dumps(diagnosis, ensure_ascii=False)),
+            ("trade_decision", json.dumps(decision, ensure_ascii=False)),
+        ]
+        llm = MagicMock()
+        llm.model = "test-model"
+        llm.base_url = "https://example.test"
+        seen_messages = []
+
+        def complete_json(messages, *, stage):
+            seen_messages.append(messages)
+            expected_stage, content = responses.pop(0)
+            assert stage == expected_stage
+            llm.last_response = {
+                "stage": stage,
+                "model": llm.model,
+                "content": content,
+                "usage": {},
+            }
+            return content
+
+        llm.complete_json.side_effect = complete_json
+        repository = MagicMock()
+        repository.get_previous_successful_analysis.return_value = previous
+        repository.query_experience.return_value = []
+        repository.save_analysis.return_value = True
+        orchestrator = PriceActionOrchestrator(
+            repository=repository,
+            llm_client=llm,
+            config={"pa_llm_window": 6, "pa_llm_warmup": 0},
+        )
+
+        outcome = orchestrator.analyze(
+            symbol="BTC/USDT",
+            dataframe=df,
+            timeframe="1h",
+            market="crypto",
+        )
+
+        assert outcome.status == "success"
+        assert [message["role"] for message in seen_messages[0]] == [
+            "system",
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert "增量更新阶段一市场诊断" in seen_messages[0][-1]["content"]
+        kwargs = repository.save_analysis.call_args.kwargs
+        assert kwargs["prompt_metadata"]["market_diagnosis_mode"] == "incremental"
+        assert kwargs["prompt_metadata"]["incremental_new_bar_count"] == 1
+
+    def test_failed_market_diagnosis_persists_exception_and_partial_record(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        bad_diagnosis = {
+            "cycle_position": "normal_channel",
+            "direction": "bullish",
+            "gate_result": "proceed",
+        }
+        raw_diagnosis = json.dumps(bad_diagnosis, ensure_ascii=False)
+        llm = MagicMock()
+        llm.model = "test-model"
+        llm.base_url = "https://example.test"
+        llm.last_response = {
+            "stage": "market_diagnosis",
+            "model": llm.model,
+            "content": raw_diagnosis,
+            "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
+        }
+        llm.complete_json.return_value = raw_diagnosis
+        repository = MagicMock()
+        repository.save_analysis.return_value = True
+        orchestrator = PriceActionOrchestrator(
+            repository=repository,
+            llm_client=llm,
+            config={"pa_llm_window": 6, "pa_llm_warmup": 0},
+        )
+
+        outcome = orchestrator.analyze(
+            symbol="BTC/USDT",
+            dataframe=df,
+            timeframe="1h",
+            market="crypto",
+        )
+
+        assert outcome.status == "failed"
+        kwargs = repository.save_analysis.call_args.kwargs
+        assert kwargs["status"] == "failed"
+        assert kwargs["raw_responses"]["market_diagnosis"]["content"] == raw_diagnosis
+        assert kwargs["usage_total"] == {
+            "prompt_tokens": 50,
+            "cached_prompt_tokens": 0,
+            "completion_tokens": 10,
+            "total_tokens": 60,
+        }
+        assert kwargs["exception"]["stage"] == "market_diagnosis"
+        assert kwargs["exception"]["type"] == "ValueError"
 
 
 class TestOpenAIJsonClient:
     def test_uses_json_object_response_format(self):
         completions = MagicMock()
         completions.create.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"ok": true}',
+                        reasoning_content="reasoning",
+                        role="assistant",
+                    )
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=3),
+            ),
+            model="deepseek-chat",
+            id="chatcmpl-test",
         )
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
         client = OpenAIJsonClient(
@@ -1077,6 +1412,21 @@ class TestOpenAIJsonClient:
         kwargs = completions.create.call_args.kwargs
         assert kwargs["response_format"] == {"type": "json_object"}
         assert kwargs["model"] == "deepseek-chat"
+        assert client.last_response == {
+            "stage": "test",
+            "model": "deepseek-chat",
+            "content": '{"ok": true}',
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "prompt_tokens_details": {"cached_tokens": 3},
+                "cached_prompt_tokens": 3,
+            },
+            "reasoning_content": "reasoning",
+            "role": "assistant",
+            "id": "chatcmpl-test",
+        }
 
 
 class TestDecisionValidator:
@@ -1473,9 +1823,19 @@ class TestPriceActionRepository:
             market_diagnosis=market_diagnosis,
             trade_decision=trade_decision,
             raw_responses={
-                "market_diagnosis": json.dumps(market_diagnosis),
-                "trade_decision": raw_trade_decision,
+                "market_diagnosis": {
+                    "stage": "market_diagnosis",
+                    "content": json.dumps(market_diagnosis),
+                    "usage": {"prompt_tokens": 10, "total_tokens": 12},
+                },
+                "trade_decision": {
+                    "stage": "trade_decision",
+                    "content": raw_trade_decision,
+                    "usage": {"prompt_tokens": 20, "total_tokens": 25},
+                },
             },
+            usage_total={"prompt_tokens": 30, "total_tokens": 37},
+            exception={"type": "validation_error", "stage": "trade_decision"},
         )
 
         assert saved is True
@@ -1489,9 +1849,19 @@ class TestPriceActionRepository:
         assert row.market_diagnosis == market_diagnosis
         assert row.trade_decision == trade_decision
         assert row.raw_responses == {
-            "market_diagnosis": json.dumps(market_diagnosis),
-            "trade_decision": raw_trade_decision,
+            "market_diagnosis": {
+                "stage": "market_diagnosis",
+                "content": json.dumps(market_diagnosis),
+                "usage": {"prompt_tokens": 10, "total_tokens": 12},
+            },
+            "trade_decision": {
+                "stage": "trade_decision",
+                "content": raw_trade_decision,
+                "usage": {"prompt_tokens": 20, "total_tokens": 25},
+            },
         }
+        assert row.usage_total == {"prompt_tokens": 30, "total_tokens": 37}
+        assert row.exception == {"type": "validation_error", "stage": "trade_decision"}
         session.commit.assert_called_once()
 
     def test_previous_successful_analysis_reads_semantic_analysis_fields(self):
@@ -1506,6 +1876,7 @@ class TestPriceActionRepository:
             trade_decision=trade_decision,
             market_diagnosis=market_diagnosis,
             validation_status="valid",
+            usage_total={"total_tokens": 123},
         )
         query = MagicMock()
         query.filter.return_value.order_by.return_value.first.return_value = row
@@ -1528,6 +1899,7 @@ class TestPriceActionRepository:
             "decision": trade_decision,
             "diagnosis": market_diagnosis,
             "validation_status": "valid",
+            "usage_total": {"total_tokens": 123},
         }
 
 

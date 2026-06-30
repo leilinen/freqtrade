@@ -135,6 +135,8 @@ class PaAnalysis(_Base):
     validation_errors: Mapped[list | None] = mapped_column(JSON, nullable=True)
     prompt_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     raw_responses: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    usage_total: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    exception: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("symbol", "timeframe", "candle_time", name="ux_pa_analysis_identity"),

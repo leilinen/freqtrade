@@ -20,6 +20,19 @@ TRADE_DECISION_TEMPLATE_FILES = (
     "trade_decision_system.txt",
     "trade_decision_user.txt",
 )
+DECISION_STANCE_TEXT = {
+    "conservative": (
+        "保守：只接受清晰信号、明确止损和通过交易者方程的机会。"
+    ),
+    "balanced": "平衡：接受结构清晰且风险收益合理的标准 PA 机会。",
+    "aggressive": (
+        "积极：可接受较早计划型入场，"
+        "但仍必须满足止损、目标和交易者方程。"
+    ),
+    "extreme_aggressive": (
+        "极积极：可评估高波动早期机会，但禁止跳过风险收益校验。"
+    ),
+}
 
 
 MARKET_DIAGNOSIS_SCHEMA: dict[str, Any] = {
@@ -198,6 +211,55 @@ class PromptAssembler:
         )
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
+    def build_incremental_market_diagnosis_messages(
+        self,
+        features: PriceActionFeatureResult,
+        *,
+        previous_analysis: dict[str, Any],
+        new_bar_count: int,
+    ) -> list[dict[str, str]]:
+        """Build Stage 1 as a PA_Agent-style continuation update."""
+        system = self._load("market_diagnosis_system.txt").render()
+        previous_messages = previous_analysis.get("market_diagnosis_messages") or []
+        previous_user = ""
+        for message in previous_messages:
+            if isinstance(message, dict) and message.get("role") == "user":
+                previous_user = str(message.get("content") or "")
+                break
+        previous_raw = previous_analysis.get("raw_responses") or {}
+        previous_stage1 = previous_raw.get("market_diagnosis") or {}
+        previous_content = ""
+        if isinstance(previous_stage1, dict):
+            previous_content = str(previous_stage1.get("content") or "")
+        if not previous_content:
+            previous_content = json.dumps(
+                previous_analysis.get("diagnosis") or {},
+                ensure_ascii=False,
+                indent=2,
+            )
+        incremental_user = (
+            "任务：增量更新阶段一市场诊断。\n\n"
+            f"上一轮成功记录到当前共有 {new_bar_count} 根新增已收盘 K 线。\n"
+            "请沿用上一轮阶段一诊断作为上下文，"
+            "但必须以当前最新闭合 K 线事实为准；"
+            "如果市场周期、方向或闸门结果发生变化，"
+            "必须在 gate_trace 中说明依据。\n\n"
+            "当前最新 K 线表：\n"
+            f"{features.kline_table}\n\n"
+            "当前几何特征表：\n"
+            f"{features.feature_table}\n\n"
+            "当前市场结构辅助特征：\n"
+            f"{features.market_features_text}\n\n"
+            "输出必须仍符合这个 JSON contract：\n"
+            f"{json.dumps(MARKET_DIAGNOSIS_SCHEMA, ensure_ascii=False, indent=2)}"
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": previous_user or "上一轮阶段一 Prompt 不可用。"},
+            {"role": "assistant", "content": previous_content},
+            {"role": "user", "content": incremental_user},
+        ]
+
     def build_trade_decision_messages(
         self,
         *,
@@ -206,9 +268,15 @@ class PromptAssembler:
         strategies: list[StrategyTemplate],
         experience_cases: list[dict[str, Any]] | None = None,
         previous_decision: dict[str, Any] | None = None,
+        decision_stance: str = "conservative",
     ) -> list[dict[str, str]]:
         system = self._load("trade_decision_system.txt").render()
         strategy_text = "\n\n".join(strategy.render() for strategy in strategies)
+        stance_key = str(decision_stance or "conservative").strip().lower()
+        stance_text = DECISION_STANCE_TEXT.get(
+            stance_key,
+            DECISION_STANCE_TEXT["conservative"],
+        )
         user = self._load("trade_decision_user.txt").render(
             diagnosis_json=json.dumps(diagnosis, ensure_ascii=False, indent=2),
             strategy_text=strategy_text,
@@ -216,6 +284,8 @@ class PromptAssembler:
             latest_features_json=json.dumps(features.latest_features, ensure_ascii=False, indent=2),
             experience_text=json.dumps(experience_cases or [], ensure_ascii=False, indent=2),
             previous_text=json.dumps(previous_decision or {}, ensure_ascii=False, indent=2),
+            decision_stance=stance_key,
+            decision_stance_text=stance_text,
             schema_json=json.dumps(TRADE_DECISION_SCHEMA, ensure_ascii=False, indent=2),
         )
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -249,6 +319,20 @@ def build_market_diagnosis_messages(features: PriceActionFeatureResult) -> list[
     return DEFAULT_ASSEMBLER.build_market_diagnosis_messages(features)
 
 
+def build_incremental_market_diagnosis_messages(
+    features: PriceActionFeatureResult,
+    *,
+    previous_analysis: dict[str, Any],
+    new_bar_count: int,
+) -> list[dict[str, str]]:
+    """Assemble a continuation-style incremental market-diagnosis prompt."""
+    return DEFAULT_ASSEMBLER.build_incremental_market_diagnosis_messages(
+        features,
+        previous_analysis=previous_analysis,
+        new_bar_count=new_bar_count,
+    )
+
+
 def build_trade_decision_messages(
     *,
     features: PriceActionFeatureResult,
@@ -256,6 +340,7 @@ def build_trade_decision_messages(
     strategies: list[StrategyTemplate],
     experience_cases: list[dict[str, Any]] | None = None,
     previous_decision: dict[str, Any] | None = None,
+    decision_stance: str = "conservative",
 ) -> list[dict[str, str]]:
     """Assemble the trade-decision prompt."""
     return DEFAULT_ASSEMBLER.build_trade_decision_messages(
@@ -264,6 +349,7 @@ def build_trade_decision_messages(
         strategies=strategies,
         experience_cases=experience_cases,
         previous_decision=previous_decision,
+        decision_stance=decision_stance,
     )
 
 
