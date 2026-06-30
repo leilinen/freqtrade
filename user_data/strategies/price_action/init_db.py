@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import os
+import sys
 
 from sqlalchemy import create_engine
+
+sys.path.insert(0, "/freqtrade/user_data/strategies")
 
 from price_action.models import _Base
 
