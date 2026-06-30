@@ -1254,37 +1254,45 @@ async def main() -> None:
 async def _poll_updates(app_tg: Application) -> None:
     """Poll Telegram sequentially and dispatch updates through handlers.
 
-    The built-in Updater can leave overlapping long-poll requests in some
-    container restarts, which Telegram reports as 409 Conflict. This loop keeps
-    exactly one getUpdates request in flight.
+    The built-in Updater / Bot.get_updates wrappers can leave overlapping
+    long-poll requests in this container environment, which Telegram reports as
+    409 Conflict. This loop uses raw Bot API calls and keeps exactly one
+    getUpdates request in flight.
     """
+    api_url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates"
     offset = None
-    try:
-        pending = await app_tg.bot.get_updates(timeout=0)
-        if pending:
-            offset = pending[-1].update_id + 1
-            logger.info("Dropped %d pending Telegram updates", len(pending))
-    except Exception:
-        logger.warning("Failed to drop pending Telegram updates", exc_info=True)
-
-    while True:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=10)) as client:
         try:
-            updates = await app_tg.bot.get_updates(
-                offset=offset,
-                timeout=5,
-                read_timeout=10,
-                connect_timeout=10,
-                pool_timeout=10,
-                allowed_updates=Update.ALL_TYPES,
-            )
-            for update in updates:
-                offset = update.update_id + 1
-                await app_tg.process_update(update)
-        except asyncio.CancelledError:
-            raise
+            response = await client.post(api_url, json={"timeout": 0})
+            response.raise_for_status()
+            pending = response.json().get("result", [])
+            if pending:
+                offset = int(pending[-1]["update_id"]) + 1
+                logger.info("Dropped %d pending Telegram updates", len(pending))
         except Exception:
-            logger.warning("TG polling request failed; retrying", exc_info=True)
-            await asyncio.sleep(5)
+            logger.warning("Failed to drop pending Telegram updates", exc_info=True)
+
+        while True:
+            try:
+                payload = {
+                    "offset": offset,
+                    "timeout": 5,
+                    "allowed_updates": list(Update.ALL_TYPES),
+                }
+                response = await client.post(api_url, json=payload)
+                response.raise_for_status()
+                body = response.json()
+                if not body.get("ok"):
+                    raise RuntimeError(body.get("description") or "getUpdates failed")
+                for item in body.get("result", []):
+                    offset = int(item["update_id"]) + 1
+                    update = Update.de_json(item, app_tg.bot)
+                    await app_tg.process_update(update)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("TG polling request failed; retrying", exc_info=True)
+                await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
