@@ -1493,6 +1493,7 @@ class TestOpenAIJsonClient:
         kwargs = completions.create.call_args.kwargs
         assert kwargs["response_format"] == {"type": "json_object"}
         assert kwargs["model"] == "deepseek-chat"
+        assert "max_tokens" not in kwargs
         assert client.last_response == {
             "stage": "test",
             "model": "deepseek-chat",
@@ -1508,6 +1509,26 @@ class TestOpenAIJsonClient:
             "role": "assistant",
             "id": "chatcmpl-test",
         }
+
+    def test_uses_configured_max_tokens(self):
+        completions = MagicMock()
+        completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))],
+            usage=SimpleNamespace(),
+            model="glm-5-turbo",
+        )
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        client = OpenAIJsonClient(
+            base_url="https://example.test/v1",
+            api_key="test",
+            model="glm-5-turbo",
+            max_tokens=2048,
+            client=fake_client,
+        )
+
+        client.complete_json([{"role": "user", "content": "x"}], stage="test")
+
+        assert completions.create.call_args.kwargs["max_tokens"] == 2048
 
 
 class TestDecisionValidator:

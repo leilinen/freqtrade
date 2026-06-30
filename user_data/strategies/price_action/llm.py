@@ -19,6 +19,7 @@ class OpenAIJsonClient:
     model: str
     temperature: float = 0.1
     timeout: float = 60.0
+    max_tokens: int | None = None
     client: Any | None = None
     last_response: dict[str, Any] | None = None
 
@@ -36,17 +37,25 @@ class OpenAIJsonClient:
             model=config.get("pa_llm_model") or os.environ.get("PA_LLM_MODEL") or "deepseek-chat",
             temperature=float(config.get("pa_llm_temperature", 0.1)),
             timeout=float(config.get("pa_llm_timeout", 60)),
+            max_tokens=_optional_int(
+                config.get("pa_llm_max_tokens") or os.environ.get("PA_LLM_MAX_TOKENS")
+            ),
         )
 
     def complete_json(self, messages: list[dict[str, str]], *, stage: str) -> str:
         """Call chat.completions with JSON-object response_format."""
         client = self._client()
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "response_format": {"type": "json_object"},
+            "timeout": self.timeout,
+        }
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
         response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=self.temperature,
-            response_format={"type": "json_object"},
-            timeout=self.timeout,
+            **kwargs,
         )
         try:
             message = response.choices[0].message
@@ -74,6 +83,12 @@ class OpenAIJsonClient:
             raise LlmConfigurationError("openai SDK is not installed") from exc
         self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
         return self.client
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
 
 
 def _serialize_chat_response(

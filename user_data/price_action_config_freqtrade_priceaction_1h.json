@@ -11,6 +11,9 @@
   "pa_chart_port": 8091,
   "pa_agent_enabled": true,
   "pa_validation_retry_max": 1,
+  "pa_llm_window": 8,
+  "pa_llm_timeout": 180,
+  "pa_llm_max_tokens": 2048,
   "pa_incremental_stage1_enabled": true,
   "pa_incremental_stage1_max_new_bars": 10,
   "pa_decision_stance": "balanced",
@@ -27,7 +30,7 @@
     {
       "method": "DatabasePairList",
       "db_url": "postgresql://postgres:postgres@postgres:5432/freqtrade_priceaction",
-      "refresh_period": 3600
+      "refresh_period": 60
     }
   ],
   "pair_blacklist": [
