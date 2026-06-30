@@ -89,6 +89,8 @@ class DatabasePairList(IPairList):
             logger.exception("Failed to load pairs from database")
             return []
 
+        if not pairs:
+            return []
         return self._whitelist_for_active_markets(pairs)
 
     def filter_pairlist(self, pairlist: list[str], tickers: Tickers) -> list[str]:

@@ -17,10 +17,7 @@
   "pa_notify_wait": false,
   "exchange": {
     "name": "ashare",
-    "pair_whitelist": [
-      "510300/SH",
-      "588290/SH"
-    ]
+    "pair_whitelist": []
   },
   "pairlists": [
     {

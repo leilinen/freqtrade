@@ -1,6 +1,23 @@
 name: freqtrade_priceaction
 
 services:
+  init-db:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pa
+    image: freqtrade-priceaction-pa:latest
+    container_name: freqtrade_priceaction_init_db
+    restart: "no"
+    environment:
+      TZ: "Asia/Shanghai"
+      PA_DB_URL: "${PA_DB_URL:-postgresql://postgres:postgres@postgres:5432/freqtrade_priceaction}"
+    volumes:
+      - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    entrypoint: ["python"]
+    command: ["/freqtrade/docker/init_freqtrade_priceaction_db.py"]
+    networks:
+      - pricedog_default
+
   crypto-1h:
     build:
       context: ..
@@ -19,6 +36,9 @@ services:
       trade
       --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_1h.json
       --strategy PriceActionMonitor
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import os; [exit(0) for p in os.listdir('/proc') if p.isdigit() and 'freqtrade' in open(f'/proc/{p}/cmdline').read()] or exit(1)\""]
       interval: 2m
@@ -43,6 +63,9 @@ services:
       trade
       --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_4h.json
       --strategy PriceActionMonitor
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import os; [exit(0) for p in os.listdir('/proc') if p.isdigit() and 'freqtrade' in open(f'/proc/{p}/cmdline').read()] or exit(1)\""]
       interval: 2m
@@ -67,6 +90,9 @@ services:
       trade
       --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_ashare_1h.json
       --strategy PriceActionMonitor
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
     networks:
       - pricedog_default
 
@@ -85,6 +111,9 @@ services:
       trade
       --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_ashare_1d.json
       --strategy PriceActionMonitor
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
     networks:
       - pricedog_default
 
@@ -106,6 +135,9 @@ services:
          "crypto:4h":{"host":"freqtrade_priceaction_crypto_4h","port":8092},
          "ashare:1h":{"host":"freqtrade_priceaction_ashare_1h","port":8093},
          "ashare:1d":{"host":"freqtrade_priceaction_ashare_1d","port":8094}}
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
     networks:
       - pricedog_default
 

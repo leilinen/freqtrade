@@ -296,19 +296,31 @@ class PriceActionMonitor(IStrategy):
         logger.info("Chart HTTP server listening on port %d (/quote)", port)
 
     def _init_default_pairs(self) -> None:
-        """将默认标的写入 watch_pair 表（如不存在）。"""
+        """Optionally seed watch_pair rows for local smoke tests.
+
+        Production monitoring symbols are managed by tg-bot commands and stored
+        in watch_pair. Do not insert defaults unless explicitly requested.
+        """
         repository = self._get_repository()
         if not repository:
             return
         exchange_name = self.config.get("exchange", {}).get("name", "")
         if exchange_name == "ashare":
-            pairs = self.config.get("exchange", {}).get("pair_whitelist", [])
             market = "ashare"
         else:
-            pairs = DEFAULT_PAIRS
             market = "crypto"
         self._market = market
         repository.market = market
+        if not self.config.get("pa_seed_default_pairs", False):
+            logger.info(
+                "watch_pair seeding disabled; symbols are managed by tg-bot"
+            )
+            return
+
+        if market == "ashare":
+            pairs = self.config.get("exchange", {}).get("pair_whitelist", [])
+        else:
+            pairs = DEFAULT_PAIRS
 
         display_name_fetcher = None
         if market == "ashare":
