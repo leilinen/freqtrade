@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import logging
+import os
 from typing import Any, Callable
 
 from pandas import DataFrame
@@ -99,8 +100,8 @@ class PriceActionOrchestrator:
                 symbol=symbol,
                 timeframe=timeframe,
                 market=market,
-                window=int(self.config.get("pa_llm_window", 30)),
-                warmup=int(self.config.get("pa_llm_warmup", 50)),
+                window=_config_int(self.config, "pa_llm_window", "PA_LLM_WINDOW", 30),
+                warmup=_config_int(self.config, "pa_llm_warmup", "PA_LLM_WARMUP", 50),
             )
 
             previous = (
@@ -651,6 +652,20 @@ def _decision_stance(config: dict[str, Any]) -> str:
     value = str(config.get("pa_decision_stance") or "conservative").strip().lower()
     allowed = {"conservative", "balanced", "aggressive", "extreme_aggressive"}
     return value if value in allowed else "conservative"
+
+
+def _config_int(
+    config: dict[str, Any],
+    key: str,
+    env_key: str,
+    default: int,
+) -> int:
+    value = config.get(key)
+    if value is None or value == "":
+        value = os.environ.get(env_key)
+    if value is None or value == "":
+        return default
+    return int(value)
 
 
 def _use_incremental_stage1(

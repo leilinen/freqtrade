@@ -48,7 +48,7 @@ from price_action.features import (  # noqa: E402
 )
 from price_action.experience import retrieve_experience_cases  # noqa: E402
 from price_action.llm import OpenAIJsonClient  # noqa: E402
-from price_action.orchestrator import PriceActionOrchestrator  # noqa: E402
+from price_action.orchestrator import PriceActionOrchestrator, _config_int  # noqa: E402
 from price_action.prompts import (  # noqa: E402
     build_market_diagnosis_messages,
     build_trade_decision_messages,
@@ -1529,6 +1529,32 @@ class TestOpenAIJsonClient:
         client.complete_json([{"role": "user", "content": "x"}], stage="test")
 
         assert completions.create.call_args.kwargs["max_tokens"] == 2048
+
+    def test_from_config_reads_runtime_env_budget(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "sk-env",
+                "PA_LLM_TIMEOUT": "180",
+                "PA_LLM_MAX_TOKENS": "2048",
+            },
+            clear=False,
+        ):
+            client = OpenAIJsonClient.from_config({})
+
+        assert client.api_key == "sk-env"
+        assert client.timeout == 180
+        assert client.max_tokens == 2048
+
+
+class TestRuntimeConfig:
+    def test_config_int_uses_env_when_config_missing(self):
+        with patch.dict(os.environ, {"PA_LLM_WINDOW": "8"}, clear=False):
+            assert _config_int({}, "pa_llm_window", "PA_LLM_WINDOW", 30) == 8
+
+    def test_config_int_prefers_explicit_config(self):
+        with patch.dict(os.environ, {"PA_LLM_WINDOW": "8"}, clear=False):
+            assert _config_int({"pa_llm_window": 6}, "pa_llm_window", "PA_LLM_WINDOW", 30) == 6
 
 
 class TestDecisionValidator:

@@ -30,6 +30,9 @@ services:
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
       PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
       PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+      PA_LLM_WINDOW: "${PA_LLM_WINDOW:-8}"
+      PA_LLM_TIMEOUT: "${PA_LLM_TIMEOUT:-180}"
+      PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
     command: >
@@ -57,6 +60,9 @@ services:
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
       PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
       PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+      PA_LLM_WINDOW: "${PA_LLM_WINDOW:-8}"
+      PA_LLM_TIMEOUT: "${PA_LLM_TIMEOUT:-180}"
+      PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
     command: >
@@ -84,6 +90,9 @@ services:
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
       PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
       PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+      PA_LLM_WINDOW: "${PA_LLM_WINDOW:-8}"
+      PA_LLM_TIMEOUT: "${PA_LLM_TIMEOUT:-180}"
+      PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
     command: >
@@ -105,6 +114,9 @@ services:
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
       PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
       PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+      PA_LLM_WINDOW: "${PA_LLM_WINDOW:-8}"
+      PA_LLM_TIMEOUT: "${PA_LLM_TIMEOUT:-180}"
+      PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
     command: >

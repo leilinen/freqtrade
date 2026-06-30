@@ -35,8 +35,14 @@ class OpenAIJsonClient:
             or "https://api.deepseek.com",
             api_key=api_key,
             model=config.get("pa_llm_model") or os.environ.get("PA_LLM_MODEL") or "deepseek-chat",
-            temperature=float(config.get("pa_llm_temperature", 0.1)),
-            timeout=float(config.get("pa_llm_timeout", 60)),
+            temperature=float(
+                config.get("pa_llm_temperature")
+                or os.environ.get("PA_LLM_TEMPERATURE")
+                or 0.1
+            ),
+            timeout=float(
+                config.get("pa_llm_timeout") or os.environ.get("PA_LLM_TIMEOUT") or 60
+            ),
             max_tokens=_optional_int(
                 config.get("pa_llm_max_tokens") or os.environ.get("PA_LLM_MAX_TOKENS")
             ),
