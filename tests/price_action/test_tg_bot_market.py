@@ -136,6 +136,46 @@ class TestDecisionHttpFlow:
 
 
 # ===================================================================
+# Tests: /quote chart routing
+# ===================================================================
+
+
+class TestQuoteChartRoutes:
+    """图表路由必须支持新旧 price-action 服务并行部署。"""
+
+    def test_default_routes_keep_legacy_container_names(self):
+        routes = tg_bot._load_chart_routes("")
+
+        assert routes[("crypto", "1h")] == ("price-action-1h", 8091)
+        assert routes[("crypto", "4h")] == ("price-action-4h", 8092)
+        assert routes[("ashare", "1h")] == ("ashare-1h", 8093)
+        assert routes[("ashare", "1d")] == ("ashare-1d", 8094)
+
+    def test_env_routes_can_target_freqtrade_priceaction_stack(self):
+        raw = json.dumps({
+            "crypto:1h": {
+                "host": "freqtrade_priceaction_crypto_1h",
+                "port": 8091,
+            },
+            "ashare:1d": [
+                "freqtrade_priceaction_ashare_1d",
+                "8094",
+            ],
+        })
+
+        routes = tg_bot._load_chart_routes(raw)
+
+        assert routes[("crypto", "1h")] == (
+            "freqtrade_priceaction_crypto_1h",
+            8091,
+        )
+        assert routes[("ashare", "1d")] == (
+            "freqtrade_priceaction_ashare_1d",
+            8094,
+        )
+
+
+# ===================================================================
 # Tests: _normalize_ashare_code
 # ===================================================================
 

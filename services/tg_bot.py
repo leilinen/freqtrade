@@ -755,12 +755,64 @@ def authorized(update: Update) -> bool:
 
 # ---- /quote 路由表: (market, timeframe) -> (容器名, HTTP 端口) ----
 # 每个 freqtrade 容器只缓存自己 timeframe 的 OHLCV。
-CHART_ROUTES = {
+# 可用 CHART_ROUTES_JSON 覆盖，便于新旧 price-action 服务并行部署：
+# {"crypto:1h":{"host":"freqtrade_priceaction_crypto_1h","port":8091}, ...}
+DEFAULT_CHART_ROUTES = {
     ("crypto", "1h"): ("price-action-1h", 8091),
     ("crypto", "4h"): ("price-action-4h", 8092),
     ("ashare", "1h"): ("ashare-1h", 8093),
     ("ashare", "1d"): ("ashare-1d", 8094),
 }
+CHART_ROUTES = None
+
+
+def _load_chart_routes(raw: str | None = None) -> dict[tuple[str, str], tuple[str, int]]:
+    """Load /quote chart routes from CHART_ROUTES_JSON or return defaults."""
+    raw = raw if raw is not None else os.environ.get("CHART_ROUTES_JSON")
+    if not raw:
+        return dict(DEFAULT_CHART_ROUTES)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Invalid CHART_ROUTES_JSON; falling back to default routes")
+        return dict(DEFAULT_CHART_ROUTES)
+
+    routes: dict[tuple[str, str], tuple[str, int]] = {}
+    if not isinstance(data, dict):
+        logger.warning("CHART_ROUTES_JSON must be an object; falling back to default routes")
+        return dict(DEFAULT_CHART_ROUTES)
+
+    for key, value in data.items():
+        if not isinstance(key, str) or ":" not in key:
+            logger.warning("Invalid chart route key: %r", key)
+            continue
+        market, timeframe = key.split(":", 1)
+        market = market.strip().lower()
+        timeframe = timeframe.strip().lower()
+        host = None
+        port = None
+        if isinstance(value, dict):
+            host = value.get("host")
+            port = value.get("port")
+        elif isinstance(value, list | tuple) and len(value) == 2:
+            host, port = value
+        try:
+            port_int = int(port)
+        except (TypeError, ValueError):
+            logger.warning("Invalid chart route port for %s: %r", key, port)
+            continue
+        if not market or not timeframe or not isinstance(host, str) or not host.strip():
+            logger.warning("Invalid chart route value for %s: %r", key, value)
+            continue
+        routes[(market, timeframe)] = (host.strip(), port_int)
+
+    if not routes:
+        logger.warning("No valid CHART_ROUTES_JSON entries; falling back to default routes")
+        return dict(DEFAULT_CHART_ROUTES)
+    return routes
+
+
+CHART_ROUTES = _load_chart_routes()
 
 
 def _route_chart(symbol: str, timeframe: str) -> tuple[str, int] | None:

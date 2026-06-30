@@ -5,6 +5,7 @@ config*.json
 *.sqlite-wal
 logfile.txt
 user_data/*
+!user_data/price_action_config_freqtrade_priceaction_*.json
 !user_data/strategy/sample_strategy.py
 !user_data/strategies
 !user_data/strategies/price_action
@@ -105,6 +106,7 @@ target/
 .python-version
 
 .env
+docker/.env.freqtrade_priceaction
 .venv
 .idea
 .vscode
@@ -119,6 +121,7 @@ target/
 !config_examples/config_freqai.example.json
 
 docker-compose-*.yml
+!docker/docker-compose-freqtrade-priceaction.azure.yml
 
 # Local agent/project artifacts
 .claude/settings.local.json

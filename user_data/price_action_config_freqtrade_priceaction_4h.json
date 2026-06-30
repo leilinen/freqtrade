@@ -1,0 +1,64 @@
+{
+  "trading_mode": "spot",
+  "dry_run": true,
+  "dry_run_wallet": 10000,
+  "stake_currency": "USDT",
+  "stake_amount": "unlimited",
+  "max_open_trades": 4,
+  "timeframe": "4h",
+  "pa_db_url": "postgresql://postgres:postgres@postgres:5432/freqtrade_priceaction",
+  "tg_api_url": "http://freqtrade_priceaction_tg_bot:8090",
+  "pa_chart_port": 8092,
+  "pa_agent_enabled": true,
+  "pa_validation_retry_max": 1,
+  "pa_incremental_stage1_enabled": true,
+  "pa_incremental_stage1_max_new_bars": 10,
+  "pa_decision_stance": "balanced",
+  "pa_notify_wait": false,
+  "exchange": {
+    "name": "okx",
+    "key": "",
+    "secret": "",
+    "pair_whitelist": [],
+    "ccxt_config": {},
+    "ccxt_async_config": {}
+  },
+  "pairlists": [
+    {
+      "method": "DatabasePairList",
+      "db_url": "postgresql://postgres:postgres@postgres:5432/freqtrade_priceaction",
+      "refresh_period": 3600
+    }
+  ],
+  "pair_blacklist": [
+    "(BTCUP|BTCDOWN|.*3L|.*3S)/.*"
+  ],
+  "entry_pricing": {
+    "price_side": "other",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+  "exit_pricing": {
+    "price_side": "other",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+  "telegram": {
+    "enabled": false,
+    "token": "",
+    "chat_id": ""
+  },
+  "api_server": {
+    "enabled": false,
+    "listen_ip_address": "127.0.0.1",
+    "listen_port": 8080,
+    "username": "freqtrade",
+    "password": "freqtrade"
+  },
+  "bot_name": "freqtrade_priceaction_4h",
+  "initial_state": "running",
+  "force_entry_enable": false,
+  "internals": {
+    "process_throttle_secs": 240
+  }
+}

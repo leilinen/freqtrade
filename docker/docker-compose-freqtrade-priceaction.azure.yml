@@ -1,0 +1,112 @@
+services:
+  crypto-1h:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pa
+    image: freqtrade-priceaction-pa:latest
+    container_name: freqtrade_priceaction_crypto_1h
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
+      PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
+      PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+    volumes:
+      - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    command: >
+      trade
+      --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_1h.json
+      --strategy PriceActionMonitor
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os; [exit(0) for p in os.listdir('/proc') if p.isdigit() and 'freqtrade' in open(f'/proc/{p}/cmdline').read()] or exit(1)\""]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - pricedog_default
+
+  crypto-4h:
+    image: freqtrade-priceaction-pa:latest
+    container_name: freqtrade_priceaction_crypto_4h
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
+      PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
+      PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+    volumes:
+      - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    command: >
+      trade
+      --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_4h.json
+      --strategy PriceActionMonitor
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os; [exit(0) for p in os.listdir('/proc') if p.isdigit() and 'freqtrade' in open(f'/proc/{p}/cmdline').read()] or exit(1)\""]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - pricedog_default
+
+  ashare-1h:
+    image: freqtrade-priceaction-pa:latest
+    container_name: freqtrade_priceaction_ashare_1h
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
+      PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
+      PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+    volumes:
+      - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    command: >
+      trade
+      --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_ashare_1h.json
+      --strategy PriceActionMonitor
+    networks:
+      - pricedog_default
+
+  ashare-1d:
+    image: freqtrade-priceaction-pa:latest
+    container_name: freqtrade_priceaction_ashare_1d
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
+      PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
+      PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+    volumes:
+      - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    command: >
+      trade
+      --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_ashare_1d.json
+      --strategy PriceActionMonitor
+    networks:
+      - pricedog_default
+
+  tg-bot:
+    build:
+      context: ../services
+      dockerfile: Dockerfile.tg
+    image: freqtrade-priceaction-tg-bot:latest
+    container_name: freqtrade_priceaction_tg_bot
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      TG_TOKEN: "${TG_TOKEN:?set TG_TOKEN}"
+      TG_CHAT_ID: "${TG_CHAT_ID:?set TG_CHAT_ID}"
+      DB_URL: "${PA_DB_URL:-postgresql://postgres:postgres@postgres:5432/freqtrade_priceaction}"
+      API_PORT: "8090"
+      CHART_ROUTES_JSON: >
+        {"crypto:1h":{"host":"freqtrade_priceaction_crypto_1h","port":8091},
+         "crypto:4h":{"host":"freqtrade_priceaction_crypto_4h","port":8092},
+         "ashare:1h":{"host":"freqtrade_priceaction_ashare_1h","port":8093},
+         "ashare:1d":{"host":"freqtrade_priceaction_ashare_1d","port":8094}}
+    networks:
+      - pricedog_default
+
+networks:
+  pricedog_default:
+    external: true
