@@ -1273,7 +1273,10 @@ async def _poll_updates(app_tg: Application) -> None:
         try:
             updates = await app_tg.bot.get_updates(
                 offset=offset,
-                timeout=25,
+                timeout=5,
+                read_timeout=10,
+                connect_timeout=10,
+                pool_timeout=10,
                 allowed_updates=Update.ALL_TYPES,
             )
             for update in updates:
