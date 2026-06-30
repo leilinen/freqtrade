@@ -84,13 +84,22 @@ def _market_diagnosis(
     if gate_result == "proceed":
         gate_trace = [
             {
+                "node_id": "1.1",
+                "question": "K线数据是否足够完成市场诊断？",
+                "answer": "是",
+                "reason": "已提供足够的已收盘 K 线",
+                "branch": None,
+                "section": "数据检查",
+                "bar_range": "K5-K1",
+            },
+            {
                 "node_id": "1.2",
                 "question": "是否能识别出当前市场周期？",
                 "answer": "是",
                 "reason": "通道结构可识别",
                 "branch": cycle_position,
                 "section": "K线识别",
-                "bar_range": "K5-K1",
+                "bar_range": "K4-K1",
             },
             {
                 "node_id": "1.3",
@@ -99,7 +108,7 @@ def _market_diagnosis(
                 "reason": "",
                 "branch": None,
                 "section": "K线识别",
-                "bar_range": "K5-K1",
+                "bar_range": "K3-K1",
             },
             {
                 "node_id": "2.1",
@@ -108,7 +117,7 @@ def _market_diagnosis(
                 "reason": "",
                 "branch": direction,
                 "section": "方向判断",
-                "bar_range": "K5-K1",
+                "bar_range": "K4-K2",
             },
             {
                 "node_id": "2.2",
@@ -118,6 +127,24 @@ def _market_diagnosis(
                 "branch": "mixed",
                 "section": "背景判断",
                 "bar_range": "K5-K1",
+            },
+            {
+                "node_id": "2.3",
+                "question": "Always In 方向是否与顶层方向一致？",
+                "answer": "是",
+                "reason": "方向判断一致",
+                "branch": direction,
+                "section": "方向判断",
+                "bar_range": "K2-K1",
+            },
+            {
+                "node_id": "2.4",
+                "question": "当前是否没有明显反向陷阱？",
+                "answer": "是",
+                "reason": "未见反向陷阱",
+                "branch": None,
+                "section": "陷阱检查",
+                "bar_range": "K3-K2",
             },
             {
                 "node_id": "2.5",
@@ -547,6 +574,18 @@ class TestMarketStructureFeatures:
 
 
 class TestMarketDiagnosisPrompt:
+    def _features(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        return build_price_action_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+
     def test_prompt_template_metadata_exposes_file_hashes(self):
         metadata = prompt_template_metadata()
 
@@ -573,7 +612,7 @@ class TestMarketDiagnosisPrompt:
         assert '"cycle_position"' in content
         assert '"gate_trace"' in content
         assert '"gate_result"' in content
-        assert "1.2、1.3、2.1、2.2、2.5" in content
+        assert "1.1、1.2、1.3、2.1、2.2、2.3、2.4、2.5" in content
         assert '"market_state"' not in content
         assert '"signal_chain"' not in content
 
@@ -612,22 +651,63 @@ class TestMarketDiagnosisPrompt:
         assert "market_diagnosis_bar_analysis_bar_type_mismatch" in errors
 
     def test_market_diagnosis_validation_requires_proceed_gate_nodes(self):
-        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
-        features = build_price_action_features(
-            df,
-            symbol="BTC/USDT",
-            timeframe="1h",
-            market="crypto",
-            window=6,
-            warmup=0,
-            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
-        )
+        features = self._features()
         diagnosis = _market_diagnosis(features)
         diagnosis["gate_trace"] = diagnosis["gate_trace"][:2]
 
         errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
 
         assert "market_diagnosis_gate_trace_missing_proceed_nodes" in errors
+
+    def test_market_diagnosis_validation_rejects_trace_answer_and_order_errors(self):
+        features = self._features()
+        diagnosis = _market_diagnosis(features)
+        diagnosis["gate_trace"][0]["answer"] = "maybe"
+        diagnosis["gate_trace"][2], diagnosis["gate_trace"][3] = (
+            diagnosis["gate_trace"][3],
+            diagnosis["gate_trace"][2],
+        )
+
+        errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
+
+        assert "market_diagnosis_gate_trace_answer_invalid" in errors
+        assert "market_diagnosis_gate_trace_node_order_invalid" in errors
+
+    def test_market_diagnosis_validation_rejects_trace_bar_range_out_of_frame(self):
+        features = self._features()
+        diagnosis = _market_diagnosis(features)
+        diagnosis["gate_trace"][0]["bar_range"] = "K7-K1"
+
+        errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
+
+        assert "market_diagnosis_gate_trace_bar_range_out_of_frame" in errors
+
+    def test_market_diagnosis_validation_rejects_trace_branch_conflicts(self):
+        features = self._features()
+        diagnosis = _market_diagnosis(features)
+        diagnosis["gate_trace"][1]["branch"] = "spike"
+        diagnosis["gate_trace"][5]["branch"] = "bearish"
+
+        errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
+
+        assert "market_diagnosis_gate_trace_cycle_branch_conflict" in errors
+        assert "market_diagnosis_gate_trace_direction_branch_conflict" in errors
+
+    def test_market_diagnosis_validation_rejects_schema_enum_errors(self):
+        features = self._features()
+        diagnosis = _market_diagnosis(features)
+        diagnosis["support_levels"] = [100]
+        diagnosis["market_phase"] = "transitioning"
+        diagnosis["transition_risk"] = None
+        diagnosis["bar_by_bar_summary"][0]["role"] = "summary"
+        diagnosis["bar_by_bar_summary"][0]["follow_through"] = "later"
+
+        errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
+
+        assert "market_diagnosis_support_levels_items_must_be_strings" in errors
+        assert "market_diagnosis_transitioning_requires_transition_risk" in errors
+        assert "market_diagnosis_bar_by_bar_role_invalid" in errors
+        assert "market_diagnosis_bar_by_bar_follow_through_invalid" in errors
 
 
 class TestMarketDiagnosisRouting:
@@ -643,11 +723,14 @@ class TestMarketDiagnosisRouting:
         routed = route_strategies(diagnosis)
 
         assert [template.template_id for template in routed] == [
-            "trend_pullback_long",
-            "ema20_magnet_wait",
+            "上涨通道分析识别.txt",
+            "上涨通道交易策略.txt",
+            "文件13-窄通道与宽通道策略.txt",
+            "文件15-二次入场机会.txt",
+            "文件19-H1H2-L1L2计数.txt",
         ]
 
-    def test_routes_breakout_pattern_without_old_gate_shape(self):
+    def test_routes_breakout_pullback_overlay_without_old_gate_shape(self):
         diagnosis = {
             "cycle_position": "normal_channel",
             "direction": "bullish",
@@ -658,7 +741,84 @@ class TestMarketDiagnosisRouting:
 
         routed = route_strategies(diagnosis)
 
-        assert routed[0].template_id == "breakout_continuation_long"
+        assert [template.template_id for template in routed] == [
+            "上涨通道分析识别.txt",
+            "上涨通道交易策略.txt",
+            "文件13-窄通道与宽通道策略.txt",
+            "文件15-二次入场机会.txt",
+            "文件19-H1H2-L1L2计数.txt",
+            "文件18-突破失败与突破测试.txt",
+        ]
+
+    def test_routes_spike_ending_with_channel_playbooks(self):
+        diagnosis = {
+            "cycle_position": "spike",
+            "direction": "bearish",
+            "spike_stage": "ending",
+            "detected_patterns": [],
+        }
+
+        routed = route_strategies(diagnosis)
+
+        assert [template.template_id for template in routed] == [
+            "极速下跌分析识别.txt",
+            "极速下跌交易策略.txt",
+            "下跌通道分析识别.txt",
+            "下跌通道交易策略.txt",
+            "文件13-窄通道与宽通道策略.txt",
+        ]
+
+    def test_routes_alternative_cycle_and_recent_spike_then_dedupes(self):
+        diagnosis = {
+            "cycle_position": "trading_range",
+            "alternative_cycle_position": "normal_channel",
+            "direction": "bullish",
+            "trend_context": {"recent_spike": "bullish"},
+            "detected_patterns": ["barbwire"],
+        }
+
+        routed = route_strategies(diagnosis)
+
+        assert [template.template_id for template in routed] == [
+            "震荡区间分析识别.txt",
+            "震荡区间交易策略.txt",
+            "极速上涨分析识别.txt",
+            "极速上涨交易策略.txt",
+            "上涨通道分析识别.txt",
+            "上涨通道交易策略.txt",
+            "文件13-窄通道与宽通道策略.txt",
+            "文件21-铁丝网与无交易环境.txt",
+        ]
+
+    def test_routes_pattern_overlays_from_keywords(self):
+        diagnosis = {
+            "cycle_position": "unknown",
+            "direction": "neutral",
+            "detected_patterns": ["wedge", "mtr", "final_flag"],
+            "key_signals": [
+                "H2 计数入场后突破失败，形成上升三角形和双顶，"
+                "Always In 背景转弱，信号失败后价格靠近磁力位",
+            ],
+        }
+
+        routed = route_strategies(diagnosis)
+
+        assert [template.template_id for template in routed] == [
+            "文件14-楔形形态分析交易.txt",
+            "文件15-二次入场机会.txt",
+            "文件25-主要趋势反转MTR.txt",
+            "文件24-最终旗形与趋势末端.txt",
+            "文件19-H1H2-L1L2计数.txt",
+            "文件18-突破失败与突破测试.txt",
+            "文件20-AlwaysIn与20GB.txt",
+            "文件22-信号失败后的磁力位.txt",
+            "文件27-三角形与收敛形态.txt",
+            "文件28-双重顶底与微型结构.txt",
+        ]
+
+    def test_routes_unknown_and_extreme_to_empty_when_no_overlay(self):
+        assert route_strategies({"cycle_position": "unknown", "direction": "neutral"}) == []
+        assert route_strategies({"cycle_position": "extreme_tr", "direction": "bearish"}) == []
 
     def test_experience_lookup_uses_market_diagnosis_fields(self):
         repository = MagicMock()
