@@ -1183,7 +1183,6 @@ async def main() -> None:
 
     logger.info("Starting TG bot polling...")
     await app_tg.initialize()
-    await app_tg.start()
     from telegram import BotCommand
     await app_tg.bot.set_my_commands([
         BotCommand(command, description)
@@ -1246,7 +1245,6 @@ async def main() -> None:
         except asyncio.CancelledError:
             pass
         try:
-            await app_tg.stop()
             await app_tg.shutdown()
         except Exception:
             pass
