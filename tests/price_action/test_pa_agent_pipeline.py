@@ -1112,6 +1112,83 @@ class TestMarketDiagnosisOrchestrator:
         }
         assert kwargs["exception"] is None
 
+    def test_actionable_trade_flows_to_save_and_telegram_notification(self):
+        df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
+        features = build_price_action_features(
+            df,
+            symbol="BTC/USDT",
+            timeframe="1h",
+            market="crypto",
+            window=6,
+            warmup=0,
+            now=pd.Timestamp("2026-06-01 14:30", tz="UTC"),
+        )
+        diagnosis = _market_diagnosis(features)
+        decision = _trade_decision(
+            order_type="突破单",
+            entry=105,
+            stop=101,
+            tp1=109,
+            tp2=111,
+            estimated_win_rate=60,
+            diagnosis=diagnosis,
+        )
+        responses = [
+            ("market_diagnosis", json.dumps(diagnosis, ensure_ascii=False)),
+            ("trade_decision", json.dumps(decision, ensure_ascii=False)),
+        ]
+        llm = MagicMock()
+        llm.model = "test-model"
+        llm.base_url = "https://example.test"
+
+        def complete_json(_messages, *, stage):
+            expected_stage, content = responses.pop(0)
+            assert stage == expected_stage
+            llm.last_response = {
+                "stage": stage,
+                "model": llm.model,
+                "content": content,
+                "usage": {},
+            }
+            return content
+
+        llm.complete_json.side_effect = complete_json
+        repository = MagicMock()
+        repository.get_previous_successful_analysis.return_value = None
+        repository.query_experience.return_value = [{"id": 1, "title": "case"}]
+        repository.save_analysis.return_value = True
+        notifier = MagicMock()
+        orchestrator = PriceActionOrchestrator(
+            repository=repository,
+            llm_client=llm,
+            config={"pa_llm_window": 6, "pa_llm_warmup": 0},
+        )
+
+        outcome = orchestrator.analyze(
+            symbol="BTC/USDT",
+            dataframe=df,
+            timeframe="1h",
+            market="crypto",
+            notifier=notifier,
+            chart_generator=lambda *args, **kwargs: b"chart",
+        )
+
+        assert outcome.status == "success"
+        assert outcome.decision["decision"]["order_type"] == "突破单"
+        save_kwargs = repository.save_analysis.call_args.kwargs
+        assert save_kwargs["status"] == "success"
+        assert save_kwargs["validation_status"] == "valid"
+        assert save_kwargs["trade_decision"] == outcome.decision
+        assert save_kwargs["experience_cases"] == [{"id": 1, "title": "case"}]
+        notifier.notify_decision.assert_called_once()
+        notify_args = notifier.notify_decision.call_args
+        assert notify_args.args[0] == "BTC/USDT"
+        payload = notify_args.args[2]
+        assert payload["decision"] == outcome.decision
+        assert payload["validation"]["valid"] is True
+        assert payload["diagnosis"] == diagnosis
+        assert payload["experience_cases"] == [{"id": 1, "title": "case"}]
+
     def test_market_diagnosis_validation_retry_uses_feedback(self):
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
         features = build_price_action_features(

@@ -22,6 +22,11 @@ api_key 优先从 config 读，其次 DEEPSEEK_API_KEY 环境变量。
   pa_llm_window / pa_llm_warmup:
     特征工程取最近 N 根已收盘 K、warmup 预热根数（默认 30 / 50）
   pa_experience_limit: 经验库检索条数（默认 3）
+  pa_validation_retry_max: LLM JSON 校验失败后的自动重试次数（默认 0，最大 3）
+  pa_incremental_stage1_enabled:
+    是否复用上一轮成功记录做阶段一增量分析（默认 true）
+  pa_incremental_stage1_max_new_bars: 增量阶段一允许的最大新增 K 线数（默认 10）
+  pa_decision_stance: 交易倾向 conservative/balanced/aggressive/extreme_aggressive
   pa_notify_wait: wait/avoid 是否也推送（默认 false，仅 enter 推送）
 """
 
