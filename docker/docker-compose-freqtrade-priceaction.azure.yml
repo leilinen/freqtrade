@@ -14,7 +14,7 @@ services:
     volumes:
       - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
     entrypoint: ["python"]
-    command: ["/freqtrade/docker/init_freqtrade_priceaction_db.py"]
+    command: ["/freqtrade/user_data/strategies/price_action/init_db.py"]
     networks:
       - pricedog_default
 
