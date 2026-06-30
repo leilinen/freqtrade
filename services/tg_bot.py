@@ -50,6 +50,8 @@ BOT_COMMAND_SPECS = [
     ("pa_help", "帮助"),
 ]
 
+TELEGRAM_POLL_LOCK = asyncio.Lock()
+
 
 # ================================================================
 # Database helpers
@@ -1263,7 +1265,8 @@ async def _poll_updates(app_tg: Application) -> None:
     offset = None
     async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=10)) as client:
         try:
-            response = await client.post(api_url, json={"timeout": 0})
+            async with TELEGRAM_POLL_LOCK:
+                response = await client.post(api_url, json={"timeout": 0})
             response.raise_for_status()
             pending = response.json().get("result", [])
             if pending:
@@ -1279,7 +1282,8 @@ async def _poll_updates(app_tg: Application) -> None:
                     "timeout": 5,
                     "allowed_updates": list(Update.ALL_TYPES),
                 }
-                response = await client.post(api_url, json=payload)
+                async with TELEGRAM_POLL_LOCK:
+                    response = await client.post(api_url, json=payload)
                 response.raise_for_status()
                 body = response.json()
                 if not body.get("ok"):
