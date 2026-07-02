@@ -52,7 +52,14 @@ from price_action.llm import (  # noqa: E402
     OpenAIJsonClient,
     build_llm_client,
 )
-from price_action.orchestrator import PriceActionOrchestrator, _config_int  # noqa: E402
+from price_action.orchestrator import (  # noqa: E402
+    PriceActionOrchestrator,
+    _categorize_errors,
+    _config_int,
+    _retry_limit_for_errors,
+    _semantic_retry_limit,
+    _validation_retry_limit,
+)
 from price_action.prompts import (  # noqa: E402
     build_market_diagnosis_messages,
     build_trade_decision_messages,
@@ -2107,6 +2114,119 @@ class TestRuntimeConfig:
     def test_config_int_prefers_explicit_config(self):
         with patch.dict(os.environ, {"PA_LLM_WINDOW": "8"}, clear=False):
             assert _config_int({"pa_llm_window": 6}, "pa_llm_window", "PA_LLM_WINDOW", 30) == 6
+
+
+class TestJsonSyntaxRepair:
+    """Test JSON repair layer in parse_json_object.
+
+    Ported from PA_Agent json_validator.py:144-372. Verifies that common
+    glm-5.x LLM output errors (unbalanced brackets, truncated, control
+    chars in strings) get repaired at parse time without consuming retry.
+    """
+
+    def test_unbalanced_brackets_repaired(self):
+        """Missing closing brace gets appended."""
+        result = parse_json_object('{"a": 1')
+        assert result == {"a": 1}
+
+    def test_truncated_array_repaired(self):
+        """Missing closing bracket for array."""
+        result = parse_json_object('{"k": [1, 2')
+        assert result == {"k": [1, 2]}
+
+    def test_control_char_in_string_repaired(self):
+        """Raw newline inside string literal gets escaped to \\n."""
+        # Raw newline in the middle of a string value
+        raw = '{"r": "line1\nline2"}'
+        result = parse_json_object(raw)
+        assert result == {"r": "line1\nline2"}
+
+    def test_truncated_in_gate_trace_gets_tail_injected(self):
+        """Truncated at a comma before gate_trace → AUTO stub appended."""
+        raw = '{"cycle_position": "trading_range", '
+        result = parse_json_object(raw)
+        assert result["cycle_position"] == "trading_range"
+        assert "gate_trace" in result
+        assert result["gate_result"] == "unknown"
+
+    def test_already_valid_json_not_modified(self):
+        """Valid JSON parses unchanged."""
+        result = parse_json_object('{"a": 1}')
+        assert result == {"a": 1}
+
+    def test_garbage_text_falls_through_to_extract(self):
+        """Pure prose without leading { → falls through to _extract_json_object_text.
+
+        parse_json_object raises ValueError if no JSON object can be extracted.
+        """
+        with pytest.raises(ValueError):
+            parse_json_object("hello world no json here")
+
+    def test_fenced_json_still_works(self):
+        """Markdown-fenced JSON still parsed after repair layer."""
+        raw = '```json\n{"a": 1}\n```'
+        assert parse_json_object(raw) == {"a": 1}
+
+
+class TestCategoryAwareRetry:
+    """Tests for _categorize_errors and _retry_limit_for_errors.
+
+    Verifies that JSON syntax errors (a) and missing fields (b) get the
+    base retry limit, while schema/semantic conflicts (c) are capped at
+    the semantic limit (default 1).
+    """
+
+    def test_json_syntax_error_is_category_a(self):
+        errors = ["ValueError:JSONDecodeError:Expecting ',' delimiter: line 1"]
+        assert _categorize_errors(errors) == "a"
+
+    def test_invalid_json_token_is_category_a(self):
+        errors = ["invalid_json:Expecting value"]
+        assert _categorize_errors(errors) == "a"
+
+    def test_schema_conflict_is_category_c(self):
+        errors = ["market_diagnosis_gate_trace_cycle_branch_conflict"]
+        assert _categorize_errors(errors) == "c"
+
+    def test_missing_field_is_category_b(self):
+        errors = ["market_diagnosis_direction_required"]
+        assert _categorize_errors(errors) == "b"
+
+    def test_empty_errors_is_ok(self):
+        assert _categorize_errors([]) == "ok"
+
+    def test_retry_limit_for_syntax_errors_uses_base(self):
+        errors = ["ValueError:JSONDecodeError:..."]
+        # config base = 3
+        assert _retry_limit_for_errors(errors, {"pa_validation_retry_max": 3}) == 3
+
+    def test_retry_limit_for_schema_conflict_uses_semantic(self):
+        errors = ["market_diagnosis_gate_trace_cycle_branch_conflict"]
+        # min(base=3, semantic=1) = 1
+        assert _retry_limit_for_errors(errors, {"pa_validation_retry_max": 3}) == 1
+
+    def test_retry_limit_for_empty_errors_is_zero(self):
+        assert _retry_limit_for_errors([], {"pa_validation_retry_max": 3}) == 0
+
+
+class TestValidationRetryLimitBound:
+    """Upper bound of _validation_retry_limit raised from 3 → 5."""
+
+    def test_retry_limit_clamped_to_5(self):
+        """Setting retry_max=99 returns 5 (was previously 3)."""
+        assert _validation_retry_limit({"pa_validation_retry_max": 99}) == 5
+
+    def test_retry_limit_default_zero(self):
+        assert _validation_retry_limit({}) == 0
+
+    def test_retry_limit_within_bound(self):
+        assert _validation_retry_limit({"pa_validation_retry_max": 4}) == 4
+
+    def test_semantic_retry_limit_default_one(self):
+        assert _semantic_retry_limit({}) == 1
+
+    def test_semantic_retry_limit_clamped_to_three(self):
+        assert _semantic_retry_limit({"pa_validation_retry_semantic_max": 99}) == 3
 
 
 class TestDecisionValidator:

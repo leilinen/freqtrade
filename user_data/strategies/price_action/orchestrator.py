@@ -381,12 +381,14 @@ class PriceActionOrchestrator:
         feature_rows: list[dict[str, Any]],
         raw_responses: dict[str, Any],
     ) -> tuple[str, dict[str, Any], list[dict[str, str]]]:
-        retry_limit = _validation_retry_limit(self.config)
+        # retry_limit 改为按错误类别动态计算:首轮用 base 上限兜底,
+        # 首次失败后根据具体 errors 精修。
         failed_attempts: list[dict[str, Any]] = []
         current_messages = list(messages)
         last_errors: list[str] = []
+        attempt = 0
 
-        for attempt in range(retry_limit + 1):
+        while True:
             raw_text = self.llm_client.complete_json(
                 current_messages,
                 stage="market_diagnosis",
@@ -406,6 +408,7 @@ class PriceActionOrchestrator:
 
             last_errors = errors
             raw_record["validation_errors"] = errors
+            retry_limit = _retry_limit_for_errors(errors, self.config)
             if attempt >= retry_limit:
                 if failed_attempts:
                     raw_record["retry_attempts"] = failed_attempts
@@ -417,6 +420,7 @@ class PriceActionOrchestrator:
                 stage="market_diagnosis",
                 errors=errors,
             )
+            attempt += 1
 
         raise ValueError(f"market_diagnosis_invalid:{','.join(last_errors)}")
 
@@ -430,11 +434,11 @@ class PriceActionOrchestrator:
         strategies: list[dict[str, Any]],
         raw_responses: dict[str, Any],
     ) -> tuple[str, dict[str, Any] | None, Any, list[dict[str, str]]]:
-        retry_limit = _validation_retry_limit(self.config)
         failed_attempts: list[dict[str, Any]] = []
         current_messages = list(messages)
+        attempt = 0
 
-        for attempt in range(retry_limit + 1):
+        while True:
             raw_text = self.llm_client.complete_json(
                 current_messages,
                 stage="trade_decision",
@@ -454,6 +458,7 @@ class PriceActionOrchestrator:
                 return raw_text, decision_json, validation, current_messages
 
             raw_record["validation_errors"] = validation.errors
+            retry_limit = _retry_limit_for_errors(validation.errors, self.config)
             if attempt >= retry_limit:
                 if failed_attempts:
                     raw_record["retry_attempts"] = failed_attempts
@@ -465,8 +470,7 @@ class PriceActionOrchestrator:
                 stage="trade_decision",
                 errors=validation.errors,
             )
-
-        raise RuntimeError("unreachable_trade_decision_retry_state")
+            attempt += 1
 
     def _should_notify(self, decision_json: dict[str, Any] | None) -> bool:
         if not decision_json:
@@ -626,11 +630,69 @@ def _usage_total_from_responses(raw_responses: dict[str, Any]) -> dict[str, Any]
 
 
 def _validation_retry_limit(config: dict[str, Any]) -> int:
+    """总 retry 上限,默认 0,允许上调到 5。
+
+    上调到 5 对应上游 PA_Agent ``ValidationSettings.retry_max`` 的 ``le=5`` 上限。
+    """
     try:
         value = int(config.get("pa_validation_retry_max", 0))
     except (TypeError, ValueError):
         return 0
+    return max(0, min(value, 5))
+
+
+def _semantic_retry_limit(config: dict[str, Any]) -> int:
+    """schema/语义类错误的 retry 上限(上游 retry_max_semantic=1)。
+
+    这类错误 retry 成功率低,默认 1 次足够,避免浪费 token。
+    """
+    try:
+        value = int(config.get("pa_validation_retry_semantic_max", 1))
+    except (TypeError, ValueError):
+        return 1
     return max(0, min(value, 3))
+
+
+def _categorize_errors(errors: list[str]) -> str:
+    """把 validate_market_diagnosis 返回的错误列表归到 a/b/c/d/e 类别之一。
+
+    参考 PA_Agent ``json_validator.py:522-537, 687-696`` 和
+    ``retry_policy.py:39-50`` 的 retry 上限映射:
+
+    - ``a`` JSON 语法错误:retry_max=base(默认 3)
+    - ``b`` 缺失必填字段:retry_max=base
+    - ``c`` schema/语义冲突:retry_max=min(base, semantic=1)
+    - ``d`` 非 JSON 纯文本:retry_max=base
+    - ``e`` provider quota/rate limit:不 retry(0)
+    """
+    if not errors:
+        return "ok"
+    if any("quota" in e.lower() or "rate_limit" in e.lower() for e in errors):
+        return "e"
+    # a: parse 阶段抛出的 JSONDecodeError(被 orchestrator 包装成 ValueError)
+    if any(e.startswith("ValueError") and "JSONDecodeError" in e for e in errors):
+        return "a"
+    if any("invalid_json" in e for e in errors):
+        return "a"
+    # d: 非 JSON 纯文本(parse 阶段拿到空内容、纯文本)
+    if any("Expecting value" in e for e in errors):
+        return "d"
+    # b: 缺失必填字段
+    if any("required" in e.lower() or "missing" in e.lower() for e in errors):
+        return "b"
+    # c: 其他 schema/语义冲突
+    return "c"
+
+
+def _retry_limit_for_errors(errors: list[str], config: dict[str, Any]) -> int:
+    """根据错误类别返回 retry 上限。"""
+    cat = _categorize_errors(errors)
+    if cat in ("ok", "e"):
+        return 0
+    base = _validation_retry_limit(config)
+    if cat == "c":
+        return min(base, _semantic_retry_limit(config))
+    return base
 
 
 def _append_retry_feedback(

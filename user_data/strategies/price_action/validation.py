@@ -696,11 +696,21 @@ def parse_json_object(raw_response: str) -> dict[str, Any]:
     Some OpenAI-compatible providers accept ``response_format`` but still wrap
     JSON in Markdown fences. Keep raw response persistence unchanged, but make
     validation tolerant enough to parse those provider responses.
+    When ``json.loads`` fails, first try to repair truncated / unbalanced /
+    control-char-laden JSON (ported from PA_Agent json_validator.py); only
+    fall back to brace-fence extraction if repair returns nothing.
     """
     try:
         parsed = json.loads(raw_response)
     except json.JSONDecodeError:
-        parsed = json.loads(_extract_json_object_text(raw_response))
+        repaired = _try_repair_json_syntax(raw_response, allow_tail_inject=True)
+        if repaired is not None:
+            try:
+                parsed = json.loads(repaired)
+            except json.JSONDecodeError:
+                parsed = json.loads(_extract_json_object_text(raw_response))
+        else:
+            parsed = json.loads(_extract_json_object_text(raw_response))
     if not isinstance(parsed, dict):
         raise ValueError("LLM response root must be a JSON object")
     return parsed
@@ -723,6 +733,147 @@ def _extract_json_object_text(raw_response: str) -> str:
     if start >= 0 and end > start:
         return text[start:end + 1]
     return text
+
+
+# ================================================================
+# JSON syntax repair (ported from PA_Agent json_validator.py:144-372)
+# ================================================================
+
+
+def _escape_control_chars_in_json_strings(text: str) -> str:
+    """Escape raw newlines/tabs/control chars inside JSON string literals.
+
+    glm-5.x 偶发在 reason 字段里塞裸 \\n / \\t / 其他控制字符,
+    会让 ``json.loads`` 直接报 ``JSONDecodeError``。
+    本函数用状态机扫描,只在字符串字面量内转义,结构字符不受影响。
+    Ported from PA_Agent ``json_validator.py:144-177``.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            continue
+        if escape:
+            escape = False
+            out.append(ch)
+            continue
+        if ch == "\\":
+            escape = True
+            out.append(ch)
+            continue
+        if ch == '"':
+            in_string = False
+            out.append(ch)
+            continue
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch < " ":
+            # 其他 ASCII 控制字符直接丢弃(LLM 不应在中文 JSON 里塞这些)。
+            continue
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _balance_json_brackets(text: str) -> str:
+    """Close unclosed ``{`` / ``[`` outside JSON strings via stack scan.
+
+    处理 LLM 输出被 max_tokens 截断、最后一根 ``}`` 丢失的情况。
+    不能简单 append ``}`` —— 需要按栈深度反向闭合。
+    Ported from PA_Agent ``json_validator.py:305-331``.
+    """
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            stack.append("{")
+        elif ch == "[":
+            stack.append("[")
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+    closers = "".join("]" if opener == "[" else "}" for opener in reversed(stack))
+    return text + closers
+
+
+def _inject_stage1_missing_tail(text: str) -> str:
+    """Append minimal gate_trace stub when stage1 JSON was truncated mid-object.
+
+    仅在 ``text`` 是**未闭合** JSON(外层 ``{`` 没有对应 ``}``)时才注入。
+    完整闭合的 JSON(``{...}``)不应被注入,否则会产生 ``Extra data`` 错误。
+    """
+    tail = text.rstrip()
+    if not tail.endswith((",", "]", "}")):
+        return text
+    # 检查是否未闭合:用 _balance_json_brackets 试一下,若需要补 } 才说明截断了
+    balanced = _balance_json_brackets(tail)
+    if balanced == tail:
+        # 已经闭合(多余的尾随 , ] } 不存在),不注入
+        return text
+    if not tail.endswith(","):
+        tail += ","
+    stub_trace = (
+        '{"node_id":"AUTO","question":"输出是否在gate_trace前被截断?",'
+        '"answer":"否","reason":"JSON在gate_trace前截断,程序已补全最小闸门记录",'
+        '"bar_range":"K1"}'
+    )
+    tail += f'"gate_trace":[{stub_trace}],"gate_result":"unknown"'
+    return _balance_json_brackets(tail)
+
+
+def _try_repair_json_syntax(
+    text: str,
+    *,
+    allow_tail_inject: bool = False,
+) -> str | None:
+    """Return repaired JSON text when truncation caused a syntax error, else None.
+
+    编排顺序:
+    1. 转义字符串内控制字符(最常见,无副作用)
+    2. 若 stage1 且允许,先尝试 tail_inject(补齐 gate_trace 末尾)
+    3. 平衡未闭合的括号
+    4. 修复后必须能 ``json.loads`` 通过,否则视为不可修复
+
+    Ported from PA_Agent ``json_validator.py:352-372``.
+    """
+    if not text.strip().startswith("{"):
+        return None
+    candidate = text.rstrip()
+    if allow_tail_inject:
+        candidate = _inject_stage1_missing_tail(candidate)
+    candidate = _balance_json_brackets(candidate)
+    # 控制字符转义必须最后做(否则会破坏栈扫描的状态机)
+    escaped = _escape_control_chars_in_json_strings(candidate)
+    if escaped != candidate:
+        candidate = escaped
+    if candidate == text.rstrip():
+        return None
+    try:
+        json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return candidate
 
 
 def validate_market_diagnosis(
