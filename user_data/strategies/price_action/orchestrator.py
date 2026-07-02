@@ -12,6 +12,7 @@ from pandas import DataFrame
 from .experience import retrieve_experience_cases
 from .features import PriceActionFeatureResult, build_price_action_features
 from .llm import OpenAIJsonClient
+from .normalize import normalize_market_diagnosis, normalize_trade_decision
 from .prompts import (
     build_incremental_market_diagnosis_messages,
     build_market_diagnosis_messages,
@@ -20,7 +21,13 @@ from .prompts import (
 )
 from .repository import PriceActionRepository
 from .router import route_strategies
-from .validation import DecisionValidator, parse_json_object, validate_market_diagnosis
+from .validation import (
+    CHECK_JSON_SYNTAX,
+    DecisionValidator,
+    ValidationResult,
+    parse_json_object,
+    validate_market_diagnosis,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -396,6 +403,7 @@ class PriceActionOrchestrator:
             raw_record = self._capture_llm_response("market_diagnosis", raw_text)
             try:
                 parsed = parse_json_object(raw_text)
+                parsed = normalize_market_diagnosis(parsed, feature_rows=feature_rows)
                 errors = validate_market_diagnosis(parsed, feature_rows=feature_rows)
             except Exception as exc:
                 parsed = None
@@ -444,13 +452,33 @@ class PriceActionOrchestrator:
                 stage="trade_decision",
             )
             raw_record = self._capture_llm_response("trade_decision", raw_text)
-            decision_json, validation = self.validator.validate(
-                raw_text,
-                diagnosis=diagnosis,
-                price_action_features=price_action_features,
-                feature_rows=feature_rows,
-                strategies=strategies,
-            )
+            try:
+                parsed = parse_json_object(raw_text)
+                parsed = normalize_trade_decision(
+                    parsed,
+                    diagnosis=diagnosis,
+                    feature_rows=feature_rows,
+                )
+            except json.JSONDecodeError as exc:
+                parsed = None
+                validation = ValidationResult(
+                    False, [CHECK_JSON_SYNTAX], [f"invalid_json:{exc.msg}"]
+                )
+                decision_json = None
+            except ValueError:
+                parsed = None
+                validation = ValidationResult(
+                    False, [CHECK_JSON_SYNTAX], ["json_root_must_be_object"]
+                )
+                decision_json = None
+            else:
+                decision_json, validation = self.validator.validate_parsed(
+                    parsed,
+                    diagnosis=diagnosis,
+                    price_action_features=price_action_features,
+                    feature_rows=feature_rows,
+                    strategies=strategies,
+                )
             if validation.valid:
                 if failed_attempts:
                     raw_record["retry_attempts"] = failed_attempts

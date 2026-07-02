@@ -181,6 +181,50 @@ class DecisionValidator:
         except ValueError:
             return None, ValidationResult(False, checks, ["json_root_must_be_object"])
 
+        return self._validate_parsed_core(
+            parsed,
+            checks,
+            diagnosis=diagnosis,
+            price_action_features=price_action_features,
+            feature_rows=feature_rows,
+            strategies=strategies or [],
+        )
+
+    def validate_parsed(
+        self,
+        parsed: dict[str, Any],
+        *,
+        diagnosis: dict[str, Any],
+        price_action_features: dict[str, Any],
+        feature_rows: list[dict[str, Any]] | None = None,
+        strategies: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any] | None, ValidationResult]:
+        """Validate an already-parsed (and typically normalized) dict.
+
+        Skips JSON parsing — used when the orchestrator runs
+        :func:`normalize_trade_decision` between parse and validate.
+        """
+        checks: list[str] = [CHECK_JSON_SYNTAX]
+        return self._validate_parsed_core(
+            parsed,
+            checks,
+            diagnosis=diagnosis,
+            price_action_features=price_action_features,
+            feature_rows=feature_rows,
+            strategies=strategies or [],
+        )
+
+    def _validate_parsed_core(
+        self,
+        parsed: dict[str, Any],
+        checks: list[str],
+        *,
+        diagnosis: dict[str, Any],
+        price_action_features: dict[str, Any],
+        feature_rows: list[dict[str, Any]] | None,
+        strategies: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, ValidationResult]:
+        """Shared validation pipeline (stage consistency → semantic → numeric)."""
         checks.append(CHECK_STAGE_CONSISTENCY)
         errors = self._stage_consistency_errors(parsed, diagnosis)
         if errors:
@@ -192,7 +236,7 @@ class DecisionValidator:
             diagnosis,
             price_action_features,
             feature_rows,
-            strategies or [],
+            strategies,
         )
         if errors:
             return parsed, ValidationResult(False, checks, errors)
