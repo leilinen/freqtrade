@@ -1219,6 +1219,106 @@ class TestSyncGate12WithCycle:
         assert node_12.get("skipped") is True
 
 
+class TestRepairGateResult:
+    """gate_result=wait/unknown 在无阻塞条件时自动改写为 proceed。
+
+    参考 PA_Agent ``_repair_gate_result``(trace_normalize.py:778-811)。
+    常见 LLM 偏差:周期/方向已识别但 2.x 节点出现"否",LLM 把 gate_result
+    误设为 wait。这里测试 validate_market_diagnosis 内嵌的修正行为。
+    """
+
+    @staticmethod
+    def _diagnosis(*, gate_result: str, node_12_answer: str, node_13_answer: str) -> dict:
+        return {
+            "cycle_position": "trading_range",
+            "direction": "neutral",
+            "diagnosis_confidence": 60,
+            "spike_stage": None,
+            "climax_risk": "none",
+            "market_phase": "trending",
+            "transition_risk": "low",
+            "detected_patterns": ["trend_bull"],
+            "key_signals": ["K1 trend_bull"],
+            "htf_context": "ok",
+            "entry_setup": "breakout_pullback",
+            "support_levels": ["100.0"],
+            "resistance_levels": ["110.0"],
+            "strategy_files_needed": ["a.md"],
+            "risk_warning": "n/a",
+            "bar_analysis": {
+                "always_in": "long",
+                "last_closed_bar": "K1",
+                "bar_type": "trend_bull",
+                "signal_bar": {"bar": "K1", "quality": "medium", "pattern": "p", "reason": "r"},
+                "entry_setup_type": "breakout_pullback",
+                "follow_through": "pending",
+            },
+            "bar_by_bar_summary": [
+                {"bar": "K5", "role": "noise", "bar_type": "doji", "context_effect": "neutral",
+                 "follow_through": "no", "trapped_side": "none", "reason": "r"},
+                {"bar": "K4", "role": "noise", "bar_type": "doji", "context_effect": "neutral",
+                 "follow_through": "no", "trapped_side": "none", "reason": "r"},
+                {"bar": "K3", "role": "noise", "bar_type": "doji", "context_effect": "neutral",
+                 "follow_through": "no", "trapped_side": "none", "reason": "r"},
+                {"bar": "K2", "role": "noise", "bar_type": "doji", "context_effect": "neutral",
+                 "follow_through": "no", "trapped_side": "none", "reason": "r"},
+                {"bar": "K1", "role": "signal", "bar_type": "trend_bull", "context_effect": "strengthens_bull",
+                 "follow_through": "pending", "trapped_side": "bears", "reason": "r"},
+            ],
+            "gate_trace": [
+                {"node_id": "1.1", "question": "q", "answer": "否", "branch": "trading_range",
+                 "section": "周期识别", "bar_range": "K5-K1", "reason": "r"},
+                {"node_id": "1.2", "question": "q", "answer": node_12_answer, "branch": "trading_range",
+                 "section": "周期识别", "bar_range": "K8-K1", "reason": "r"},
+                {"node_id": "1.3", "question": "q", "answer": node_13_answer, "branch": None,
+                 "section": "周期识别", "bar_range": "K8-K1", "reason": "r"},
+                {"node_id": "2.1", "question": "q", "answer": "是", "branch": "bullish",
+                 "section": "方向与闸门", "bar_range": "K1", "reason": "r"},
+                {"node_id": "2.2", "question": "q", "answer": "是", "branch": None,
+                 "section": "方向与闸门", "bar_range": "K1", "reason": "r"},
+                {"node_id": "2.3", "question": "q", "answer": "是", "branch": "bullish",
+                 "section": "方向与闸门", "bar_range": "K1", "reason": "r"},
+                {"node_id": "2.4", "question": "q", "answer": "否", "branch": None,
+                 "section": "方向与闸门", "bar_range": "K1", "reason": "r"},
+                {"node_id": "2.5", "question": "q", "answer": "是", "branch": None,
+                 "section": "方向与闸门", "bar_range": "K8-K1", "reason": "r"},
+            ],
+            "gate_result": gate_result,
+        }
+
+    def test_wait_with_no_blocking_condition_repaired_to_proceed(self):
+        """ETH 4h 那种场景:1.2=是、1.3=否,但 LLM 输出 wait + 末节点为是 → 自动改为 proceed,校验通过。"""
+        d = self._diagnosis(gate_result="wait", node_12_answer="是", node_13_answer="否")
+        errors = validate_market_diagnosis(d)
+        assert d["gate_result"] == "proceed"
+        assert "market_diagnosis_gate_wait_requires_negative_or_waiting_final_answer" not in errors
+
+    def test_wait_with_node_12_block_is_preserved(self):
+        """1.2=否 时 wait 应保留,但末节点必须 否/等待,否则报错。"""
+        d = self._diagnosis(gate_result="wait", node_12_answer="否", node_13_answer="否")
+        validate_market_diagnosis(d)
+        assert d["gate_result"] == "wait"  # 1.2 阻塞条件成立,不改
+
+    def test_wait_with_node_13_block_is_preserved(self):
+        """1.3=是 时 wait 应保留。"""
+        d = self._diagnosis(gate_result="wait", node_12_answer="是", node_13_answer="是")
+        validate_market_diagnosis(d)
+        assert d["gate_result"] == "wait"
+
+    def test_unknown_with_no_blocking_condition_repaired_to_proceed(self):
+        """gate_result=unknown 同样在无阻塞时改为 proceed。"""
+        d = self._diagnosis(gate_result="unknown", node_12_answer="是", node_13_answer="否")
+        errors = validate_market_diagnosis(d)
+        assert d["gate_result"] == "proceed"
+        assert "market_diagnosis_gate_wait_requires_negative_or_waiting_final_answer" not in errors
+
+    def test_proceed_is_not_modified(self):
+        """proceed 永远不改。"""
+        d = self._diagnosis(gate_result="proceed", node_12_answer="是", node_13_answer="否")
+        validate_market_diagnosis(d)
+        assert d["gate_result"] == "proceed"
+
+
 class TestMarketDiagnosisOrchestrator:
     def test_gate_wait_short_circuits_trade_decision_model_call(self):
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)

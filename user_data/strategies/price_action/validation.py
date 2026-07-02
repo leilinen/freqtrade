@@ -858,6 +858,8 @@ def validate_market_diagnosis(
     gate_result = str(diagnosis.get("gate_result", "")).lower()
     if gate_result not in MARKET_DIAGNOSIS_GATE_RESULTS:
         errors.append("market_diagnosis_gate_result_invalid")
+    _repair_gate_result(diagnosis)  # 校验前先修正 wait/unknown → proceed
+    gate_result = str(diagnosis.get("gate_result", "")).lower()
     if not isinstance(gate_trace, list) or not gate_trace:
         errors.append("market_diagnosis_gate_trace_required")
     else:
@@ -1120,6 +1122,40 @@ def _sync_gate_12_with_cycle(diagnosis: dict[str, Any]) -> None:
         # answer 也没有线索 → 直接用顶层 cycle 兜底
         item["branch"] = cycle
         return
+
+
+def _repair_gate_result(diagnosis: dict[str, Any]) -> None:
+    """Fix gate_result when AI sets wait/unknown despite no blocking condition.
+
+    参考 PA_Agent ``_repair_gate_result``(trace_normalize.py:778-811)。
+
+    Per prompt rules, gate_result=wait/unknown is only valid for:
+    - §1.2 answer≠是 (cannot identify cycle)
+    - §1.3 answer=是 (market is extremely chaotic)
+
+    If neither condition holds but gate_result is wait/unknown, force to proceed.
+    让"LLM 误判 wait + 末节点为是"的输出在校验前被纠正,避免无谓失败。
+    """
+    gate_result = str(diagnosis.get("gate_result", "")).strip().lower()
+    if gate_result not in ("wait", "unknown"):
+        return
+    gate = diagnosis.get("gate_trace")
+    if not isinstance(gate, list) or not gate:
+        return
+    node_12_block = any(
+        isinstance(item, dict)
+        and str(item.get("node_id", "")) == "1.2"
+        and str(item.get("answer", "")).strip() != "是"
+        for item in gate
+    )
+    node_13_block = any(
+        isinstance(item, dict)
+        and str(item.get("node_id", "")) == "1.3"
+        and str(item.get("answer", "")).strip() == "是"
+        for item in gate
+    )
+    if not node_12_block and not node_13_block:
+        diagnosis["gate_result"] = "proceed"
 
 
 def _sync_gate_23_with_direction(diagnosis: dict[str, Any]) -> None:
