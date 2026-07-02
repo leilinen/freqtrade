@@ -41,7 +41,7 @@ import requests as http_requests
 from pandas import DataFrame
 from price_action.background import MarketBackgroundAnalyzer
 from price_action.features import calculate_atr, calculate_ema
-from price_action.llm import OpenAIJsonClient
+from price_action.llm import LlmClient, build_llm_client
 from price_action.models import PaKline, WatchPair, _Base
 from price_action.notification import SignalNotifier
 from price_action.orchestrator import PriceActionOrchestrator
@@ -105,7 +105,7 @@ class PriceActionMonitor(IStrategy):
         self._background = MarketBackgroundAnalyzer()
         self._repository: PriceActionRepository | None = None
         self._notifier: SignalNotifier | None = None
-        self._llm_client: OpenAIJsonClient | None = None
+        self._llm_client: LlmClient | None = None
         self._orchestrator: PriceActionOrchestrator | None = None
         self._worker: PaAnalysisWorker | None = None
 
@@ -156,12 +156,12 @@ class PriceActionMonitor(IStrategy):
                 )
 
     def _init_pa_pipeline(self) -> None:
-        """构建 OpenAIJsonClient + Orchestrator + Worker；无 api_key 时优雅降级。"""
+        """构建 LLM client + Orchestrator + Worker；无 api_key 时优雅降级。"""
         if not self.config.get("pa_agent_enabled", True):
             logger.info("PA LLM pipeline disabled by config (pa_agent_enabled=false)")
             return
         try:
-            client = OpenAIJsonClient.from_config(self.config)
+            client = build_llm_client(self.config)
         except Exception:
             logger.warning("PA LLM client build failed; pipeline disabled", exc_info=True)
             return

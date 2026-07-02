@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 RUN pip install --no-cache-dir -e .
-RUN pip install --no-cache-dir psycopg2-binary mplfinance openai
+RUN pip install --no-cache-dir psycopg2-binary mplfinance openai anthropic
 # Remove pyarrow: this project uses json + PostgreSQL, never feather format.
 # feather handler is lazily imported so this is safe; saves ~153MB.
 RUN pip uninstall -y pyarrow

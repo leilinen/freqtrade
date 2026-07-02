@@ -874,6 +874,8 @@ def validate_market_diagnosis(
                 errors.append(
                     "market_diagnosis_gate_wait_requires_negative_or_waiting_final_answer"
                 )
+        _sync_gate_12_with_cycle(diagnosis)
+        _sync_gate_23_with_direction(diagnosis)
         _validate_gate_trace_order(gate_trace, gate_result, errors)
         _validate_gate_trace_branch_consistency(gate_trace, diagnosis, errors)
         _validate_duplicate_bar_ranges(gate_trace, errors)
@@ -1042,6 +1044,123 @@ def _gate_trace_sort_key(node_id: str) -> tuple[int, int, str]:
         return (major, 999, node_id)
 
 
+_VALID_DIRECTION_BRANCHES = frozenset({"bullish", "bearish", "neutral"})
+
+# 通用的 yes/no 类分支值,不是合法的 cycle 名(参考 PA_Agent trace_normalize.py:26-28)
+_GATE_12_GENERIC_BRANCHES = frozenset(
+    {"yes", "no", "y", "n", "是", "否", "true", "false", ""}
+)
+
+# 合法的 cycle branch 取值
+_VALID_CYCLE_BRANCHES = frozenset(
+    {
+        "trading_range",
+        "trending_tr",
+        "extreme_tr",
+        "spike",
+        "micro_channel",
+        "tight_channel",
+        "normal_channel",
+        "broad_channel",
+        "unknown",
+    }
+)
+
+
+def _infer_direction_from_reason(reason: str) -> str | None:
+    """启发式从 reason 文本推断方向(参考 PA_Agent trace_normalize)。"""
+    blob = reason.lower()
+    if any(tok in blob for tok in ("多头", "做多", "bullish", "bull", "上涨", "向上")):
+        return "bullish"
+    if any(tok in blob for tok in ("空头", "做空", "bearish", "bear", "下跌", "向下")):
+        return "bearish"
+    if any(tok in blob for tok in ("中性", "震荡", "neutral", "横盘")):
+        return "neutral"
+    return None
+
+
+def _sync_gate_12_with_cycle(diagnosis: dict[str, Any]) -> None:
+    """Normalize gate_trace node 1.2 so branch aligns with top-level cycle_position.
+
+    参考 PA_Agent ``_sync_gate_12_branch_with_cycle``(trace_normalize.py:649-680)。
+
+    LLM 常见偏差:把 node 1.2 的 branch 填成 signal 阶段术语(如 tr_identified)
+    或 yes/no,而非真实的 cycle 名(trading_range / spike 等)。
+    这里就地修正,避免 ``market_diagnosis_gate_trace_cycle_branch_conflict``。
+    """
+    gate_trace = diagnosis.get("gate_trace")
+    if not isinstance(gate_trace, list):
+        return
+    cycle = _normalize_cycle_branch(diagnosis.get("cycle_position"))
+    if not cycle:
+        return
+    alt = _normalize_cycle_branch(diagnosis.get("alternative_cycle_position"))
+    for item in gate_trace:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("node_id", "")).strip() != "1.2":
+            continue
+        if item.get("skipped"):
+            return
+        br_raw = item.get("branch")
+        br = _normalize_cycle_branch(br_raw)
+        # branch 是合法 cycle 名 → 仅做格式归一化,不动语义
+        if br and br in _VALID_CYCLE_BRANCHES:
+            if br != str(br_raw).strip().lower().replace(" ", "_"):
+                item["branch"] = br
+            return
+        # branch 是 yes/no/空 这类通用值,或非法的 signal 术语 → 走兜底
+        ans = str(item.get("answer", "") or "").strip()
+        if ans == "是":
+            item["branch"] = cycle
+            return
+        if ans == "否":
+            item["branch"] = "unknown"
+            return
+        # answer 也没有线索 → 直接用顶层 cycle 兜底
+        item["branch"] = cycle
+        return
+
+
+def _sync_gate_23_with_direction(diagnosis: dict[str, Any]) -> None:
+    """Normalize gate_trace node 2.3 so branch/answer align with top-level direction.
+
+    参考 PA_Agent ``_sync_gate_23_answer_with_direction``(trace_normalize.py:746-775)。
+
+    LLM 常见偏差:把 node 2.3 的 branch 填成 signal_quality 术语
+    (如 no_valid_breakout),或漏填 branch,导致与顶层 direction 冲突。
+    这里就地修正 branch/answer,避免 ``market_diagnosis_gate_trace_direction_branch_conflict``。
+    """
+    gate_trace = diagnosis.get("gate_trace")
+    if not isinstance(gate_trace, list):
+        return
+    top_dir = _normalize_direction_branch(diagnosis.get("direction"))
+    for item in gate_trace:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("node_id", "")).strip() != "2.3":
+            continue
+        if item.get("skipped"):
+            return
+        branch_dir = _normalize_direction_branch(item.get("branch"))
+        # branch 值不是合法方向时(如 no_valid_breakout),视为未知,走推断/兜底
+        if branch_dir and branch_dir not in _VALID_DIRECTION_BRANCHES:
+            branch_dir = None
+        if not branch_dir:
+            branch_dir = _infer_direction_from_reason(str(item.get("reason", "") or ""))
+        if not branch_dir and top_dir:
+            branch_dir = top_dir
+        if branch_dir:
+            item["branch"] = branch_dir
+        ans = str(item.get("answer", "") or "").strip()
+        if branch_dir in ("bullish", "bearish"):
+            if ans == "中性":
+                item["answer"] = "是"
+        elif branch_dir == "neutral" and ans in ("是", "否"):
+            item["answer"] = "中性"
+        return
+
+
 def _validate_gate_trace_branch_consistency(
     gate_trace: list[Any],
     diagnosis: dict[str, Any],
@@ -1054,7 +1173,13 @@ def _validate_gate_trace_branch_consistency(
     item_12 = _find_gate_trace_item(gate_trace, "1.2")
     if item_12 and not item_12.get("skipped"):
         branch_cycle = _normalize_cycle_branch(item_12.get("branch"))
-        if branch_cycle and cycle and branch_cycle not in (cycle, alt_cycle):
+        # unknown 是归一化后的兜底值(answer=否 时),不应判冲突
+        if (
+            branch_cycle
+            and branch_cycle != "unknown"
+            and cycle
+            and branch_cycle not in (cycle, alt_cycle)
+        ):
             errors.append("market_diagnosis_gate_trace_cycle_branch_conflict")
 
     item_23 = _find_gate_trace_item(gate_trace, "2.3")

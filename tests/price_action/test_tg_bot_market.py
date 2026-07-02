@@ -10,7 +10,7 @@ Run from repo root:
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -306,8 +306,8 @@ class TestDetectMarket:
             ("BTC/USDT", ("crypto", "BTC/USDT")),
             ("BTC/USDC", ("crypto", "BTC/USDC")),
             # 以稳定币结尾无斜杠 → crypto
-            ("BTCUSDT", ("crypto", "BTCUSDT")),
-            ("BTCUSDC", ("crypto", "BTCUSDC")),
+            ("BTCUSDT", ("crypto", "BTC/USDT")),
+            ("BTCUSDC", ("crypto", "BTC/USDC")),
             # 纯字母 → usstock
             ("AAPL", ("usstock", "AAPL")),
             ("TSLA", ("usstock", "TSLA")),
@@ -352,23 +352,41 @@ class TestVerifyAshareSymbol:
 
 
 class TestVerifyCryptoSymbol:
-    """_verify_crypto_symbol 调 Binance ticker/price,200+symbol 字段即视为存在。"""
+    """_verify_crypto_symbol 调 OKX spot instruments,找到 instId 即视为存在。"""
 
-    def test_returns_true_on_binance_200(self):
+    def test_returns_true_on_okx_200(self):
         fake_resp = MagicMock()
         fake_resp.status_code = 200
-        fake_resp.json.return_value = {"symbol": "BTCUSDT", "price": "60000.0"}
+        fake_resp.json.return_value = {
+            "code": "0",
+            "data": [{"instId": "BTC-USDT", "state": "live"}],
+        }
         fake_client = MagicMock()
         fake_client.get.return_value = fake_resp
         fake_client.__enter__ = MagicMock(return_value=fake_client)
         fake_client.__exit__ = MagicMock(return_value=False)
         with patch.object(tg_bot.httpx, "Client", return_value=fake_client):
             assert tg_bot._verify_crypto_symbol("BTC/USDT") is True
+        fake_client.get.assert_called_once_with(
+            "https://www.okx.com/api/v5/public/instruments",
+            params={"instType": "SPOT", "instId": "BTC-USDT"},
+        )
 
-    def test_returns_false_on_binance_400(self):
+    def test_returns_false_when_okx_data_empty(self):
+        fake_resp = MagicMock()
+        fake_resp.status_code = 200
+        fake_resp.json.return_value = {"code": "0", "data": []}
+        fake_client = MagicMock()
+        fake_client.get.return_value = fake_resp
+        fake_client.__enter__ = MagicMock(return_value=fake_client)
+        fake_client.__exit__ = MagicMock(return_value=False)
+        with patch.object(tg_bot.httpx, "Client", return_value=fake_client):
+            assert tg_bot._verify_crypto_symbol("FAKE/USDT") is False
+
+    def test_returns_false_on_okx_http_error(self):
         fake_resp = MagicMock()
         fake_resp.status_code = 400
-        fake_resp.text = '{"code":-1121,"msg":"Invalid symbol"}'
+        fake_resp.text = '{"code":"51000","msg":"Parameter instId error"}'
         fake_client = MagicMock()
         fake_client.get.return_value = fake_resp
         fake_client.__enter__ = MagicMock(return_value=fake_client)
@@ -493,6 +511,170 @@ class TestKlineHealthRows:
         assert "WHERE wp.enabled = true" in sql
         assert "COUNT(DISTINCT k.symbol)" in sql
         assert rows == result.fetchall.return_value
+
+
+# ===================================================================
+# Tests: K-line backfill after /pa_add
+# ===================================================================
+
+
+class TestKlineBackfill:
+    """Backfill should fetch historical OHLCV and upsert into pa_kline."""
+
+    def _http_client(self, response):
+        fake_client = MagicMock()
+        fake_client.get.return_value = response
+        fake_client.__enter__ = MagicMock(return_value=fake_client)
+        fake_client.__exit__ = MagicMock(return_value=False)
+        return fake_client
+
+    def test_timeframes_match_running_pa_services(self):
+        assert tg_bot._backfill_timeframes_for_market("crypto") == ("1h", "4h")
+        assert tg_bot._backfill_timeframes_for_market("ashare") == ("1h", "1d")
+        assert tg_bot._backfill_timeframes_for_market("usstock") == ()
+
+    def test_fetch_crypto_klines_okx_filters_open_candle_and_sorts(self):
+        closed_ts = int(datetime(2026, 6, 30, 10, tzinfo=timezone.utc).timestamp() * 1000)
+        older_ts = int(datetime(2026, 6, 30, 9, tzinfo=timezone.utc).timestamp() * 1000)
+        future_ts = int((datetime.now(timezone.utc) + timedelta(days=10)).timestamp() * 1000)
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "code": "0",
+            "data": [
+                [str(future_ts), "9", "10", "8", "9.5", "99", "", "", "0"],
+                [str(closed_ts), "2", "3", "1", "2.5", "20", "", "", "1"],
+                [str(older_ts), "1", "2", "0.5", "1.5", "10", "", "", "1"],
+            ],
+        }
+        fake_client = self._http_client(response)
+
+        with patch.object(tg_bot.httpx, "Client", return_value=fake_client):
+            rows = tg_bot._fetch_crypto_klines_okx("BTC/USDT", "1h", 120)
+
+        fake_client.get.assert_called_once_with(
+            tg_bot.OKX_CANDLES_URL,
+            params={"instId": "BTC-USDT", "bar": "1H", "limit": "121"},
+        )
+        assert [r["candle_time"] for r in rows] == [
+            datetime(2026, 6, 30, 9),
+            datetime(2026, 6, 30, 10),
+        ]
+        assert rows[0]["open"] == 1.0
+        assert rows[1]["volume"] == 20.0
+
+    def test_fetch_ashare_daily_tencent_parses_beijing_date_as_utc_naive(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "data": {
+                "sh588290": {
+                    "qfqday": [
+                        ["2026-06-29", "1.00", "1.10", "1.20", "0.90", "1000"],
+                        ["2026-06-30", "1.10", "1.15", "1.30", "1.05", "1200"],
+                    ]
+                }
+            }
+        }
+        fake_client = self._http_client(response)
+
+        with patch.object(tg_bot.httpx, "Client", return_value=fake_client):
+            rows = tg_bot._fetch_ashare_daily_tencent("588290/SH", 120)
+
+        assert rows[0]["candle_time"] == datetime(2026, 6, 28, 16)
+        assert rows[1]["candle_time"] == datetime(2026, 6, 29, 16)
+        assert rows[1]["high"] == 1.30
+        assert rows[1]["close"] == 1.15
+
+    def test_fetch_ashare_1h_sina_parses_jsonp(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.text = (
+            'callback([{"day":"2026-06-30 10:30:00","open":"1.00","high":"1.20",'
+            '"low":"0.90","close":"1.10","volume":"1000"}])'
+        )
+        fake_client = self._http_client(response)
+
+        with patch.object(tg_bot.httpx, "Client", return_value=fake_client):
+            rows = tg_bot._fetch_ashare_1h_sina("588290/SH", 120)
+
+        assert rows == [{
+            "candle_time": datetime(2026, 6, 30, 2, 30),
+            "open": 1.0,
+            "high": 1.2,
+            "low": 0.9,
+            "close": 1.1,
+            "volume": 1000.0,
+        }]
+
+    def test_upsert_pa_klines_uses_batch_conflict_update(self):
+        rows = [{
+            "candle_time": datetime(2026, 6, 30, 10),
+            "open": 1.0,
+            "high": 2.0,
+            "low": 0.5,
+            "close": 1.5,
+            "volume": 10.0,
+        }]
+        conn = MagicMock()
+        conn.__enter__ = MagicMock(return_value=conn)
+        conn.__exit__ = MagicMock(return_value=False)
+        engine = MagicMock()
+        engine.begin.return_value = conn
+
+        with patch.object(tg_bot, "db_engine", engine):
+            count = tg_bot._upsert_pa_klines("BTC/USDT", "1h", rows)
+
+        assert count == 1
+        sql, params = conn.execute.call_args[0]
+        assert "INSERT INTO pa_kline" in str(sql)
+        assert "ON CONFLICT (symbol, timeframe, candle_time) DO UPDATE" in str(sql)
+        assert params == [{
+            "symbol": "BTC/USDT",
+            "timeframe": "1h",
+            "candle_time": datetime(2026, 6, 30, 10),
+            "open": 1.0,
+            "high": 2.0,
+            "low": 0.5,
+            "close": 1.5,
+            "volume": 10.0,
+        }]
+
+    def test_backfill_continues_when_one_timeframe_fails(self):
+        rows = [{
+            "candle_time": datetime(2026, 6, 30, 10),
+            "open": 1.0,
+            "high": 2.0,
+            "low": 0.5,
+            "close": 1.5,
+            "volume": 10.0,
+        }]
+        with (
+            patch.object(
+                tg_bot,
+                "_fetch_crypto_klines_okx",
+                side_effect=[rows, RuntimeError("network")],
+            ),
+            patch.object(tg_bot, "_upsert_pa_klines", return_value=1) as upsert,
+        ):
+            results = tg_bot._backfill_pair_klines("BTC/USDT", "crypto")
+
+        assert results[0] == {"timeframe": "1h", "ok": True, "rows": 1}
+        assert results[1]["timeframe"] == "4h"
+        assert results[1]["ok"] is False
+        assert "network" in results[1]["error"]
+        upsert.assert_called_once_with("BTC/USDT", "1h", rows)
+
+    def test_format_backfill_summary_for_success_failure_and_unsupported_market(self):
+        assert tg_bot._format_backfill_summary("usstock", []) == "回填: usstock 暂无 PA 回填周期"
+        summary = tg_bot._format_backfill_summary(
+            "crypto",
+            [
+                {"timeframe": "1h", "ok": True, "rows": 120},
+                {"timeframe": "4h", "ok": False, "error": "timeout"},
+            ],
+        )
+        assert summary == "回填: 1h=120, 4h失败(timeout)"
 
 
 # ===================================================================

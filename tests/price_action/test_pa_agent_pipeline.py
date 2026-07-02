@@ -47,7 +47,11 @@ from price_action.features import (  # noqa: E402
     calculate_ema,
 )
 from price_action.experience import retrieve_experience_cases  # noqa: E402
-from price_action.llm import OpenAIJsonClient  # noqa: E402
+from price_action.llm import (  # noqa: E402
+    AnthropicJsonClient,
+    OpenAIJsonClient,
+    build_llm_client,
+)
 from price_action.orchestrator import PriceActionOrchestrator, _config_int  # noqa: E402
 from price_action.prompts import (  # noqa: E402
     build_market_diagnosis_messages,
@@ -985,6 +989,236 @@ class TestMarketDiagnosisRouting:
         )
 
 
+class TestSyncGate23WithDirection:
+    """validate_market_diagnosis 应就地归一化 node 2.3 的 branch/answer,
+    避免因 LLM 把 branch 填成 signal_quality 术语等偏差直接判 invalid。
+    参考 PA_Agent ``_sync_gate_23_answer_with_direction``。
+    """
+
+    def _diagnosis_with_2_3(
+        self,
+        *,
+        direction="neutral",
+        branch="no_valid_breakout",
+        answer="否",
+        reason="",
+        skipped=False,
+        cycle_position="trading_range",
+    ):
+        gate_trace = [
+            {"node_id": "1.1", "question": "q", "answer": "是", "reason": "r",
+             "branch": None, "section": "数据检查", "bar_range": "K5-K1"},
+            {"node_id": "1.2", "question": "q", "answer": "是", "reason": "r",
+             "branch": cycle_position, "section": "周期识别", "bar_range": "K4-K1"},
+            {"node_id": "1.3", "question": "q", "answer": "否", "reason": "r",
+             "branch": None, "section": "周期识别", "bar_range": "K3-K1"},
+            {"node_id": "2.1", "question": "q", "answer": "否", "reason": "r",
+             "branch": direction, "section": "方向判断", "bar_range": "K4-K2"},
+            {"node_id": "2.2", "question": "q", "answer": "中性", "reason": "r",
+             "branch": direction, "section": "背景判断", "bar_range": "K5-K1"},
+            {"node_id": "2.3", "question": "q", "answer": answer, "reason": reason,
+             "branch": branch, "section": "方向判断", "bar_range": "K3-K1",
+             **({"skipped": True} if skipped else {})},
+            {"node_id": "2.4", "question": "q", "answer": "否", "reason": "r",
+             "branch": "low_quality", "section": "信号质量", "bar_range": "K2-K1"},
+            {"node_id": "2.5", "question": "q", "answer": "中性", "reason": "r",
+             "branch": direction, "section": "结构检查", "bar_range": "K8-K1"},
+        ]
+        return {
+            "cycle_position": cycle_position,
+            "alternative_cycle_position": None,
+            "direction": direction,
+            "diagnosis_confidence": 60,
+            "spike_stage": None,
+            "climax_risk": None,
+            "market_phase": "stable",
+            "transition_risk": None,
+            "detected_patterns": ["trading_range"],
+            "key_signals": [],
+            "htf_context": "",
+            "entry_setup": "none",
+            "support_levels": [],
+            "resistance_levels": [],
+            "strategy_files_needed": [],
+            "risk_warning": None,
+            "bar_analysis": [],
+            "bar_by_bar_summary": [],
+            "gate_trace": gate_trace,
+            "gate_result": "proceed",
+        }
+
+    def test_branch_no_valid_breakout_gets_corrected_to_top_direction(self):
+        d = self._diagnosis_with_2_3(
+            direction="neutral", branch="no_valid_breakout", answer="否"
+        )
+        errors = validate_market_diagnosis(d)
+        assert "market_diagnosis_gate_trace_direction_branch_conflict" not in errors
+        node_23 = next(i for i in d["gate_trace"] if i["node_id"] == "2.3")
+        assert node_23["branch"] == "neutral"
+        assert node_23["answer"] == "中性"
+
+    def test_branch_missing_infers_bullish_from_reason(self):
+        d = self._diagnosis_with_2_3(
+            direction="bullish",
+            branch=None,
+            answer="中性",
+            reason="多头 follow_through 强势,突破上沿",
+        )
+        errors = validate_market_diagnosis(d)
+        assert "market_diagnosis_gate_trace_direction_branch_conflict" not in errors
+        node_23 = next(i for i in d["gate_trace"] if i["node_id"] == "2.3")
+        assert node_23["branch"] == "bullish"
+        assert node_23["answer"] == "是"
+
+    def test_bullish_branch_neutral_answer_corrected_to_yes(self):
+        d = self._diagnosis_with_2_3(
+            direction="bullish", branch="bullish", answer="中性"
+        )
+        validate_market_diagnosis(d)
+        node_23 = next(i for i in d["gate_trace"] if i["node_id"] == "2.3")
+        assert node_23["answer"] == "是"
+
+    def test_neutral_branch_yes_answer_corrected_to_neutral(self):
+        d = self._diagnosis_with_2_3(
+            direction="neutral", branch="neutral", answer="是"
+        )
+        validate_market_diagnosis(d)
+        node_23 = next(i for i in d["gate_trace"] if i["node_id"] == "2.3")
+        assert node_23["answer"] == "中性"
+
+    def test_no_change_when_already_consistent(self):
+        d = self._diagnosis_with_2_3(
+            direction="neutral", branch="neutral", answer="中性"
+        )
+        errors = validate_market_diagnosis(d)
+        assert "market_diagnosis_gate_trace_direction_branch_conflict" not in errors
+
+    def test_skipped_node_not_modified(self):
+        d = self._diagnosis_with_2_3(
+            direction="bullish", branch=None, answer="", skipped=True
+        )
+        validate_market_diagnosis(d)
+        node_23 = next(i for i in d["gate_trace"] if i["node_id"] == "2.3")
+        assert node_23.get("branch") is None
+        assert node_23.get("skipped") is True
+
+
+class TestSyncGate12WithCycle:
+    """validate_market_diagnosis 应就地归一化 node 1.2 的 branch,
+    避免因 LLM 把 branch 填成 signal 阶段术语(如 tr_identified)或 yes/no
+    直接判 invalid。参考 PA_Agent ``_sync_gate_12_branch_with_cycle``。
+    """
+
+    def _diagnosis_with_1_2(
+        self,
+        *,
+        cycle_position="trading_range",
+        branch="tr_identified",
+        answer="是",
+        skipped=False,
+        direction="neutral",
+    ):
+        gate_trace = [
+            {"node_id": "1.1", "question": "q", "answer": "是", "reason": "r",
+             "branch": None, "section": "数据检查", "bar_range": "K5-K1"},
+            {"node_id": "1.2", "question": "q", "answer": answer, "reason": "r",
+             "branch": branch, "section": "周期识别", "bar_range": "K4-K1",
+             **({"skipped": True} if skipped else {})},
+            {"node_id": "1.3", "question": "q", "answer": "否", "reason": "r",
+             "branch": None, "section": "周期识别", "bar_range": "K3-K1"},
+            {"node_id": "2.1", "question": "q", "answer": "否", "reason": "r",
+             "branch": direction, "section": "方向判断", "bar_range": "K4-K2"},
+            {"node_id": "2.2", "question": "q", "answer": "中性", "reason": "r",
+             "branch": direction, "section": "背景判断", "bar_range": "K5-K1"},
+            {"node_id": "2.3", "question": "q", "answer": "中性", "reason": "r",
+             "branch": direction, "section": "方向判断", "bar_range": "K3-K1"},
+            {"node_id": "2.4", "question": "q", "answer": "否", "reason": "r",
+             "branch": "low_quality", "section": "信号质量", "bar_range": "K2-K1"},
+            {"node_id": "2.5", "question": "q", "answer": "中性", "reason": "r",
+             "branch": direction, "section": "结构检查", "bar_range": "K8-K1"},
+        ]
+        return {
+            "cycle_position": cycle_position,
+            "alternative_cycle_position": None,
+            "direction": direction,
+            "diagnosis_confidence": 60,
+            "spike_stage": None,
+            "climax_risk": None,
+            "market_phase": "stable",
+            "transition_risk": None,
+            "detected_patterns": ["trading_range"],
+            "key_signals": [],
+            "htf_context": "",
+            "entry_setup": "none",
+            "support_levels": [],
+            "resistance_levels": [],
+            "strategy_files_needed": [],
+            "risk_warning": None,
+            "bar_analysis": [],
+            "bar_by_bar_summary": [],
+            "gate_trace": gate_trace,
+            "gate_result": "proceed",
+        }
+
+    def test_branch_tr_identified_gets_corrected_to_cycle(self):
+        """LLM 把 1.2 branch 填成 tr_identified(signal 术语) → 修正为顶层 cycle。"""
+        d = self._diagnosis_with_1_2(
+            cycle_position="trading_range", branch="tr_identified", answer="是"
+        )
+        errors = validate_market_diagnosis(d)
+        assert "market_diagnosis_gate_trace_cycle_branch_conflict" not in errors
+        node_12 = next(i for i in d["gate_trace"] if i["node_id"] == "1.2")
+        assert node_12["branch"] == "trading_range"
+
+    def test_branch_yes_gets_corrected_when_answer_is_yes(self):
+        """branch=yes, answer=是 → branch 改成 cycle_position。"""
+        d = self._diagnosis_with_1_2(
+            cycle_position="spike", branch="yes", answer="是"
+        )
+        errors = validate_market_diagnosis(d)
+        assert "market_diagnosis_gate_trace_cycle_branch_conflict" not in errors
+        node_12 = next(i for i in d["gate_trace"] if i["node_id"] == "1.2")
+        assert node_12["branch"] == "spike"
+
+    def test_branch_unknown_when_answer_is_no(self):
+        """answer=否 时,branch 应改为 unknown。"""
+        d = self._diagnosis_with_1_2(
+            cycle_position="trading_range", branch="tr_identified", answer="否"
+        )
+        errors = validate_market_diagnosis(d)
+        assert "market_diagnosis_gate_trace_cycle_branch_conflict" not in errors
+        node_12 = next(i for i in d["gate_trace"] if i["node_id"] == "1.2")
+        assert node_12["branch"] == "unknown"
+
+    def test_valid_branch_not_modified(self):
+        """branch 已经是合法 cycle 名(如 spike) → 不动。"""
+        d = self._diagnosis_with_1_2(
+            cycle_position="spike", branch="spike", answer="是"
+        )
+        validate_market_diagnosis(d)
+        node_12 = next(i for i in d["gate_trace"] if i["node_id"] == "1.2")
+        assert node_12["branch"] == "spike"
+
+    def test_chinese_cycle_alias_normalized(self):
+        """branch=交易区间 → 归一化为 trading_range,不报冲突。"""
+        d = self._diagnosis_with_1_2(
+            cycle_position="trading_range", branch="交易区间", answer="是"
+        )
+        errors = validate_market_diagnosis(d)
+        assert "market_diagnosis_gate_trace_cycle_branch_conflict" not in errors
+        node_12 = next(i for i in d["gate_trace"] if i["node_id"] == "1.2")
+        assert node_12["branch"] == "trading_range"
+
+    def test_skipped_node_not_modified(self):
+        d = self._diagnosis_with_1_2(
+            cycle_position="trading_range", branch=None, answer="", skipped=True
+        )
+        validate_market_diagnosis(d)
+        node_12 = next(i for i in d["gate_trace"] if i["node_id"] == "1.2")
+        assert node_12.get("branch") is None
+        assert node_12.get("skipped") is True
+
+
 class TestMarketDiagnosisOrchestrator:
     def test_gate_wait_short_circuits_trade_decision_model_call(self):
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
@@ -1547,6 +1781,224 @@ class TestOpenAIJsonClient:
         assert client.max_tokens == 2048
 
 
+class TestAnthropicJsonClient:
+    def _fake_anthropic_response(
+        self,
+        *,
+        content: str = '{"ok": true}',
+        model: str = "glm-5-turbo",
+        input_tokens: int = 12,
+        output_tokens: int = 6,
+        cache_read: int | None = 5,
+        response_id: str = "msg-test",
+    ):
+        usage = SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        if cache_read is not None:
+            usage.cache_read_input_tokens = cache_read
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=content)],
+            model=model,
+            id=response_id,
+            role="assistant",
+            usage=usage,
+        )
+
+    def test_extracts_system_message_and_forwards_rest(self):
+        messages_endpoint = MagicMock()
+        messages_endpoint.create.return_value = self._fake_anthropic_response()
+        fake_client = SimpleNamespace(messages=messages_endpoint)
+        client = AnthropicJsonClient(
+            base_url="https://ca.f-free.site",
+            api_key="test",
+            model="glm-5-turbo",
+            client=fake_client,
+        )
+
+        client.complete_json(
+            [
+                {"role": "system", "content": "you are json bot"},
+                {"role": "user", "content": "hi"},
+            ],
+            stage="test",
+        )
+
+        kwargs = messages_endpoint.create.call_args.kwargs
+        assert kwargs["system"] == "you are json bot"
+        assert kwargs["messages"] == [{"role": "user", "content": "hi"}]
+        assert "response_format" not in kwargs
+
+    def test_last_response_shape_maps_anthropic_usage(self):
+        messages_endpoint = MagicMock()
+        messages_endpoint.create.return_value = self._fake_anthropic_response(
+            input_tokens=12,
+            output_tokens=6,
+            cache_read=5,
+            model="glm-5-turbo",
+            response_id="msg-1",
+        )
+        fake_client = SimpleNamespace(messages=messages_endpoint)
+        client = AnthropicJsonClient(
+            base_url="https://ca.f-free.site",
+            api_key="test",
+            model="glm-5-turbo",
+            client=fake_client,
+        )
+
+        content = client.complete_json(
+            [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+            ],
+            stage="market_diagnosis",
+        )
+
+        assert json.loads(content) == {"ok": True}
+        assert client.last_response == {
+            "stage": "market_diagnosis",
+            "model": "glm-5-turbo",
+            "content": '{"ok": true}',
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 6,
+                "total_tokens": 18,
+                "cached_prompt_tokens": 5,
+            },
+            "id": "msg-1",
+            "role": "assistant",
+        }
+
+    def test_no_system_message_passes_only_messages(self):
+        messages_endpoint = MagicMock()
+        messages_endpoint.create.return_value = self._fake_anthropic_response()
+        fake_client = SimpleNamespace(messages=messages_endpoint)
+        client = AnthropicJsonClient(
+            base_url="https://ca.f-free.site",
+            api_key="test",
+            model="glm-5-turbo",
+            client=fake_client,
+        )
+
+        client.complete_json(
+            [{"role": "user", "content": "hi"}],
+            stage="test",
+        )
+
+        kwargs = messages_endpoint.create.call_args.kwargs
+        assert "system" not in kwargs
+        assert kwargs["messages"] == [{"role": "user", "content": "hi"}]
+
+    def test_from_config_reads_runtime_env_budget(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "sk-env",
+                "PA_LLM_BASE_URL": "https://ca.f-free.site",
+                "PA_LLM_MODEL": "glm-5-turbo",
+                "PA_LLM_TIMEOUT": "180",
+                "PA_LLM_MAX_TOKENS": "2048",
+            },
+            clear=False,
+        ):
+            client = AnthropicJsonClient.from_config({})
+
+        assert client.api_key == "sk-env"
+        assert client.base_url == "https://ca.f-free.site"
+        assert client.model == "glm-5-turbo"
+        assert client.timeout == 180
+        assert client.max_tokens == 2048
+
+    def test_client_passes_timeout_to_sdk(self):
+        """Regression: Anthropic client must forward `timeout` to SDK constructor.
+
+        Previously `timeout` was stored on the wrapper but never passed to the
+        underlying Anthropic SDK, so dead connections hung indefinitely.
+        """
+        import anthropic
+
+        with patch.object(anthropic, "Anthropic") as mock_anthropic:
+            client = AnthropicJsonClient(
+                base_url="https://ca.f-free.site/v1",
+                api_key="test",
+                model="glm-5.2",
+                timeout=180.0,
+            )
+            client._client()
+
+        mock_anthropic.assert_called_once()
+        kwargs = mock_anthropic.call_args.kwargs
+        assert kwargs["timeout"] == 180.0
+        assert "ca.f-free.site" in kwargs["base_url"]
+
+
+class TestBuildLlmClient:
+    def test_anthropic_protocol_routes_to_anthropic_client(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "sk-env",
+                "PA_LLM_BASE_URL": "https://ca.f-free.site",
+                "PA_LLM_MODEL": "glm-5-turbo",
+                "PA_LLM_PROTOCOL": "anthropic",
+            },
+            clear=False,
+        ):
+            client = build_llm_client({})
+
+        assert isinstance(client, AnthropicJsonClient)
+
+    def test_claude_alias_routes_to_anthropic_client(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "sk-env",
+                "PA_LLM_PROTOCOL": "claude",
+            },
+            clear=False,
+        ):
+            client = build_llm_client({})
+
+        assert isinstance(client, AnthropicJsonClient)
+
+    def test_openai_protocol_is_default(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "sk-env",
+                "PA_LLM_PROTOCOL": "",
+            },
+            clear=False,
+        ):
+            client = build_llm_client({})
+
+        assert isinstance(client, OpenAIJsonClient)
+
+    def test_explicit_openai_protocol(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "sk-env",
+                "PA_LLM_PROTOCOL": "openai",
+            },
+            clear=False,
+        ):
+            client = build_llm_client({"pa_llm_protocol": "openai"})
+
+        assert isinstance(client, OpenAIJsonClient)
+
+    def test_config_overrides_env(self):
+        with patch.dict(
+            os.environ,
+            {"PA_LLM_PROTOCOL": "openai", "DEEPSEEK_API_KEY": "sk-env"},
+            clear=False,
+        ):
+            client = build_llm_client({"pa_llm_protocol": "anthropic"})
+
+        assert isinstance(client, AnthropicJsonClient)
+
+
 class TestRuntimeConfig:
     def test_config_int_uses_env_when_config_missing(self):
         with patch.dict(os.environ, {"PA_LLM_WINDOW": "8"}, clear=False):
@@ -2049,6 +2501,73 @@ class TestPriceActionRepository:
             "validation_status": "valid",
             "usage_total": {"total_tokens": 123},
         }
+
+    def test_previous_analysis_excludes_messages_and_raw_responses(self):
+        """Even if the DB row carries bloated messages/raw_responses, the
+        returned previous-analysis dict must stay slim — those fields never
+        belong in the next-round prompt (regression guard for prompt bloat).
+        """
+        row = SimpleNamespace(
+            candle_time=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            trade_decision={"decision": {"order_direction": "做多"}},
+            market_diagnosis={"cycle_position": "spike"},
+            validation_status="valid",
+            usage_total={"total_tokens": 100},
+            market_diagnosis_messages=[{"role": "user", "content": "x" * 100000}],
+            trade_decision_messages=[{"role": "user", "content": "y" * 100000}],
+            price_action_features={"rows": [{"k": "K1"}]},
+            raw_responses={"market_diagnosis": {"content": "z" * 100000}},
+        )
+        query = MagicMock()
+        query.filter.return_value.order_by.return_value.first.return_value = row
+        session = MagicMock()
+        session.query.return_value = query
+        ctx = MagicMock()
+        ctx.__enter__.return_value = session
+        ctx.__exit__.return_value = False
+        factory = MagicMock(return_value=ctx)
+        repository = PriceActionRepository(factory, timeframe="1h", market="crypto")
+
+        previous = repository.get_previous_successful_analysis(
+            symbol="BTC/USDT",
+            timeframe="1h",
+            before_time=datetime(2026, 6, 2, tzinfo=timezone.utc),
+        )
+
+        for forbidden in (
+            "market_diagnosis_messages",
+            "trade_decision_messages",
+            "price_action_features",
+            "raw_responses",
+        ):
+            assert forbidden not in previous, f"{forbidden} must not leak into next-round prompt"
+
+    def test_previous_analysis_includes_decision_summary_fields(self):
+        row = SimpleNamespace(
+            candle_time=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            trade_decision={"decision": {"order_direction": "做空"}},
+            market_diagnosis={"cycle_position": "trending"},
+            validation_status="valid",
+            usage_total={"prompt_tokens": 5, "total_tokens": 7},
+        )
+        query = MagicMock()
+        query.filter.return_value.order_by.return_value.first.return_value = row
+        session = MagicMock()
+        session.query.return_value = query
+        ctx = MagicMock()
+        ctx.__enter__.return_value = session
+        ctx.__exit__.return_value = False
+        factory = MagicMock(return_value=ctx)
+        repository = PriceActionRepository(factory, timeframe="1h", market="crypto")
+
+        previous = repository.get_previous_successful_analysis(
+            symbol="BTC/USDT",
+            timeframe="1h",
+            before_time=datetime(2026, 6, 2, tzinfo=timezone.utc),
+        )
+
+        for required in ("candle_time", "decision", "diagnosis", "validation_status", "usage_total"):
+            assert required in previous, f"{required} must be present in previous-analysis summary"
 
 
 class TestPaAnalysisWorker:

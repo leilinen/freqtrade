@@ -107,6 +107,7 @@ target/
 
 .env
 docker/.env.freqtrade_priceaction
+docker/.env.freqtrade_priceaction.local
 .venv
 .idea
 .vscode
@@ -122,6 +123,7 @@ docker/.env.freqtrade_priceaction
 
 docker-compose-*.yml
 !docker/docker-compose-freqtrade-priceaction.azure.yml
+!docker/docker-compose-freqtrade-priceaction.local.yml
 
 # Local agent/project artifacts
 .claude/settings.local.json

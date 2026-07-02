@@ -1,0 +1,215 @@
+name: freqtrade_priceaction_local
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: freqtrade_priceaction_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_DB: "${POSTGRES_DB:-freqtrade_priceaction}"
+      TZ: "Asia/Shanghai"
+    ports:
+      - "${PA_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - freqtrade_priceaction_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-freqtrade_priceaction}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - priceaction_local
+
+  init-db:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pa
+    image: freqtrade-priceaction-pa:latest
+    container_name: freqtrade_priceaction_init_db
+    restart: "no"
+    environment:
+      TZ: "Asia/Shanghai"
+      PA_DB_URL: "${PA_DB_URL:-postgresql://postgres:postgres@postgres:5432/freqtrade_priceaction}"
+    volumes:
+      - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    entrypoint: ["python"]
+    command: ["/freqtrade/user_data/strategies/price_action/init_db.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - priceaction_local
+
+  crypto-1h:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pa
+    image: freqtrade-priceaction-pa:latest
+    container_name: freqtrade_priceaction_crypto_1h
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
+      PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
+      PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+      PA_LLM_WINDOW: "${PA_LLM_WINDOW:-8}"
+      PA_LLM_TIMEOUT: "${PA_LLM_TIMEOUT:-180}"
+      PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
+      PA_LLM_PROTOCOL: "${PA_LLM_PROTOCOL:-openai}"
+    volumes:
+      - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    extra_hosts:
+      - "ca.f-free.site:149.28.81.78"
+    ports:
+      - "${PA_CHART_1H_PORT:-18091}:8091"
+    command: >
+      trade
+      --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_1h.json
+      --strategy PriceActionMonitor
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os; [exit(0) for p in os.listdir('/proc') if p.isdigit() and 'freqtrade' in open(f'/proc/{p}/cmdline').read()] or exit(1)\""]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - priceaction_local
+
+  crypto-4h:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pa
+    image: freqtrade-priceaction-pa:latest
+    container_name: freqtrade_priceaction_crypto_4h
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
+      PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
+      PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+      PA_LLM_WINDOW: "${PA_LLM_WINDOW:-8}"
+      PA_LLM_TIMEOUT: "${PA_LLM_TIMEOUT:-180}"
+      PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
+      PA_LLM_PROTOCOL: "${PA_LLM_PROTOCOL:-openai}"
+    volumes:
+      - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    extra_hosts:
+      - "ca.f-free.site:149.28.81.78"
+    ports:
+      - "${PA_CHART_4H_PORT:-18092}:8092"
+    command: >
+      trade
+      --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_4h.json
+      --strategy PriceActionMonitor
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os; [exit(0) for p in os.listdir('/proc') if p.isdigit() and 'freqtrade' in open(f'/proc/{p}/cmdline').read()] or exit(1)\""]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - priceaction_local
+
+  ashare-1h:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pa
+    image: freqtrade-priceaction-pa:latest
+    container_name: freqtrade_priceaction_ashare_1h
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
+      PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
+      PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+      PA_LLM_WINDOW: "${PA_LLM_WINDOW:-8}"
+      PA_LLM_TIMEOUT: "${PA_LLM_TIMEOUT:-180}"
+      PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
+      PA_LLM_PROTOCOL: "${PA_LLM_PROTOCOL:-openai}"
+    volumes:
+      - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    extra_hosts:
+      - "ca.f-free.site:149.28.81.78"
+    ports:
+      - "${PA_CHART_ASHARE_1H_PORT:-18093}:8093"
+    command: >
+      trade
+      --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_ashare_1h.json
+      --strategy PriceActionMonitor
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+    networks:
+      - priceaction_local
+
+  ashare-1d:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.pa
+    image: freqtrade-priceaction-pa:latest
+    container_name: freqtrade_priceaction_ashare_1d
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
+      PA_LLM_BASE_URL: "${PA_LLM_BASE_URL:?set PA_LLM_BASE_URL}"
+      PA_LLM_MODEL: "${PA_LLM_MODEL:?set PA_LLM_MODEL}"
+      PA_LLM_WINDOW: "${PA_LLM_WINDOW:-8}"
+      PA_LLM_TIMEOUT: "${PA_LLM_TIMEOUT:-180}"
+      PA_LLM_MAX_TOKENS: "${PA_LLM_MAX_TOKENS:-2048}"
+      PA_LLM_PROTOCOL: "${PA_LLM_PROTOCOL:-openai}"
+    volumes:
+      - ${USERDATA_DIR:?set USERDATA_DIR}:/freqtrade/user_data
+    extra_hosts:
+      - "ca.f-free.site:149.28.81.78"
+    ports:
+      - "${PA_CHART_ASHARE_1D_PORT:-18094}:8094"
+    command: >
+      trade
+      --config /freqtrade/user_data/price_action_config_freqtrade_priceaction_ashare_1d.json
+      --strategy PriceActionMonitor
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+    networks:
+      - priceaction_local
+
+  priceaction-tg-bot:
+    build:
+      context: ../services
+      dockerfile: Dockerfile.tg
+    image: freqtrade-priceaction-tg-bot:latest
+    container_name: freqtrade_priceaction_tg_bot
+    restart: unless-stopped
+    environment:
+      TZ: "Asia/Shanghai"
+      TG_TOKEN: "${TG_TOKEN:?set TG_TOKEN}"
+      TG_CHAT_ID: "${TG_CHAT_ID:?set TG_CHAT_ID}"
+      DB_URL: "${PA_DB_URL:-postgresql://postgres:postgres@postgres:5432/freqtrade_priceaction}"
+      API_PORT: "8090"
+      CHART_ROUTES_JSON: >
+        {"crypto:1h":{"host":"freqtrade_priceaction_crypto_1h","port":8091},
+         "crypto:4h":{"host":"freqtrade_priceaction_crypto_4h","port":8092},
+         "ashare:1h":{"host":"freqtrade_priceaction_ashare_1h","port":8093},
+         "ashare:1d":{"host":"freqtrade_priceaction_ashare_1d","port":8094}}
+    ports:
+      - "${PA_TG_API_PORT:-18090}:8090"
+    depends_on:
+      init-db:
+        condition: service_completed_successfully
+    networks:
+      - priceaction_local
+
+volumes:
+  freqtrade_priceaction_pgdata:
+
+networks:
+  priceaction_local:

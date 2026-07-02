@@ -297,20 +297,6 @@ class PriceActionRepository:
                     "validation_status": row.validation_status,
                     "usage_total": getattr(row, "usage_total", None),
                 }
-                for key, value in (
-                    (
-                        "market_diagnosis_messages",
-                        getattr(row, "market_diagnosis_messages", None),
-                    ),
-                    (
-                        "trade_decision_messages",
-                        getattr(row, "trade_decision_messages", None),
-                    ),
-                    ("price_action_features", getattr(row, "price_action_features", None)),
-                    ("raw_responses", getattr(row, "raw_responses", None)),
-                ):
-                    if value is not None:
-                        previous[key] = value
                 return previous
         except Exception:
             logger.debug("Previous PA analysis lookup failed for %s", symbol, exc_info=True)

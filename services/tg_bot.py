@@ -107,6 +107,26 @@ STABLECOIN_QUOTES = ("USDT", "USDC", "TUSD", "DAI", "FDUSD", "USD")
 # A 股交易所后缀:沪 /SH、深 /SZ、北 /BJ
 ASHARE_SUFFIXES = ("/SH", "/SZ", "/BJ")
 
+BACKFILL_KLINE_LIMIT = 120
+BACKFILL_TIMEFRAMES = {
+    "crypto": ("1h", "4h"),
+    "ashare": ("1h", "1d"),
+}
+TIMEFRAME_SECONDS = {
+    "1h": 60 * 60,
+    "4h": 4 * 60 * 60,
+    "1d": 24 * 60 * 60,
+}
+OKX_BAR_BY_TIMEFRAME = {
+    "1h": "1H",
+    "4h": "4H",
+}
+OKX_CANDLES_URL = "https://www.okx.com/api/v5/market/candles"
+TENCENT_KLINE_URL = "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+SINA_KLINE_URL = (
+    "https://quotes.sina.cn/cn/api/jsonp_v2.php/callback/CN_MarketDataService.getKLineData"
+)
+
 
 def _normalize_ashare_code(code: str) -> str | None:
     """按 A 股代码前缀补 /SH、/SZ 或 /BJ 后缀。
@@ -164,7 +184,8 @@ def _detect_market(symbol: str) -> tuple[str, str]:
     # 以稳定币结尾(无斜杠的 crypto 写法,如 BTCUSDT)
     for q in STABLECOIN_QUOTES:
         if s.endswith(q) and len(s) > len(q):
-            return ("crypto", s)
+            base = s[: -len(q)]
+            return ("crypto", f"{base}/{q}")
     # 以字母开头 → 美股。允许后续含字母/点/横线(如 BRK.B、BRK-B),不允许数字。
     if s[0].isalpha() and all(c.isalpha() or c in ".-" for c in s):
         return ("usstock", s)
@@ -221,22 +242,21 @@ def _verify_ashare_symbol(symbol: str) -> bool:
 
 
 def _verify_crypto_symbol(symbol: str) -> bool:
-    """校验 crypto 标的是否存在,查询 Binance 24h ticker。
-
-    Binance 对无效 symbol 返回 400,有效返回价格 JSON。
-    """
+    """校验 crypto 标的是否存在,查询策略实际使用的 OKX spot instruments。"""
     headers = {"User-Agent": "Mozilla/5.0"}
+    inst_id = symbol.replace("/", "-").upper()
     try:
         with httpx.Client(follow_redirects=True, timeout=10, headers=headers) as client:
             resp = client.get(
-                "https://api.binance.com/api/v3/ticker/price",
-                params={"symbol": symbol.replace("/", "").upper()},
+                "https://www.okx.com/api/v5/public/instruments",
+                params={"instType": "SPOT", "instId": inst_id},
             )
             if resp.status_code == 200:
                 data = resp.json()
-                return bool(data.get("symbol") and data.get("price"))
+                instruments = data.get("data") or []
+                return any(item.get("instId") == inst_id for item in instruments)
             logger.warning(
-                "Binance verify failed for %s: HTTP %s %s",
+                "OKX verify failed for %s: HTTP %s %s",
                 symbol, resp.status_code, resp.text[:200],
             )
     except Exception:
@@ -406,6 +426,233 @@ def _fetch_kline_health_rows(conn):
         "WHERE wp.enabled = true "
         "GROUP BY wp.market, k.timeframe"
     )).fetchall()
+
+
+def _backfill_timeframes_for_market(market: str) -> tuple[str, ...]:
+    """Return PA monitoring timeframes configured for a market."""
+    return BACKFILL_TIMEFRAMES.get(market, ())
+
+
+def _backfill_pair_klines(
+    symbol: str,
+    market: str,
+    *,
+    limit: int = BACKFILL_KLINE_LIMIT,
+) -> list[dict]:
+    """Fetch and persist recent historical klines for all PA timeframes of a market."""
+    results = []
+    for timeframe in _backfill_timeframes_for_market(market):
+        try:
+            if market == "crypto":
+                rows = _fetch_crypto_klines_okx(symbol, timeframe, limit)
+            elif market == "ashare":
+                rows = _fetch_ashare_klines(symbol, timeframe, limit)
+            else:
+                rows = []
+            written = _upsert_pa_klines(symbol, timeframe, rows)
+            results.append({"timeframe": timeframe, "ok": True, "rows": written})
+            logger.info(
+                "Backfilled klines: %s %s rows=%d",
+                symbol, timeframe, written,
+            )
+        except Exception as exc:
+            logger.warning(
+                "K-line backfill failed for %s %s",
+                symbol, timeframe,
+                exc_info=True,
+            )
+            results.append({
+                "timeframe": timeframe,
+                "ok": False,
+                "rows": 0,
+                "error": str(exc),
+            })
+    return results
+
+
+def _fetch_crypto_klines_okx(symbol: str, timeframe: str, limit: int) -> list[dict]:
+    """Fetch recent closed OKX spot candles and return pa_kline-ready rows."""
+    bar = OKX_BAR_BY_TIMEFRAME.get(timeframe)
+    if not bar:
+        raise ValueError(f"unsupported crypto timeframe: {timeframe}")
+    inst_id = symbol.replace("/", "-").upper()
+    request_limit = min(limit + 1, 300)
+    with httpx.Client(follow_redirects=True, timeout=15) as client:
+        resp = client.get(
+            OKX_CANDLES_URL,
+            params={"instId": inst_id, "bar": bar, "limit": str(request_limit)},
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"OKX candles HTTP {resp.status_code}: {resp.text[:120]}")
+    payload = resp.json()
+    if payload.get("code") not in (None, "0", 0):
+        raise RuntimeError(f"OKX candles error: {payload.get('msg') or payload.get('code')}")
+    candles = payload.get("data") or []
+    now = datetime.now(timezone.utc)
+    rows = []
+    for candle in candles:
+        if len(candle) < 6:
+            continue
+        candle_time = datetime.fromtimestamp(int(candle[0]) / 1000, tz=timezone.utc)
+        confirm = str(candle[8]) if len(candle) > 8 else ""
+        if confirm != "1":
+            seconds = TIMEFRAME_SECONDS[timeframe]
+            if candle_time + timedelta(seconds=seconds) > now:
+                continue
+        rows.append({
+            "candle_time": _to_utc_naive(candle_time),
+            "open": float(candle[1]),
+            "high": float(candle[2]),
+            "low": float(candle[3]),
+            "close": float(candle[4]),
+            "volume": float(candle[5]),
+        })
+    rows.sort(key=lambda row: row["candle_time"])
+    rows = rows[-limit:]
+    if not rows:
+        raise RuntimeError("OKX candles returned no closed rows")
+    return rows
+
+
+def _fetch_ashare_klines(symbol: str, timeframe: str, limit: int) -> list[dict]:
+    """Fetch A-share klines using the same public sources as the ashare exchange plugin."""
+    if timeframe == "1d":
+        return _fetch_ashare_daily_tencent(symbol, limit)
+    if timeframe == "1h":
+        return _fetch_ashare_1h_sina(symbol, limit)
+    raise ValueError(f"unsupported ashare timeframe: {timeframe}")
+
+
+def _fetch_ashare_daily_tencent(symbol: str, limit: int) -> list[dict]:
+    market_symbol = _to_ashare_market_symbol(symbol)
+    with httpx.Client(follow_redirects=True, timeout=15) as client:
+        resp = client.get(
+            TENCENT_KLINE_URL,
+            params={"param": f"{market_symbol},day,,,{limit},qfq"},
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Tencent candles HTTP {resp.status_code}: {resp.text[:120]}")
+    raw = resp.json().get("data", {}).get(market_symbol, {})
+    candles = raw.get("qfqday", []) or raw.get("day", [])
+    rows = []
+    for candle in candles:
+        if len(candle) < 6:
+            continue
+        dt = datetime.strptime(candle[0], "%Y-%m-%d").replace(tzinfo=ASHARE_CALENDAR_TZ)
+        rows.append({
+            "candle_time": _to_utc_naive(dt),
+            "open": float(candle[1]),
+            "high": float(candle[3]),
+            "low": float(candle[4]),
+            "close": float(candle[2]),
+            "volume": float(candle[5]),
+        })
+    rows.sort(key=lambda row: row["candle_time"])
+    rows = rows[-limit:]
+    if not rows:
+        raise RuntimeError("Tencent candles returned no rows")
+    return rows
+
+
+def _fetch_ashare_1h_sina(symbol: str, limit: int) -> list[dict]:
+    market_symbol = _to_ashare_market_symbol(symbol)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://finance.sina.com.cn/",
+    }
+    with httpx.Client(follow_redirects=True, timeout=15, headers=headers) as client:
+        resp = client.get(
+            SINA_KLINE_URL,
+            params={"symbol": market_symbol, "scale": "60", "ma": "no", "datalen": str(limit)},
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Sina candles HTTP {resp.status_code}: {resp.text[:120]}")
+    text_body = resp.text
+    json_str = text_body[text_body.index("(") + 1 : text_body.rindex(")")]
+    candles = json.loads(json_str)
+    rows = []
+    for candle in candles:
+        dt = datetime.strptime(candle["day"], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=ASHARE_CALENDAR_TZ
+        )
+        rows.append({
+            "candle_time": _to_utc_naive(dt),
+            "open": float(candle["open"]),
+            "high": float(candle["high"]),
+            "low": float(candle["low"]),
+            "close": float(candle["close"]),
+            "volume": float(candle["volume"]),
+        })
+    rows.sort(key=lambda row: row["candle_time"])
+    rows = rows[-limit:]
+    if not rows:
+        raise RuntimeError("Sina candles returned no rows")
+    return rows
+
+
+def _to_ashare_market_symbol(symbol: str) -> str:
+    parts = symbol.split("/")
+    if len(parts) != 2:
+        raise ValueError(f"invalid ashare symbol: {symbol}")
+    code, exchange = parts[0], parts[1].lower()
+    return f"{exchange}{code}"
+
+
+def _to_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _upsert_pa_klines(symbol: str, timeframe: str, rows: list[dict]) -> int:
+    """Upsert raw OHLCV rows into pa_kline."""
+    if not rows:
+        return 0
+    params = [
+        {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candle_time": row["candle_time"],
+            "open": row["open"],
+            "high": row["high"],
+            "low": row["low"],
+            "close": row["close"],
+            "volume": row["volume"],
+        }
+        for row in rows
+    ]
+    with db_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO pa_kline
+                (symbol, timeframe, candle_time, open, high, low, close, volume)
+            VALUES
+                (:symbol, :timeframe, :candle_time, :open, :high, :low, :close, :volume)
+            ON CONFLICT (symbol, timeframe, candle_time) DO UPDATE SET
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume
+        """), params)
+    return len(params)
+
+
+def _format_backfill_summary(market: str, results: list[dict]) -> str:
+    if not _backfill_timeframes_for_market(market):
+        return f"回填: {market} 暂无 PA 回填周期"
+    if not results:
+        return "回填: 未执行"
+    parts = []
+    for result in results:
+        timeframe = result["timeframe"]
+        if result.get("ok"):
+            parts.append(f"{timeframe}={result.get('rows', 0)}")
+        else:
+            error = str(result.get("error") or "unknown")
+            if len(error) > 60:
+                error = error[:57] + "..."
+            parts.append(f"{timeframe}失败({error})")
+    return "回填: " + ", ".join(parts)
 
 
 def db_add_pair(symbol: str, market: str) -> str:
@@ -984,11 +1231,13 @@ async def pa_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         symbol = normalized
     # 校验标的真实存在
     if not _verify_symbol(market, symbol):
-        await update.message.reply_text(f"标的 {symbol} 在 {market} 市场未找到,请检查代码")
+        await update.message.reply_text(f"标的 {symbol} 在 {market} 市场未找到，请检查输入或稍后重试")
         return
     msg = db_add_pair(symbol, market)
+    backfill_results = _backfill_pair_klines(symbol, market)
+    backfill_summary = _format_backfill_summary(market, backfill_results)
     await update.message.reply_text(
-        msg + "\n提示: 等待缓存刷新生效，或发送 /reload_config 立即生效"
+        msg + "\n" + backfill_summary + "\n提示: 等待缓存刷新生效，或发送 /reload_config 立即生效"
     )
 
 
