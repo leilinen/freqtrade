@@ -19,6 +19,7 @@ import os
 import asyncio
 import threading
 from datetime import datetime, timezone, timedelta, time as dt_time
+from typing import Any
 
 import httpx
 from aiohttp import web
@@ -942,6 +943,39 @@ def _fmt_decision_price(v):
     return f"{v:.6f}"
 
 
+# 顶部「理由」摘要的最大字符数（中文字符按 1 计）。
+_REASON_MAX_CHARS = 60
+# 单个 trace 节点 reason 的最大字符数。
+_TRACE_REASON_MAX_CHARS = 40
+
+
+def _truncate_text(text: Any, limit: int) -> str:
+    """截断到 limit 个字符（按字符计数），超出加省略号。"""
+    s = str(text or "").strip()
+    if limit <= 0 or len(s) <= limit:
+        return s
+    return s[:limit].rstrip() + "…"
+
+
+def _format_trace_item(item: Any) -> str:
+    """把 decision_trace 节点压成紧凑一行。
+
+    dict 节点: ``node_id · section · answer — reason``（reason 截断）。
+    纯字符串节点直接截断返回。
+    """
+    if isinstance(item, dict):
+        node_id = str(item.get("node_id", "")).strip()
+        section = str(item.get("section", "")).strip()
+        answer = str(item.get("answer", "")).strip()
+        reason = _truncate_text(item.get("reason", ""), _TRACE_REASON_MAX_CHARS)
+        head_parts = [p for p in (node_id, section, answer) if p]
+        head = " · ".join(head_parts)
+        if reason:
+            return f"{head} — {reason}" if head else reason
+        return head
+    return _truncate_text(item, _TRACE_REASON_MAX_CHARS)
+
+
 def format_decision_message(data: dict) -> str:
     """格式化 PA L4 交易决策推送消息（中文）。
 
@@ -1013,7 +1047,7 @@ def format_decision_message(data: dict) -> str:
     if order_type and order_type != "none":
         lines.append(f"下单方式: {order_type}")
 
-    reason = str(data.get("reason", "")).strip()
+    reason = _truncate_text(data.get("reason", ""), _REASON_MAX_CHARS)
     if reason:
         lines.append(f"理由: {reason}")
 
@@ -1021,9 +1055,9 @@ def format_decision_message(data: dict) -> str:
     if isinstance(trace, list) and trace:
         # 只取前 3 条，避免消息过长
         for item in trace[:3]:
-            text = str(item).strip()
-            if text:
-                lines.append(f"• {text}")
+            compact = _format_trace_item(item)
+            if compact:
+                lines.append(f"• {compact}")
 
     validation = data.get("validation") or {}
     if isinstance(validation, dict):

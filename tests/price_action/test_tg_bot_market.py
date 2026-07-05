@@ -136,6 +136,105 @@ class TestDecisionHttpFlow:
 
 
 # ===================================================================
+# Tests: format_decision_message 精简渲染（理由摘要 + trace 紧凑一行）
+# ===================================================================
+
+
+class TestDecisionMessageCompact:
+    """理由长文应截断为摘要；decision_trace 节点应渲染成紧凑一行而非 dict 字面量。"""
+
+    def _long_reason(self) -> str:
+        return (
+            "K1 inside bear方向 body_pct=0.3046 close=63140.60低于K2 close=63299.40 "
+            "overlap=0.7613高重叠 volume=312.79较K2大幅萎缩58.9%。"
+            "K2突破63090.9的follow_through更新为no——突破后缺乏跟进。"
+            "但K1 close=63140.60仍高于63090.9突破位50点 突破尚未完全失败 "
+            "三重突破栈底层(62407.0)和中层(62964.6)仍有效。"
+        )
+
+    def _trace(self) -> list:
+        return [
+            {
+                "node_id": "3.1",
+                "question": "当前是否有有效的信号棒？",
+                "answer": "中性",
+                "reason": "K2 trend_bull body_pct=0.525 close=63299.40突破63090.9创新高63469.30 是上一根信号K线。",
+                "branch": "weak",
+                "section": "信号棒评估",
+                "bar_range": "K2-K1",
+            },
+            {
+                "node_id": "4.1",
+                "question": "K2 close=63299.40突破63090.9是否仍为有效突破？",
+                "answer": "中性",
+                "reason": "顶层突破处于危险，中底层仍有效。",
+                "branch": "breakout_danger",
+                "section": "突破评估",
+                "bar_range": "K7-K1",
+            },
+        ]
+
+    def test_reason_is_truncated_with_ellipsis(self):
+        msg = tg_bot.format_decision_message({
+            "symbol": "BTC/USDT",
+            "timeframe": "4h",
+            "decision_type": "enter_long",
+            "reason": self._long_reason(),
+        })
+        reason_line = next(ln for ln in msg.splitlines() if ln.startswith("理由:"))
+        # 摘要应远短于原文，且以省略号结尾
+        assert reason_line.endswith("…")
+        assert len(reason_line) < len(self._long_reason())
+
+    def test_trace_items_rendered_as_compact_line_not_dict(self):
+        msg = tg_bot.format_decision_message({
+            "symbol": "BTC/USDT",
+            "timeframe": "4h",
+            "decision_type": "enter_long",
+            "decision_trace": self._trace(),
+        })
+        # 不应再出现 dict 字面量的痕迹
+        assert "{'node_id'" not in msg
+        assert "node_id" not in msg.split("•")[1] if "•" in msg else True
+        # 第一条 trace 应紧凑呈现 node_id · section · answer
+        first_trace = next(ln for ln in msg.splitlines() if ln.startswith("• 3.1"))
+        assert "信号棒评估" in first_trace
+        assert "中性" in first_trace
+
+    def test_string_trace_item_still_handled(self):
+        """历史纯字符串 trace 也应被截断处理，不报错。"""
+        msg = tg_bot.format_decision_message({
+            "symbol": "BTC/USDT",
+            "timeframe": "4h",
+            "decision_type": "enter_long",
+            "decision_trace": ["trend up", "pullback to EMA20"],
+        })
+        assert "• trend up" in msg
+
+    def test_format_trace_item_unit(self):
+        item = {
+            "node_id": "4.1",
+            "section": "突破评估",
+            "answer": "中性",
+            "reason": "顶层突破处于危险，中底层仍有效。",
+        }
+        out = tg_bot._format_trace_item(item)
+        assert out == "4.1 · 突破评估 · 中性 — 顶层突破处于危险，中底层仍有效。"
+
+    def test_format_trace_item_truncates_long_reason(self):
+        item = {
+            "node_id": "3.1",
+            "section": "信号棒评估",
+            "answer": "中性",
+            "reason": self._long_reason(),
+        }
+        out = tg_bot._format_trace_item(item)
+        assert out.endswith("…")
+        # 头部仍保留三段 + 分隔
+        assert out.startswith("3.1 · 信号棒评估 · 中性 — ")
+
+
+# ===================================================================
 # Tests: /quote chart routing
 # ===================================================================
 
