@@ -740,14 +740,24 @@ def parse_json_object(raw_response: str) -> dict[str, Any]:
     Some OpenAI-compatible providers accept ``response_format`` but still wrap
     JSON in Markdown fences. Keep raw response persistence unchanged, but make
     validation tolerant enough to parse those provider responses.
-    When ``json.loads`` fails, first try to repair truncated / unbalanced /
-    control-char-laden JSON (ported from PA_Agent json_validator.py); only
-    fall back to brace-fence extraction if repair returns nothing.
+
+    修复流水线(对齐 PA_Agent json_validator.py):
+    1. 先归一化智能引号 + 修复值内未转义引号/分号分隔符(最常见的结构错误);
+    2. 首次 json.loads;
+    3. 失败则走 _try_repair_json_syntax(控制字符转义 + 截断补全);
+    4. 仍失败则回退到大括号围栏提取。
     """
+    # 预处理:先抽最外层 {...},再修未转义引号和分号分隔符。
+    # 这一步对 id=251 那种 "}," "entry_setup_type" 病灶直接生效。
+    pre = _extract_json_object_text(raw_response)
+    pre = _normalize_smart_quotes(pre)
+    pre = _drop_stray_string_separators(pre)
+    pre = _repair_semicolon_separator(pre)
+    pre = _repair_unescaped_quotes(pre)
     try:
-        parsed = json.loads(raw_response)
+        parsed = json.loads(pre)
     except json.JSONDecodeError:
-        repaired = _try_repair_json_syntax(raw_response, allow_tail_inject=True)
+        repaired = _try_repair_json_syntax(pre, allow_tail_inject=True)
         if repaired is not None:
             try:
                 parsed = json.loads(repaired)
@@ -824,6 +834,231 @@ def _escape_control_chars_in_json_strings(text: str) -> str:
             continue
         else:
             out.append(ch)
+    return "".join(out)
+
+
+# 中文/智能引号归一化:LLM 偶发输出 \u201c \u201d 等弯引号,
+# 会让 json.loads 报错。Ported from PA_Agent json_validator.py:110-121.
+_SMART_QUOTE_MAP: dict[str, str] = {
+    "\u201c": '"',   # " → "
+    "\u201d": '"',   # " → "
+    "\u2018": "'",   # ' → '
+    "\u2019": "'",   # ' → '
+    "\u2013": "-",   # en-dash
+    "\u2014": "-",   # em-dash
+}
+
+
+def _normalize_smart_quotes(text: str) -> str:
+    """Replace smart/curly quotes with ASCII equivalents before parsing."""
+    for bad, good in _SMART_QUOTE_MAP.items():
+        text = text.replace(bad, good)
+    return text
+
+
+# 字符串值内未转义引号的修复。Ported from PA_Agent json_validator.py:207-258.
+# glm-5.x 常在 reason / detected_patterns 等长文本值里塞裸引号,
+# 例如 ...四重确认"}," "entry_setup_type"... ——这里 LLM 把字符串提前闭合了。
+_STRING_END_CHARS = frozenset(",:}]")
+
+
+def _repair_unescaped_quotes(text: str) -> str:
+    """Escape ``"`` inside JSON string values that were not backslash-escaped.
+
+    用 peek-ahead 启发式判断一个引号是字符串结束符还是值内嵌的:
+    只有当引号后第一个非空白字符是结构字符(``,`` ``:`` ``}`` ``]`` 或 EOF)时,
+    才认为该引号闭合字符串;否则视为值内未转义引号,转义为 ``\\"``。
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if escape:
+            escape = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            escape = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j >= n or text[j] in _STRING_END_CHARS:
+                in_string = False
+                out.append(ch)
+            else:
+                out.append('\\"')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _repair_semicolon_separator(text: str) -> str:
+    """Replace stray semicolons used as field separators outside JSON strings.
+
+    LLM 偶发把 ``"a": "b";`` 写成 ``"a": "b";``(分号当逗号)。
+    只替换**结构分隔位置**的分号:在字符串外、且后跟可选空白再接 ``"`` ``}`` ``]``。
+    Ported from PA_Agent json_validator.py:261-300.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ";":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in ('"', '}', ']'):
+                out.append(",")
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _drop_stray_string_separators(text: str) -> str:
+    """Remove stray whitespace-only string literals inserted between object fields.
+
+    glm-5.x 偶发在对象字段间插入一个孤立的空白字符串字面量。实测两种变体:
+
+    变体 A(孤立字符串后紧跟带引号的 key)::
+        "...确认"}, " "entry_setup_type": "breakout_pullback"
+        这里 LLM 在 ``,`` 后塞了 ``" "``,真正的 key 紧跟在第二个引号后。
+        修复:删除 ``" "``(第一个引号到第二个引号,含内容),保留第二个引号
+        作为下一个字符串的开始。
+
+    变体 B(孤立字符串后紧跟不带引号的 key)::
+        同上例,但 key ``entry_setup_type`` 没有自己的开始引号——LLM 把
+        那个引号"借"给了孤立字符串。此时第二个引号既是孤立字符串的结束,
+        又必须充当 key 的开始。修复:删除从第一个引号到第二个引号之前的
+        所有字符,保留第二个引号。
+
+    两种变体的修复结果相同:把 ``"<空白>"`` 整体删除,保留其后第一个引号。
+    保守起见,只处理同时满足下列条件的孤立字符串:
+    1. 位于字符串外,前驱非空白字符是 ``,`` / ``{`` / ``}`` / ``]``
+       (对象字段分隔位置,含前一个值闭合后的逗号场景);
+    2. 字符串内容全部为空白(``\\s``),且非空;
+    3. 后驱(跳过空白)是 ``"`` 或字母/下划线(下一个 key 的开始)。
+
+    不会删除数组里的合法字符串元素(其前驱是 ``[`` 或值分隔,但后驱是
+    ``,``/``]``,不满足条件 3)。
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        # 字符串内:原样输出,维护状态机
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            out.append(ch)
+            i += 1
+            continue
+        # 字符串外遇到引号:判断是否孤立空白字符串分隔符
+        if ch == '"':
+            # 找到这个字符串字面量的结束引号
+            j = i + 1
+            content_chars: list[str] = []
+            esc = False
+            while j < n:
+                cj = text[j]
+                if esc:
+                    esc = False
+                    content_chars.append(cj)
+                    j += 1
+                    continue
+                if cj == "\\":
+                    esc = True
+                    content_chars.append(cj)
+                    j += 1
+                    continue
+                if cj == '"':
+                    break
+                content_chars.append(cj)
+                j += 1
+            # j 指向结束引号(若找到);j>=n 表示未闭合,按普通字符串处理
+            content = "".join(content_chars)
+            # 条件 2:内容非空且全为空白
+            is_ws_only = bool(content) and all(c in " \t\r\n" for c in content)
+            # 条件 1:前驱非空白字符是 ,/{/}/]
+            k = len(out) - 1
+            while k >= 0 and out[k] in " \t\r\n":
+                k -= 1
+            prev_struct = out[k] if k >= 0 else ""
+            prev_is_field_sep = prev_struct in (",", "{", "}", "]")
+            # 条件 3:后驱(结束引号之后)跳过空白后是 " 或 字母/下划线
+            m = j + 1
+            while m < n and text[m] in " \t\r\n":
+                m += 1
+            next_char = text[m] if m < n else ""
+            next_is_key_start = next_char == '"' or (
+                next_char and (next_char.isalpha() or next_char == "_")
+            )
+            if is_ws_only and prev_is_field_sep and next_is_key_start and j < n:
+                # 命中:删除孤立空白字符串字面量。
+                # 两种变体的处理:
+                #   - 变体 A(后驱是 "):下一个 key 自带引号 → 删整个孤立字符串
+                #     (含其结束引号 text[j]),保留后驱的 "。
+                #   - 变体 B(后驱是字母/下划线):下一个 key 没有自己的引号,
+                #     孤立字符串的结束引号 text[j] 必须保留为 key 的开始引号。
+                #     → 删 [i, j),保留 text[j]。
+                if next_char == '"':
+                    # 变体 A:删 [i, j+1),连孤立字符串结束引号一起删,
+                    # 后驱的 " 由后续循环正常处理。
+                    i = j + 1
+                else:
+                    # 变体 B:保留结束引号作为 key 起始。
+                    out.append('"')
+                    i = j + 1
+                continue
+            # 未命中:正常输出这个字符串起始引号,后续循环处理内容
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
     return "".join(out)
 
 

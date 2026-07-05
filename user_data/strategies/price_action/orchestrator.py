@@ -427,6 +427,9 @@ class PriceActionOrchestrator:
                 current_messages,
                 stage="market_diagnosis",
                 errors=errors,
+                attempt=attempt + 1,
+                retry_limit=retry_limit,
+                previous_raw=raw_text,
             )
             attempt += 1
 
@@ -497,6 +500,9 @@ class PriceActionOrchestrator:
                 current_messages,
                 stage="trade_decision",
                 errors=validation.errors,
+                attempt=attempt + 1,
+                retry_limit=retry_limit,
+                previous_raw=raw_text,
             )
             attempt += 1
 
@@ -728,14 +734,205 @@ def _append_retry_feedback(
     *,
     stage: str,
     errors: list[str],
+    attempt: int = 1,
+    retry_limit: int = 1,
+    previous_raw: str | None = None,
 ) -> list[dict[str, str]]:
-    feedback = (
-        "上一次输出未通过程序校验。\n"
-        f"stage={stage}\n"
-        f"errors={json.dumps(errors, ensure_ascii=False)}\n\n"
-        "请只修正 JSON 输出，不要解释，不要输出 Markdown。"
+    """追加结构化重试反馈 + 上轮 assistant 输出回灌。
+
+    相比早期"只丢一句 errors 列表"的实现,本版本:
+    1. 把内部错误码翻译成 LLM 能理解的人话 + 可操作指引;
+    2. 针对常见错误追加枚举提示(如 gate_trace answer 只能用 是/否/中性/等待/不适用);
+    3. 列出禁止项,防止 LLM 为通过校验而乱改方向;
+    4. 把上轮 assistant 输出回灌,让 LLM 看到自己写错了什么(对照修改)。
+
+    参考 PA_Agent ``retry_feedback.py:58 build_retry_feedback``。
+    """
+    feedback = _build_retry_feedback(
+        stage=stage,
+        errors=errors,
+        attempt=attempt,
+        retry_limit=retry_limit,
     )
-    return [*messages, {"role": "user", "content": feedback}]
+    # 上轮 assistant 输出回灌:让 LLM 看到自己上次写了什么(对照修改)。
+    # PA_Agent validation_retry.py:197-200 的关键机制。
+    new_messages = list(messages)
+    if previous_raw and previous_raw.strip():
+        new_messages = [
+            *new_messages,
+            {"role": "assistant", "content": previous_raw},
+        ]
+    return [*new_messages, {"role": "user", "content": feedback}]
+
+
+# 错误类别中文标签。参考 PA_Agent retry_feedback.py:12 _CATEGORY_ZH。
+_CATEGORY_LABEL: dict[str, str] = {
+    "a": "JSON 语法错误",
+    "b": "缺少必填字段",
+    "c": "字段值/一致性不符合规则",
+    "d": "未输出 JSON(正文为空或纯文字)",
+    "e": "API 额度/限流",
+}
+
+# 错误码 → 中文人话翻译 + 可操作指引。
+# 参考 PA_Agent validation_messages.py 的 _PREFIX_RULES,适配 freqtrade 错误码。
+_ERROR_HINTS: dict[str, str] = {
+    # ── market_diagnosis 阶段 ──
+    "market_diagnosis_gate_trace_direction_branch_conflict":
+        "gate_trace 中某条的 direction 字段与 branch 字段语义冲突。请检查每条 gate_trace,"
+        "direction 取 long/short/neutral,branch 必须与 direction 自洽"
+        "(如 direction=long 时 branch 应为 aligned/bullish,不能是 bearish/conflict)。",
+    "market_diagnosis_gate_trace_direction_answer_conflict":
+        "gate_trace 中某条的 direction 与 answer 冲突。direction=long 对应的 answer 应为「是/中性」,"
+        "不能是「否」(除非 branch 显式标记 reversal)。",
+    "market_diagnosis_gate_trace_cycle_branch_conflict":
+        "gate_trace 中 cycle_position 与 branch 冲突。请检查 cycle_position=spike 时 "
+        "branch 是否用了 not_spike 类分支。",
+    "market_diagnosis_gate_trace_answer_invalid":
+        "gate_trace[].answer 只能用 是/否/中性/等待/不适用。"
+        "禁止写「同向/冲突/多头/空头/bullish/bearish」等词——方向信息写进 branch。",
+    "market_diagnosis_gate_trace_bar_range_required":
+        "每条 gate_trace 必须有 bar_range 字段,格式如 K1 或 K2-K1(范围)。",
+    "market_diagnosis_gate_trace_bar_range_invalid":
+        "gate_trace[].bar_range 必须引用当前 K 线帧内的 K 序号(如 K1、K2-K5),不能是 K0 或超出范围。",
+    "market_diagnosis_bar_by_bar_summary_must_cover_k5_to_k1":
+        "bar_by_bar_summary 必须包含 K5、K4、K3、K2、K1 这 5 根 K 线各自的总结条目,"
+        "缺一不可。请检查是否漏了某根 K 线。",
+    "market_diagnosis_bar_by_bar_bar_type_mismatch":
+        "bar_by_bar_summary[].bar_type 与程序计算的 K 线几何不一致。"
+        "bar_type 必须服从程序几何表(trend_bull/trend_bear/doji 等),不能凭主观判断。",
+    "market_diagnosis_bar_by_bar_role_invalid":
+        "bar_by_bar_summary[].role 只能用 "
+        "structure/signal/entry/confirmation/noise/trap/climax/test。"
+        "禁止写 support/resistance/continuation 或 detected_patterns 中的形态名。",
+    "market_diagnosis_bar_by_bar_trapped_side_invalid":
+        "bar_by_bar_summary[].trapped_side 只能用 bulls/bears/both/none/unknown。"
+        "禁止 null/空值;无明确被套方向时写 none。",
+    "market_diagnosis_bar_by_bar_context_effect_invalid":
+        "bar_by_bar_summary[].context_effect 只能用 "
+        "strengthens_bull/weakens_bull/strengthens_bear/weakens_bear/neutral/transition。"
+        "注意 strengthens_bear 不要拼成 strengthens_bash。",
+    "market_diagnosis_direction_invalid":
+        "顶层 direction 只能用 long/short/neutral。",
+    "market_diagnosis_cycle_position_invalid":
+        "cycle_position 只能用 spike/transitioning/barbwire/trading_range/trend 之一。",
+    # ── trade_decision 阶段 ──
+    "risk_reward_below_minimum":
+        "盈亏比(R/R)低于最低要求。请重新计算 entry/stop/tp1,"
+        "确保 R/R >= 配置的最低值;若市场结构不支持合格 R/R,应改为不下单。",
+    "trader_equation_fails":
+        "交易者方程不成立(盈亏比 × 胜率 < 1)。请重算或下调 trade_confidence,"
+        "若无法满足应改为不下单。",
+    "order_direction_conflicts_with_stage1_direction_without_node_2_3":
+        "下单方向与 stage1 的 direction 冲突,且没有 node 2.3 的覆盖理由。"
+        "若要反向下单,必须在 decision_trace 中加 node 2.3 说明反向依据。",
+    "long_stop_must_be_below_entry": "做多止损价必须低于入场价。",
+    "long_tp1_must_be_above_entry": "做多止盈1必须高于入场价。",
+    "long_tp2_must_be_above_tp1": "做多止盈2必须高于止盈1。",
+    "short_stop_must_be_above_entry": "做空止损价必须高于入场价。",
+    "short_tp1_must_be_below_entry": "做空止盈1必须低于入场价。",
+    "short_tp2_must_be_below_tp1": "做空止盈2必须低于止盈1。",
+    "decision_trace_bar_range_invalid":
+        "decision_trace[].bar_range 必须引用当前 K 线帧内的 K 序号(如 K1、K2-K5),格式正确。",
+    "decision_trace_answer_invalid":
+        "decision_trace[].answer 只能用 是/否/中性/等待/不适用。",
+}
+
+
+def _build_retry_feedback(
+    *,
+    stage: str,
+    errors: list[str],
+    attempt: int,
+    retry_limit: int,
+) -> str:
+    """生成结构化、可操作的 LLM 重试反馈。
+
+    参考 PA_Agent ``retry_feedback.py:58 build_retry_feedback``。
+    """
+    category = _categorize_errors(errors)
+    stage_zh = "市场诊断(stage1)" if "diagnosis" in stage else "交易决策(stage2)"
+
+    lines = [
+        f"## 校验未通过(第 {attempt}/{retry_limit} 次重试)",
+        "",
+        f"阶段:**{stage_zh}**",
+        f"失败类型:**{_CATEGORY_LABEL.get(category, category)}** (category={category})",
+        "",
+        "**必须修正(仅修下列项;其余字段保持与上一轮一致):**",
+    ]
+
+    # 列出具体错误 + 人话翻译
+    shown = 0
+    for err in errors[:8]:
+        hint = _lookup_hint(err)
+        lines.append(f"{shown + 1}. {hint}")
+        shown += 1
+    if len(errors) > 8:
+        lines.append(f"…另有 {len(errors) - 8} 条错误")
+
+    # 针对性枚举提示
+    err_blob = " ".join(errors)
+    if "gate_trace" in err_blob and "answer" in err_blob:
+        lines.append("")
+        lines.append("**gate_trace answer 枚举提示:**")
+        lines.append(
+            "- answer 只能用 **是/否/中性/等待/不适用**;"
+            "「同向/冲突/背景中性」写在 branch(aligned/conflict/neutral_background),"
+            "**禁止**把「冲突」写在 answer。"
+        )
+    if "bar_by_bar" in err_blob and ("role" in err_blob or "trapped_side" in err_blob):
+        lines.append("")
+        lines.append("**bar_by_bar_summary 枚举提示:**")
+        lines.append(
+            "- role 只用 structure/signal/entry/confirmation/noise/trap/climax/test;"
+            "- trapped_side 只用 bulls/bears/both/none/unknown(无被套方向写 none,禁止 null);"
+            "- context_effect 只用 strengthens_bull/weakens_bull/strengthens_bear/weakens_bear/neutral/transition。"
+        )
+
+    # 禁止项:防止 LLM 为通过校验而乱改方向/反转交易结论
+    lines.append("")
+    lines.append("**禁止为通过校验而修改:**")
+    if "diagnosis" in stage:
+        forbidden = (
+            "顶层 direction / cycle_position(除非有明确 K 线依据);",
+            "gate_trace[].answer 之外的字段(除非反馈明确要求);",
+            "程序锁定的 K 线几何 bar_type(必须服从程序几何表)。",
+        )
+    else:
+        forbidden = (
+            "diagnosis_summary.cycle_position / direction(除非反馈明确要求);",
+            "把 order_type 从「不下单」改成下单(或反之)仅为通过校验;",
+            "交易者方程的数值结论(须基于真实 entry/stop/target 重算)。",
+        )
+    for item in forbidden:
+        lines.append(f"- {item}")
+
+    lines.append("")
+    lines.append(
+        f"请根据以上说明,在 assistant 正文输出**完整**{stage_zh}裸 JSON(不要 markdown 围栏)。"
+        "交易结论须与 K 线分析一致,不得仅为修字段而反转方向。"
+    )
+    return "\n".join(lines)
+
+
+def _lookup_hint(error_code: str) -> str:
+    """把单条错误码翻译成人话 + 可操作指引。"""
+    code = str(error_code).strip()
+    # 精确匹配
+    if code in _ERROR_HINTS:
+        return f"[{code}] {_ERROR_HINTS[code]}"
+    # 缺失字段类:market_diagnosis_missing_<field> / decision_trace_<field>_required
+    if "_missing_" in code or code.endswith("_required"):
+        field = code.split("_missing_")[-1] if "_missing_" in code else code.replace("_required", "")
+        return f"[{code}] 缺少必填字段「{field}」,请补上。"
+    # JSON 语法类
+    if code.startswith("invalid_json:") or "JSONDecodeError" in code:
+        return f"[{code}] JSON 语法错误。请确保输出是合法 JSON:引号成对、逗号正确、无多余字符。"
+    if code == "json_root_must_be_object":
+        return f"[{code}] JSON 根必须是对象 {{...}},不能是数组或纯文本。"
+    # 兜底:原样展示
+    return f"[{code}]"
 
 
 def _decision_stance(config: dict[str, Any]) -> str:

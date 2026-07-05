@@ -1598,7 +1598,15 @@ class TestMarketDiagnosisOrchestrator:
 
         assert outcome.status == "success"
         assert llm.complete_json.call_count == 3
-        assert "上一次输出未通过程序校验" in seen_messages[1][-1]["content"]
+        # Retry feedback is appended as the last user message. New structured
+        # feedback uses a "## 校验未通过" header and translates error codes.
+        feedback_msg = seen_messages[1][-1]
+        assert feedback_msg["role"] == "user"
+        assert "校验未通过" in feedback_msg["content"]
+        # The previous (failed) assistant turn must be re-injected before the
+        # feedback so the LLM can self-correct against its own prior output.
+        assert seen_messages[1][-2]["role"] == "assistant"
+        assert json.dumps(bad_diagnosis, ensure_ascii=False) in seen_messages[1][-2]["content"]
         raw = repository.save_analysis.call_args.kwargs["raw_responses"]
         assert len(raw["market_diagnosis"]["retry_attempts"]) == 1
 
@@ -1669,7 +1677,12 @@ class TestMarketDiagnosisOrchestrator:
 
         assert outcome.status == "success"
         assert llm.complete_json.call_count == 3
-        assert "上一次输出未通过程序校验" in seen_messages[2][-1]["content"]
+        # New structured feedback header + previous assistant turn re-injected.
+        feedback_msg = seen_messages[2][-1]
+        assert feedback_msg["role"] == "user"
+        assert "校验未通过" in feedback_msg["content"]
+        assert seen_messages[2][-2]["role"] == "assistant"
+        assert json.dumps(invalid_decision, ensure_ascii=False) in seen_messages[2][-2]["content"]
         raw = repository.save_analysis.call_args.kwargs["raw_responses"]
         assert len(raw["trade_decision"]["retry_attempts"]) == 1
 
