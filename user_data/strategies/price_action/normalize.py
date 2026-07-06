@@ -26,6 +26,7 @@ from .price_tick import (
 )
 from .trace_normalize import (
     normalize_trace_list_bar_range,
+    repair_stage1_gate_trace,
     repair_stage2_terminal,
     strip_ai_gate_14,
 )
@@ -624,6 +625,7 @@ def normalize_market_diagnosis(
     gate = out.get("gate_trace")
     if isinstance(gate, list):
         strip_ai_gate_14(gate)
+    repair_stage1_gate_trace(out)
     _resolve_trace_answers(gate or [])
     normalize_trace_list_bar_range(
         gate,

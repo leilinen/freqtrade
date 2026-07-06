@@ -7,6 +7,7 @@ normalize_market_diagnosis / normalize_trade_decision entry points.
 """
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -34,9 +35,13 @@ from price_action.trace_normalize import (  # noqa: E402
     infer_max_bar_seq_from_trace,
     normalize_trace_item_bar_range,
     normalize_trace_list_bar_range,
+    repair_gate_trace_answer_aliases,
+    repair_stage1_gate_trace,
     repair_stage2_terminal,
     sort_trace_by_chapter,
     strip_ai_gate_14,
+    strip_gate_end_nodes,
+    strip_program_reference_blocks,
 )
 
 
@@ -562,3 +567,272 @@ class TestBatchBIntegration:
         assert out["decision"]["order_type"] == "不下单"
         # After coerce, terminal.node_id should be aligned to 10.3
         assert out["terminal"]["node_id"] == "10.3"
+
+
+# ── Batch C: prog-ref stripping / gate-end removal / answer aliases ──
+
+
+class TestStripProgramReferenceBlocks:
+    def test_empty_returns_empty(self):
+        assert strip_program_reference_blocks("") == ""
+
+    def test_none_returns_empty(self):
+        assert strip_program_reference_blocks(None) == ""
+
+    def test_strips_single_block(self):
+        text = "前期突破。【程序参考数据（市场特征）：ATR=100, 波动率=高】继续看多。"
+        out = strip_program_reference_blocks(text)
+        assert "程序参考数据" not in out
+        assert "前期突破。" in out
+        assert "继续看多。" in out
+
+    def test_strips_multiple_blocks(self):
+        text = (
+            "【程序参考数据（市场特征）：A=1】"
+            "正文。【程序参考数据（趋势特征）：B=2】"
+        )
+        out = strip_program_reference_blocks(text)
+        assert "程序参考数据" not in out
+        assert "正文。" in out
+
+    def test_preserves_text_without_blocks(self):
+        text = "纯文本，无注入。"
+        assert strip_program_reference_blocks(text) == text
+
+    def test_collapses_extra_whitespace(self):
+        text = "前文。  \n\n  【程序参考数据（市场特征）：X=1】  后文。"
+        out = strip_program_reference_blocks(text)
+        assert "  " not in out
+
+
+class TestRepairGateTraceAnswerAliases:
+    def test_proceed_maps_to_yes(self):
+        gate = [{"node_id": "2.5", "answer": "proceed", "branch": ""}]
+        repair_gate_trace_answer_aliases(gate)
+        assert gate[0]["answer"] == "是"
+        assert gate[0]["branch"] == "proceed"
+
+    def test_wait_maps_to_wait_text(self):
+        gate = [{"node_id": "2.5", "answer": "wait"}]
+        repair_gate_trace_answer_aliases(gate)
+        assert gate[0]["answer"] == "等待"
+
+    def test_unknown_maps_to_neutral(self):
+        gate = [{"node_id": "2.5", "answer": "unknown"}]
+        repair_gate_trace_answer_aliases(gate)
+        assert gate[0]["answer"] == "中性"
+
+    def test_case_insensitive(self):
+        gate = [{"node_id": "2.5", "answer": "PROCEED"}]
+        repair_gate_trace_answer_aliases(gate)
+        assert gate[0]["answer"] == "是"
+
+    def test_keeps_existing_branch_on_proceed(self):
+        gate = [{"node_id": "2.5", "answer": "proceed", "branch": "bullish"}]
+        repair_gate_trace_answer_aliases(gate)
+        assert gate[0]["branch"] == "bullish"
+
+    def test_normal_answer_untouched(self):
+        gate = [{"node_id": "2.5", "answer": "是", "branch": "bullish"}]
+        repair_gate_trace_answer_aliases(gate)
+        assert gate[0]["answer"] == "是"
+        assert gate[0]["branch"] == "bullish"
+
+    def test_non_dict_items_skipped(self):
+        gate = [None, "string", {"node_id": "2.5", "answer": "proceed"}]
+        repair_gate_trace_answer_aliases(gate)
+        assert gate[2]["answer"] == "是"
+
+
+class TestStripGateEndNodes:
+    def test_removes_gate_end(self):
+        gate = [
+            {"node_id": "2.5", "answer": "是"},
+            {"node_id": "gate_end", "answer": "是"},
+        ]
+        n = strip_gate_end_nodes(gate)
+        assert n == 1
+        assert [item["node_id"] for item in gate] == ["2.5"]
+
+    def test_removes_summary_variants(self):
+        gate = [
+            {"node_id": "1.1"},
+            {"node_id": "gate_summary"},
+            {"node_id": "summary"},
+        ]
+        n = strip_gate_end_nodes(gate)
+        assert n == 2
+        assert [item["node_id"] for item in gate] == ["1.1"]
+
+    def test_no_op_when_no_end_nodes(self):
+        gate = [{"node_id": "1.1"}, {"node_id": "2.5"}]
+        n = strip_gate_end_nodes(gate)
+        assert n == 0
+        assert len(gate) == 2
+
+    def test_empty_list(self):
+        assert strip_gate_end_nodes([]) == 0
+
+    def test_none_skipped(self):
+        gate = [None, {"node_id": "gate_end"}, {"node_id": "1.1"}]
+        n = strip_gate_end_nodes(gate)
+        assert n == 1
+        assert gate[0] is None
+        assert gate[1]["node_id"] == "1.1"
+
+
+class TestRepairStage1GateTrace:
+    def test_no_op_when_gate_trace_missing(self):
+        obj: dict = {}
+        assert repair_stage1_gate_trace(obj) is False
+
+    def test_no_op_when_gate_trace_empty(self):
+        obj = {"gate_trace": []}
+        assert repair_stage1_gate_trace(obj) is False
+
+    def test_no_op_when_gate_trace_not_list(self):
+        obj = {"gate_trace": "x"}
+        assert repair_stage1_gate_trace(obj) is False
+
+    def test_strips_gate_end_nodes(self):
+        obj = {
+            "gate_trace": [
+                {"node_id": "1.1", "answer": "是"},
+                {"node_id": "gate_end"},
+            ]
+        }
+        assert repair_stage1_gate_trace(obj) is True
+        assert [item["node_id"] for item in obj["gate_trace"]] == ["1.1"]
+
+    def test_maps_proceed_answer_alias(self):
+        obj = {
+            "gate_trace": [
+                {"node_id": "2.5", "answer": "proceed", "branch": ""},
+            ]
+        }
+        repair_stage1_gate_trace(obj)
+        assert obj["gate_trace"][0]["answer"] == "是"
+        assert obj["gate_trace"][0]["branch"] == "proceed"
+
+    def test_strips_prog_ref_from_2_5_reason(self):
+        obj = {
+            "gate_trace": [
+                {
+                    "node_id": "2.5",
+                    "answer": "是",
+                    "reason": "突破确认。【程序参考数据（市场特征）：ATR=100】",
+                }
+            ]
+        }
+        repair_stage1_gate_trace(obj)
+        assert "程序参考数据" not in obj["gate_trace"][0]["reason"]
+
+    def test_strips_prog_ref_from_1_3_reason(self):
+        obj = {
+            "gate_trace": [
+                {
+                    "node_id": "1.3",
+                    "answer": "是",
+                    "reason": "K1【程序参考数据（趋势特征）：Slope=up】",
+                }
+            ]
+        }
+        repair_stage1_gate_trace(obj)
+        assert "程序参考数据" not in obj["gate_trace"][0]["reason"]
+
+    def test_does_not_strip_prog_ref_from_other_nodes(self):
+        """Per upstream: only §1.3 and §2.5 reasons get prog-ref cleanup."""
+        obj = {
+            "gate_trace": [
+                {
+                    "node_id": "2.3",
+                    "answer": "是",
+                    "reason": "【程序参考数据（市场特征）：ATR=100】",
+                }
+            ]
+        }
+        repair_stage1_gate_trace(obj)
+        # 2.3 is not in the cleanup set
+        assert "程序参考数据" in obj["gate_trace"][0]["reason"]
+
+    def test_appends_proceed_token_when_missing(self):
+        obj = {
+            "gate_result": "proceed",
+            "gate_trace": [
+                {"node_id": "2.5", "answer": "是", "reason": "信号良好。"},
+            ],
+        }
+        repair_stage1_gate_trace(obj)
+        reason = obj["gate_trace"][-1]["reason"]
+        assert "可进入阶段二" in reason
+
+    def test_no_proceed_token_injected_when_already_present(self):
+        obj = {
+            "gate_result": "proceed",
+            "gate_trace": [
+                {"node_id": "2.5", "answer": "是", "reason": "闸门通过，可进入阶段二"},
+            ],
+        }
+        before = obj["gate_trace"][-1]["reason"]
+        repair_stage1_gate_trace(obj)
+        after = obj["gate_trace"][-1]["reason"]
+        assert before == after
+
+    def test_no_proceed_token_when_gate_result_not_proceed(self):
+        obj = {
+            "gate_result": "wait",
+            "gate_trace": [
+                {"node_id": "2.5", "answer": "等待", "reason": "震荡市。"},
+            ],
+        }
+        before = obj["gate_trace"][-1]["reason"]
+        repair_stage1_gate_trace(obj)
+        assert obj["gate_trace"][-1]["reason"] == before
+
+
+class TestBatchCIntegration:
+    """normalize_market_diagnosis runs repair_stage1_gate_trace before bar_range."""
+
+    def test_normalize_strips_gate_end_via_stage1(self):
+        diagnosis = {
+            "gate_trace": [
+                {"node_id": "1.1", "answer": "是", "reason": "ok"},
+                {"node_id": "gate_end", "answer": "是", "reason": "x"},
+            ]
+        }
+        out = normalize_market_diagnosis(diagnosis)
+        assert [item["node_id"] for item in out["gate_trace"]] == ["1.1"]
+
+    def test_normalize_strips_prog_ref_via_stage1(self):
+        diagnosis = {
+            "gate_trace": [
+                {
+                    "node_id": "2.5",
+                    "answer": "是",
+                    "reason": "确认。【程序参考数据（市场特征）：ATR=1】",
+                }
+            ]
+        }
+        out = normalize_market_diagnosis(diagnosis)
+        assert "程序参考数据" not in out["gate_trace"][0]["reason"]
+
+    def test_normalize_appends_proceed_token_via_stage1(self):
+        diagnosis = {
+            "gate_result": "proceed",
+            "gate_trace": [
+                {"node_id": "2.5", "answer": "是", "reason": "信号良好。"},
+            ],
+        }
+        out = normalize_market_diagnosis(diagnosis)
+        assert "可进入阶段二" in out["gate_trace"][-1]["reason"]
+
+    def test_normalize_does_not_mutate_input(self):
+        diagnosis = {
+            "gate_result": "proceed",
+            "gate_trace": [
+                {"node_id": "2.5", "answer": "proceed", "branch": "", "reason": "ok。"},
+            ],
+        }
+        original = copy.deepcopy(diagnosis)
+        normalize_market_diagnosis(diagnosis)
+        assert diagnosis == original

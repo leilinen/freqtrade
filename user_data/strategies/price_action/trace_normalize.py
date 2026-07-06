@@ -32,6 +32,30 @@ logger = logging.getLogger(__name__)
 _BAR_RANGE_RE = re.compile(r"^K(\d+)-K(\d+)$", re.IGNORECASE)
 _SINGLE_BAR_RE = re.compile(r"^K(\d+)$", re.IGNORECASE)
 
+# Program-injected reference blocks like 【程序参考数据（市场特征）：...】
+_PROG_REF_BLOCK_RE = re.compile(r"【程序参考数据（[^】]*）：.*?】", re.DOTALL)
+
+# Model-invented summary nodes; gate_result belongs in gate_result field.
+_GATE_END_NODE_IDS = frozenset({"gate_end", "gate_summary", "summary"})
+
+# Tokens that mark a "proceed" rationale as complete.
+_PROCEED_FINAL_TOKENS: tuple[str, ...] = (
+    "进入阶段二",
+    "可进入阶段二",
+    "闸门通过",
+    "继续阶段二",
+    "进入策略",
+    "可继续分析",
+)
+
+# When the AI writes the gate_result token as a trace answer
+# (e.g. node 2.5 answer="proceed"), map it back to the schema enum.
+_GATE_RESULT_ANSWER_ALIASES: dict[str, str] = {
+    "proceed": "是",
+    "wait": "等待",
+    "unknown": "中性",
+}
+
 # ── Aliases / placeholders ──
 _BAR_RANGE_ALIASES = frozenset({"全局", "全图", "整体", "全部", "all"})
 _PENDING_BAR_RANGE_VALUES = frozenset(
@@ -537,3 +561,110 @@ def repair_stage2_terminal(obj: dict[str, Any]) -> bool:
             return True
         return False
     return False
+
+
+# ── Batch C: program-reference stripping, gate-end removal, answer aliases ──
+
+
+def strip_program_reference_blocks(text: str) -> str:
+    """Remove merged program-metric blocks from trace reason (§2.5 cleanup).
+
+    Mirrors upstream ``_strip_program_reference_blocks``. The orchestrator
+    injects 【程序参考数据（市场特征）：...】 blocks into node 2.5 reason; the
+    model sometimes echoes them back into the trace, where the validator's
+    "no program-reference leakage" rule would reject them. Strip before
+    validation.
+    """
+    cleaned = _PROG_REF_BLOCK_RE.sub("", text or "")
+    return " ".join(cleaned.split()).strip()
+
+
+def repair_gate_trace_answer_aliases(gate_trace: list[Any]) -> None:
+    """Map gate_result tokens mistakenly written as trace answer.
+
+    Mirrors upstream ``_repair_gate_trace_answer_aliases``. When the AI
+    writes ``answer="proceed"`` (a gate_result enum value, not a valid
+    node answer), translate to 是. proceed with empty branch → fill
+    ``branch="proceed"`` so downstream direction sync treats it as
+    "passed".
+    """
+    for item in gate_trace:
+        if not isinstance(item, dict):
+            continue
+        raw = str(item.get("answer", "") or "").strip()
+        mapped = _GATE_RESULT_ANSWER_ALIASES.get(raw.lower())
+        if mapped:
+            item["answer"] = mapped
+            branch = str(item.get("branch", "") or "").strip()
+            if raw.lower() == "proceed" and not branch:
+                item["branch"] = "proceed"
+
+
+def strip_gate_end_nodes(gate_trace: list[Any]) -> int:
+    """Drop model-invented gate_end / summary nodes from gate_trace.
+
+    Mirrors upstream ``_strip_gate_end_nodes``. ``gate_result`` lives
+    in its own field; nodes named gate_end/gate_summary/summary are
+    hallucinations. Returns count removed.
+    """
+    if not isinstance(gate_trace, list) or not gate_trace:
+        return 0
+    kept = [
+        item
+        for item in gate_trace
+        if not (
+            isinstance(item, dict)
+            and str(item.get("node_id", "") or "").strip().lower() in _GATE_END_NODE_IDS
+        )
+    ]
+    removed = len(gate_trace) - len(kept)
+    if removed:
+        gate_trace[:] = kept
+        logger.debug("Stripped %s gate_end/summary nodes from gate_trace", removed)
+    return removed
+
+
+def repair_stage1_gate_trace(obj: dict[str, Any]) -> bool:
+    """Format-only stage1 gate_trace repairs before validation.
+
+    Mirrors upstream ``_repair_stage1_gate_trace``. Runs:
+    1. answer alias repair (proceed/wait/unknown → enum)
+    2. drop gate_end/summary nodes
+    3. strip program-reference blocks from §1.3/§2.5 reasons
+    4. (delegates _sync_gate_23_with_direction / _repair_gate_result
+       to validation.py — already called there)
+
+    Returns True if any mutation happened.
+    """
+    gate = obj.get("gate_trace")
+    if not isinstance(gate, list) or not gate:
+        return False
+
+    mutated = False
+
+    repair_gate_trace_answer_aliases(gate)
+    if strip_gate_end_nodes(gate):
+        mutated = True
+
+    for item in gate:
+        if not isinstance(item, dict):
+            continue
+        nid = str(item.get("node_id", "") or "").strip()
+        if nid in ("1.3", "2.5"):
+            reason = str(item.get("reason", "") or "")
+            stripped = strip_program_reference_blocks(reason)
+            if stripped != reason.strip():
+                item["reason"] = stripped
+                mutated = True
+
+    # Proceed-final-token injection: when gate_result=proceed, ensure the
+    # last gate node reason ends with a token marking the gate as cleared.
+    if str(obj.get("gate_result", "") or "").strip().lower() == "proceed" and gate:
+        last = gate[-1]
+        if isinstance(last, dict):
+            blob = str(last.get("reason", "") or "")
+            if not any(tok in blob for tok in _PROCEED_FINAL_TOKENS):
+                last["reason"] = (blob.rstrip("。") + "，闸门通过，可进入阶段二。").strip()
+                mutated = True
+
+    return mutated
