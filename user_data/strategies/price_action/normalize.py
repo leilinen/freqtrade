@@ -162,6 +162,264 @@ def _clear_decision_to_no_order(decision: dict[str, Any]) -> None:
         decision["trade_confidence_reasoning"] = "无入场计划，不存在交易信心"
 
 
+# ── Stage2 unwrap / required-fields / truncate (Batch D) ──
+#
+# When the model puts trade-decision fields at the JSON root instead of
+# nested under `decision`, or writes decision as a scalar ("wait"/"reject"),
+# `_unwrap_flat_stage2_decision` rebuilds the canonical structure before
+# schema validation. `_ensure_decision_required_fields` fills missing
+# non-null schema fields with sensible defaults derived from stage1.
+# `_truncate_decision_reasoning` caps reasoning length to avoid verbose
+# JSON overflowing the model's response budget.
+
+# Cap decision.reasoning to keep JSON payload bounded.
+DECISION_REASONING_MAX_LEN = 280
+
+_DECISION_SUBFIELD_KEYS: frozenset[str] = frozenset({
+    "order_direction",
+    "order_type",
+    "entry_price",
+    "entry_basis_bar",
+    "entry_basis_extreme",
+    "entry_rule",
+    "take_profit_price",
+    "take_profit_price_2",
+    "stop_loss_price",
+    "reasoning",
+    "diagnosis_confidence",
+    "diagnosis_confidence_reasoning",
+    "trade_confidence",
+    "trade_confidence_reasoning",
+    "estimated_win_rate",
+    "estimated_win_rate_reasoning",
+    "key_factors",
+    "watch_points",
+    "risk_assessment",
+    "invalidation_condition",
+})
+
+# Maps scalar decision tokens and terminal-outcome-like strings to the
+# canonical outcome. Used by `_order_type_from_decision_scalar` to translate
+# "wait"/"reject" (a terminal-outcome hint) into 不下单.
+_TERMINAL_OUTCOME_ALIASES: dict[str, str] = {
+    "action": "trade",
+    "execute": "trade",
+    "execution": "trade",
+    "place_order": "trade",
+    "breakout_entry": "trade",
+    "breakout": "trade",
+    "limit_entry": "trade",
+    "market_entry": "trade",
+    "entry": "trade",
+    "trade_entry": "trade",
+    "no_trade": "wait",
+    "no_order": "wait",
+    "wait": "wait",
+    "reject": "reject",
+    "trade": "trade",
+    "proceed": "proceed",
+}
+
+
+def _order_type_from_decision_scalar(value: str) -> str | None:
+    """Map a scalar decision token (wait/reject/limit/…) to order_type.
+
+    Mirrors upstream. Returns ``None`` for unrecognized tokens so the caller
+    can fall back to 不下单 as the safe default.
+    """
+    token = str(value or "").strip().lower()
+    if not token:
+        return None
+    if token in _ORDER_TYPE_ALIASES:
+        return _ORDER_TYPE_ALIASES[token]
+    normalized = token.replace(" ", "_").replace("-", "_")
+    if normalized in _ORDER_TYPE_ALIASES:
+        return _ORDER_TYPE_ALIASES[normalized]
+    outcome = _TERMINAL_OUTCOME_ALIASES.get(token) or _TERMINAL_OUTCOME_ALIASES.get(
+        normalized
+    )
+    if outcome in ("wait", "reject"):
+        return "不下单"
+    return None
+
+
+def _unwrap_flat_stage2_decision(out: dict[str, Any]) -> bool:
+    """Repair models that put decision fields at root or use decision=scalar.
+
+    Mirrors upstream ``_unwrap_flat_stage2_decision``. Hoists any
+    ``_DECISION_SUBFIELD_KEYS`` found at the top level into ``out['decision']``.
+    When ``decision`` itself is a scalar string, builds a fresh dict with
+    ``order_type`` derived from the scalar (falling back to 不下单).
+    """
+    changed = False
+    hoisted: dict[str, Any] = {}
+    for key in _DECISION_SUBFIELD_KEYS:
+        if key in out:
+            hoisted[key] = out.pop(key)
+            changed = True
+
+    raw = out.get("decision")
+    if isinstance(raw, str):
+        order_type = _order_type_from_decision_scalar(raw) or "不下单"
+        decision: dict[str, Any] = {"order_type": order_type}
+        decision.update(hoisted)
+        out["decision"] = decision
+        logger.debug(
+            "Unwrapped scalar decision %r -> order_type=%s with %d hoisted fields",
+            raw,
+            order_type,
+            len(hoisted),
+        )
+        return True
+
+    if isinstance(raw, dict):
+        for key, val in hoisted.items():
+            existing = raw.get(key)
+            if key not in raw or existing is None or existing == "" or existing == []:
+                raw[key] = val
+                changed = True
+        return changed
+
+    if hoisted:
+        out["decision"] = hoisted
+        logger.debug("Built decision object from %d hoisted root fields", len(hoisted))
+        return True
+    return changed
+
+
+def _hoist_terminal_from_decision(out: dict[str, Any]) -> bool:
+    """Move ``terminal`` nested under ``decision`` to the top level.
+
+    Some models nest terminal inside the decision object. Schema expects
+    terminal at root. Mirrors upstream ``_hoist_terminal_from_decision``.
+    """
+    if isinstance(out.get("terminal"), dict):
+        return False
+    decision = out.get("decision")
+    if not isinstance(decision, dict):
+        return False
+    nested = decision.pop("terminal", None)
+    if not isinstance(nested, dict):
+        return False
+    out["terminal"] = nested
+    logger.debug("Hoisted terminal from decision to top level")
+    return True
+
+
+def _ensure_decision_required_fields(
+    out: dict[str, Any],
+    *,
+    stage1_json: dict[str, Any] | None = None,
+) -> bool:
+    """Fill missing decision sub-fields that commonly trigger schema retries.
+
+    Mirrors upstream. Adds empty lists for key_factors/watch_points,
+    sensible text defaults for reasoning/diagnosis_confidence_reasoning/
+    risk_assessment, numeric defaults for diagnosis_confidence and
+    trade_confidence, and a label for terminal when missing.
+    """
+    decision = out.get("decision")
+    if not isinstance(decision, dict):
+        return False
+    s1 = stage1_json or {}
+    changed = _normalize_order_type_aliases(decision)
+    if not isinstance(decision.get("key_factors"), list):
+        decision["key_factors"] = []
+        changed = True
+    if not isinstance(decision.get("watch_points"), list):
+        decision["watch_points"] = []
+        changed = True
+    text_defaults = {
+        "reasoning": "基于阶段一诊断与当前K线结构的阶段二决策说明",
+        "diagnosis_confidence_reasoning": (
+            str(s1.get("htf_context") or "").strip()[:500]
+            or "依据阶段一诊断与闸门结论"
+        ),
+        "risk_assessment": "见 watch_points 与 invalidation_condition",
+    }
+    for key, default in text_defaults.items():
+        if not isinstance(decision.get(key), str) or not str(decision.get(key)).strip():
+            decision[key] = default
+            changed = True
+    if decision.get("diagnosis_confidence") is None:
+        try:
+            decision["diagnosis_confidence"] = int(s1.get("diagnosis_confidence") or 50)
+        except (TypeError, ValueError):
+            decision["diagnosis_confidence"] = 50
+        changed = True
+    if decision.get("trade_confidence") is None:
+        decision["trade_confidence"] = (
+            0 if decision.get("order_type") == "不下单" else 50
+        )
+        changed = True
+    if (
+        not isinstance(decision.get("trade_confidence_reasoning"), str)
+        or not decision["trade_confidence_reasoning"].strip()
+    ):
+        decision["trade_confidence_reasoning"] = (
+            "无入场计划，不存在交易信心"
+            if decision.get("order_type") == "不下单"
+            else "基于结构与入场方案的综合评估"
+        )
+        changed = True
+    if decision.get("order_type") == "不下单":
+        if "estimated_win_rate" not in decision:
+            decision["estimated_win_rate"] = None
+            changed = True
+    elif decision.get("estimated_win_rate") is None:
+        decision["estimated_win_rate"] = 50
+        changed = True
+    if decision.get("estimated_win_rate_reasoning") is not None and not isinstance(
+        decision.get("estimated_win_rate_reasoning"), str
+    ):
+        decision["estimated_win_rate_reasoning"] = None
+        changed = True
+    elif "estimated_win_rate_reasoning" not in decision:
+        decision["estimated_win_rate_reasoning"] = (
+            None
+            if decision.get("order_type") == "不下单"
+            else "基于入场/止损/目标三价与结构背景的胜率估算"
+        )
+        changed = True
+    elif (
+        decision.get("order_type") != "不下单"
+        and isinstance(decision.get("estimated_win_rate_reasoning"), str)
+        and not str(decision.get("estimated_win_rate_reasoning")).strip()
+    ):
+        decision["estimated_win_rate_reasoning"] = "基于入场/止损/目标三价与结构背景的胜率估算"
+        changed = True
+    terminal = out.get("terminal")
+    if isinstance(terminal, dict) and not str(terminal.get("label") or "").strip():
+        outcome = str(terminal.get("outcome") or "wait")
+        terminal["label"] = {
+            "trade": "执行下单方案",
+            "reject": "交易者方程未通过",
+            "wait": "等待更好 setup",
+            "proceed": "继续评估",
+        }.get(outcome, "阶段二终局")
+        changed = True
+    return changed
+
+
+def _truncate_decision_reasoning(decision: dict[str, Any]) -> bool:
+    """Cap ``decision.reasoning`` length to avoid verbose JSON.
+
+    Mirrors upstream ``_truncate_decision_reasoning``. Returns True when
+    the field was modified.
+    """
+    reasoning = decision.get("reasoning")
+    if not isinstance(reasoning, str):
+        return False
+    text = reasoning.strip()
+    if len(text) <= DECISION_REASONING_MAX_LEN:
+        if text != reasoning:
+            decision["reasoning"] = text
+            return True
+        return False
+    decision["reasoning"] = text[: DECISION_REASONING_MAX_LEN - 1] + "…"
+    return True
+
+
 def _coerce_decision_no_order(out: dict[str, Any]) -> bool:
     """When trace/terminal reject a trade, clear decision prices (common model slip).
 
@@ -645,8 +903,10 @@ def normalize_trade_decision(
     Fixes ``next_cycle_prediction.probabilities`` (float→int, clamp,
     rescale sum=100, cycle=argmax), maps decision_trace answer aliases
     (e.g. "不下单" → "否"), canonicalizes bar_range strings (Batch A port
-    from upstream ``normalize_stage2_traces``), coerces decision to 不下单
-    when trace/terminal reject the trade (ported from upstream
+    from upstream ``normalize_stage2_traces``), repairs flat/scalar
+    decision payloads (Batch D: unwrap → hoist terminal → ensure required
+    fields → truncate reasoning), coerces decision to 不下单 when
+    trace/terminal reject the trade (ported from upstream
     ``_coerce_decision_no_order``), and normalizes breakout entry_price
     to basis extreme +/- 1 tick (ported from PA_Agent price_tick).
     """
@@ -659,6 +919,16 @@ def normalize_trade_decision(
         out.get("decision_trace"),
         default_max_seq=_max_seq_from_feature_rows(feature_rows),
     )
+
+    if _unwrap_flat_stage2_decision(out):
+        logger.debug("flat stage2 decision hoisted into decision object")
+    if _hoist_terminal_from_decision(out):
+        logger.debug("terminal hoisted from decision to top level")
+    if _ensure_decision_required_fields(out, stage1_json=diagnosis):
+        logger.debug("decision required fields filled with defaults")
+    decision_obj = out.get("decision")
+    if isinstance(decision_obj, dict) and _truncate_decision_reasoning(decision_obj):
+        logger.debug("decision.reasoning truncated to %d chars", DECISION_REASONING_MAX_LEN)
 
     if _coerce_decision_no_order(out):
         logger.debug("decision coerced to 不下单 (trace/terminal rejection)")

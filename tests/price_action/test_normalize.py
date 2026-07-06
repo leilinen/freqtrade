@@ -12,15 +12,21 @@ if str(_STRATEGY_DIR) not in sys.path:
     sys.path.insert(0, str(_STRATEGY_DIR))
 
 from price_action.normalize import (  # noqa: E402
+    DECISION_REASONING_MAX_LEN,
     _clear_decision_to_no_order,
     _coerce_decision_no_order,
     _default_cycle_probs,
+    _ensure_decision_required_fields,
+    _hoist_terminal_from_decision,
     _normalize_next_cycle_prediction,
     _normalize_order_type_aliases,
+    _order_type_from_decision_scalar,
     _resolve_trace_answer,
     _resolve_trace_answers,
     _section14_violated,
     _trace_node_answer,
+    _truncate_decision_reasoning,
+    _unwrap_flat_stage2_decision,
     normalize_market_diagnosis,
     normalize_trade_decision,
 )
@@ -741,3 +747,258 @@ class TestNormalizeTradeDecisionCoerceIntegration:
         original_type = decision_json["decision"]["order_type"]
         _ = normalize_trade_decision(decision_json)
         assert decision_json["decision"]["order_type"] == original_type
+
+
+# ── Batch D: stage2 unwrap / ensure / truncate ──
+
+
+class TestOrderTypeFromDecisionScalar:
+    def test_no_order_alias(self):
+        assert _order_type_from_decision_scalar("no_order") == "不下单"
+
+    def test_wait_becomes_no_order(self):
+        assert _order_type_from_decision_scalar("wait") == "不下单"
+
+    def test_reject_becomes_no_order(self):
+        assert _order_type_from_decision_scalar("reject") == "不下单"
+
+    def test_limit_alias(self):
+        assert _order_type_from_decision_scalar("limit") == "限价单"
+
+    def test_breakout_alias_with_dash(self):
+        assert _order_type_from_decision_scalar("breakout-order") == "突破单"
+
+    def test_unknown_returns_none(self):
+        assert _order_type_from_decision_scalar("garbage") is None
+
+    def test_empty_returns_none(self):
+        assert _order_type_from_decision_scalar("") is None
+
+    def test_case_insensitive(self):
+        assert _order_type_from_decision_scalar("LIMIT") == "限价单"
+
+
+class TestUnwrapFlatStage2Decision:
+    def test_hoist_root_fields_into_new_decision(self):
+        out = {
+            "order_type": "突破单",
+            "entry_price": 100.0,
+            "stop_loss_price": 95.0,
+        }
+        assert _unwrap_flat_stage2_decision(out) is True
+        dec = out["decision"]
+        assert dec["order_type"] == "突破单"
+        assert dec["entry_price"] == 100.0
+        assert "entry_price" not in out
+
+    def test_scalar_decision_becomes_dict(self):
+        out = {"decision": "wait"}
+        assert _unwrap_flat_stage2_decision(out) is True
+        assert out["decision"] == {"order_type": "不下单"}
+
+    def test_scalar_reject_becomes_no_order(self):
+        out = {"decision": "reject"}
+        _unwrap_flat_stage2_decision(out)
+        assert out["decision"]["order_type"] == "不下单"
+
+    def test_scalar_breakout_with_hoisted_fields(self):
+        out = {"decision": "breakout", "entry_price": 100.0}
+        _unwrap_flat_stage2_decision(out)
+        dec = out["decision"]
+        assert dec["order_type"] == "突破单"
+        assert dec["entry_price"] == 100.0
+
+    def test_dict_decision_gets_hoisted_only_when_missing(self):
+        out = {
+            "decision": {"order_type": "限价单", "entry_price": 200.0},
+            "entry_price": 999.0,
+            "stop_loss_price": 180.0,
+        }
+        changed = _unwrap_flat_stage2_decision(out)
+        assert changed is True
+        # existing entry_price preserved
+        assert out["decision"]["entry_price"] == 200.0
+        # missing stop_loss_price filled from root
+        assert out["decision"]["stop_loss_price"] == 180.0
+
+    def test_dict_decision_with_no_root_fields_unchanged(self):
+        out = {"decision": {"order_type": "限价单"}}
+        assert _unwrap_flat_stage2_decision(out) is False
+
+    def test_no_decision_no_root_fields_no_op(self):
+        out = {}
+        assert _unwrap_flat_stage2_decision(out) is False
+
+    def test_unrecognized_root_keys_not_hoisted(self):
+        out = {"random_key": "x", "decision": {"order_type": "限价单"}}
+        assert _unwrap_flat_stage2_decision(out) is False
+        assert "random_key" in out
+
+
+class TestHoistTerminalFromDecision:
+    def test_moves_nested_terminal_to_root(self):
+        out = {"decision": {"order_type": "限价单", "terminal": {"node_id": "10.3"}}}
+        assert _hoist_terminal_from_decision(out) is True
+        assert out["terminal"] == {"node_id": "10.3"}
+        assert "terminal" not in out["decision"]
+
+    def test_root_terminal_takes_precedence(self):
+        out = {
+            "terminal": {"node_id": "root"},
+            "decision": {"terminal": {"node_id": "nested"}},
+        }
+        assert _hoist_terminal_from_decision(out) is False
+        assert out["terminal"] == {"node_id": "root"}
+
+    def test_no_decision_no_op(self):
+        out = {}
+        assert _hoist_terminal_from_decision(out) is False
+
+    def test_decision_without_terminal_no_op(self):
+        out = {"decision": {"order_type": "限价单"}}
+        assert _hoist_terminal_from_decision(out) is False
+
+    def test_non_dict_nested_terminal_no_op(self):
+        out = {"decision": {"terminal": "string"}}
+        assert _hoist_terminal_from_decision(out) is False
+
+
+class TestEnsureDecisionRequiredFields:
+    def test_fills_key_factors_watch_points(self):
+        out = {"decision": {"order_type": "限价单"}}
+        assert _ensure_decision_required_fields(out) is True
+        assert out["decision"]["key_factors"] == []
+        assert out["decision"]["watch_points"] == []
+
+    def test_fills_text_defaults(self):
+        out = {"decision": {"order_type": "限价单"}}
+        _ensure_decision_required_fields(out)
+        dec = out["decision"]
+        assert isinstance(dec["reasoning"], str) and dec["reasoning"]
+        assert isinstance(dec["risk_assessment"], str)
+
+    def test_diagnosis_confidence_from_stage1(self):
+        out = {"decision": {"order_type": "限价单"}}
+        _ensure_decision_required_fields(out, stage1_json={"diagnosis_confidence": 80})
+        assert out["decision"]["diagnosis_confidence"] == 80
+
+    def test_diagnosis_confidence_default_50(self):
+        out = {"decision": {"order_type": "限价单"}}
+        _ensure_decision_required_fields(out)
+        assert out["decision"]["diagnosis_confidence"] == 50
+
+    def test_trade_confidence_default_for_no_order(self):
+        out = {"decision": {"order_type": "不下单"}}
+        _ensure_decision_required_fields(out)
+        assert out["decision"]["trade_confidence"] == 0
+
+    def test_trade_confidence_default_for_trade(self):
+        out = {"decision": {"order_type": "限价单"}}
+        _ensure_decision_required_fields(out)
+        assert out["decision"]["trade_confidence"] == 50
+
+    def test_estimated_win_rate_for_trade(self):
+        out = {"decision": {"order_type": "限价单"}}
+        _ensure_decision_required_fields(out)
+        assert out["decision"]["estimated_win_rate"] == 50
+
+    def test_estimated_win_rate_for_no_order(self):
+        out = {"decision": {"order_type": "不下单"}}
+        _ensure_decision_required_fields(out)
+        assert "estimated_win_rate" in out["decision"]
+        assert out["decision"]["estimated_win_rate"] is None
+
+    def test_terminal_label_filled(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "terminal": {"outcome": "trade"},
+        }
+        _ensure_decision_required_fields(out)
+        assert out["terminal"]["label"] == "执行下单方案"
+
+    def test_existing_fields_preserved(self):
+        out = {"decision": {"order_type": "限价单", "trade_confidence": 75}}
+        changed = _ensure_decision_required_fields(out)
+        assert changed is True  # other fields were filled
+        assert out["decision"]["trade_confidence"] == 75
+
+    def test_non_dict_decision_returns_false(self):
+        out = {"decision": "wait"}
+        assert _ensure_decision_required_fields(out) is False
+
+
+class TestTruncateDecisionReasoning:
+    def test_short_reasoning_untouched(self):
+        dec = {"reasoning": "短"}
+        assert _truncate_decision_reasoning(dec) is False
+        assert dec["reasoning"] == "短"
+
+    def test_long_reasoning_truncated(self):
+        dec = {"reasoning": "x" * (DECISION_REASONING_MAX_LEN + 50)}
+        assert _truncate_decision_reasoning(dec) is True
+        assert len(dec["reasoning"]) == DECISION_REASONING_MAX_LEN
+        assert dec["reasoning"].endswith("…")
+
+    def test_whitespace_only_reasoning_stripped(self):
+        dec = {"reasoning": "  short  "}
+        assert _truncate_decision_reasoning(dec) is True
+        assert dec["reasoning"] == "short"
+
+    def test_non_string_reasoning_no_op(self):
+        dec = {"reasoning": None}
+        assert _truncate_decision_reasoning(dec) is False
+
+    def test_missing_reasoning_no_op(self):
+        dec = {}
+        assert _truncate_decision_reasoning(dec) is False
+
+    def test_at_limit_not_truncated(self):
+        dec = {"reasoning": "x" * DECISION_REASONING_MAX_LEN}
+        assert _truncate_decision_reasoning(dec) is False
+
+
+class TestNormalizeTradeDecisionBatchDIntegration:
+    def test_unwrap_runs_via_normalize(self):
+        decision_json = {
+            "decision": "wait",
+        }
+        out = normalize_trade_decision(decision_json)
+        assert out["decision"]["order_type"] == "不下单"
+
+    def test_hoist_root_fields_via_normalize(self):
+        decision_json = {
+            "order_type": "突破单",
+            "entry_price": 100.0,
+            "order_direction": "做多",
+        }
+        out = normalize_trade_decision(decision_json)
+        assert out["decision"]["order_type"] == "突破单"
+        assert out["decision"]["entry_price"] == 100.0
+
+    def test_ensure_fields_via_normalize(self):
+        decision_json = {
+            "decision": {"order_type": "限价单"},
+        }
+        out = normalize_trade_decision(decision_json)
+        assert out["decision"]["key_factors"] == []
+        assert out["decision"]["trade_confidence"] == 50
+
+    def test_truncate_via_normalize(self):
+        decision_json = {
+            "decision": {
+                "order_type": "限价单",
+                "reasoning": "y" * (DECISION_REASONING_MAX_LEN + 100),
+            },
+        }
+        out = normalize_trade_decision(decision_json)
+        assert len(out["decision"]["reasoning"]) == DECISION_REASONING_MAX_LEN
+
+    def test_does_not_mutate_input(self):
+        decision_json = {
+            "decision": "wait",
+            "order_type": "突破单",
+            "entry_price": 100.0,
+        }
+        original = copy.deepcopy(decision_json)
+        normalize_trade_decision(decision_json)
+        assert decision_json == original
