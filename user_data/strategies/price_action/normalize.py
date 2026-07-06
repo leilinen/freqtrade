@@ -24,6 +24,7 @@ from .price_tick import (
     normalize_breakout_basis_extreme,
     normalize_breakout_entry_price,
 )
+from .trace_normalize import normalize_trace_list_bar_range
 
 logger = logging.getLogger(__name__)
 
@@ -595,6 +596,14 @@ def _resolve_trace_answers(trace: list[Any]) -> None:
 
 # ── Public entry points ──
 
+def _max_seq_from_feature_rows(feature_rows: list[dict[str, Any]] | None) -> int | None:
+    """Infer the max K index from feature_rows length (K1..K{N})."""
+    if not feature_rows:
+        return None
+    n = len(feature_rows)
+    return n if n >= 1 else None
+
+
 def normalize_market_diagnosis(
     diagnosis: dict[str, Any],
     *,
@@ -604,9 +613,15 @@ def normalize_market_diagnosis(
 
     PR1 scope: gate_trace answer alias mapping only.
     PR2 will add bar_by_bar pad + bar_type/role/context_effect repair.
+    Batch A: gate_trace bar_range canonicalization (ported from upstream
+    ``normalize_stage1_traces``).
     """
     out = copy.deepcopy(diagnosis)
     _resolve_trace_answers(out.get("gate_trace") or [])
+    normalize_trace_list_bar_range(
+        out.get("gate_trace"),
+        default_max_seq=_max_seq_from_feature_rows(feature_rows),
+    )
     return out
 
 
@@ -620,16 +635,21 @@ def normalize_trade_decision(
 
     Fixes ``next_cycle_prediction.probabilities`` (float→int, clamp,
     rescale sum=100, cycle=argmax), maps decision_trace answer aliases
-    (e.g. "不下单" → "否"), coerces decision to 不下单 when trace/terminal
-    reject the trade (ported from upstream ``_coerce_decision_no_order``),
-    and normalizes breakout entry_price to basis extreme +/- 1 tick
-    (ported from PA_Agent price_tick).
+    (e.g. "不下单" → "否"), canonicalizes bar_range strings (Batch A port
+    from upstream ``normalize_stage2_traces``), coerces decision to 不下单
+    when trace/terminal reject the trade (ported from upstream
+    ``_coerce_decision_no_order``), and normalizes breakout entry_price
+    to basis extreme +/- 1 tick (ported from PA_Agent price_tick).
     """
     out = copy.deepcopy(decision_json)
     prediction = out.get("next_cycle_prediction")
     if isinstance(prediction, dict):
         _normalize_next_cycle_prediction(prediction, stage1_json=diagnosis)
     _resolve_trace_answers(out.get("decision_trace") or [])
+    normalize_trace_list_bar_range(
+        out.get("decision_trace"),
+        default_max_seq=_max_seq_from_feature_rows(feature_rows),
+    )
 
     if _coerce_decision_no_order(out):
         logger.debug("decision coerced to 不下单 (trace/terminal rejection)")
