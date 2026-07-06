@@ -24,7 +24,11 @@ from .price_tick import (
     normalize_breakout_basis_extreme,
     normalize_breakout_entry_price,
 )
-from .trace_normalize import normalize_trace_list_bar_range
+from .trace_normalize import (
+    normalize_trace_list_bar_range,
+    repair_stage2_terminal,
+    strip_ai_gate_14,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -617,9 +621,12 @@ def normalize_market_diagnosis(
     ``normalize_stage1_traces``).
     """
     out = copy.deepcopy(diagnosis)
-    _resolve_trace_answers(out.get("gate_trace") or [])
+    gate = out.get("gate_trace")
+    if isinstance(gate, list):
+        strip_ai_gate_14(gate)
+    _resolve_trace_answers(gate or [])
     normalize_trace_list_bar_range(
-        out.get("gate_trace"),
+        gate,
         default_max_seq=_max_seq_from_feature_rows(feature_rows),
     )
     return out
@@ -653,6 +660,9 @@ def normalize_trade_decision(
 
     if _coerce_decision_no_order(out):
         logger.debug("decision coerced to 不下单 (trace/terminal rejection)")
+
+    if repair_stage2_terminal(out):
+        logger.debug("terminal.node_id aligned to 10.3 (no-order rejection)")
 
     decision = out.get("decision")
     if isinstance(decision, dict) and normalize_breakout_basis_extreme(decision):

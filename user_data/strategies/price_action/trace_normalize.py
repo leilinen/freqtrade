@@ -402,14 +402,19 @@ def normalize_trace_list_bar_range(
     *,
     default_max_seq: int | None = None,
 ) -> list[Any] | None:
-    """Canonicalize bar_range across a trace list (Batch A subset).
+    """Canonicalize a trace list (Batch A + Batch B).
 
-    * Computes ``default_max_seq`` from the trace itself when not given
-    * Walks trace in order, carrying the last valid bar_range forward
-      so subsequent placeholder/null bar_ranges can inherit it
+    Batch A: bar_range canonicalization per item, carrying last valid
+    bar_range forward so placeholder/null entries can inherit it.
+    Batch B: sort items by ``node_id`` chapter prefix before per-item
+    processing so the ``decision_trace_chapter_order_invalid`` /
+    ``market_diagnosis_gate_trace_node_order_invalid`` validator checks
+    pass for traces the AI emitted out of order.
     """
     if not isinstance(trace, list):
         return trace
+
+    sort_trace_by_chapter(trace)
 
     max_seq = default_max_seq or infer_max_bar_seq_from_trace(trace)
     last_br: str | None = None
@@ -425,3 +430,110 @@ def normalize_trace_list_bar_range(
         if br and br not in ("不适用", "—", "-"):
             last_br = br
     return trace
+
+
+# ── Batch B: chapter ordering + terminal repair + strip AI §14.1 ──
+
+_CHAPTER_ORDER: dict[str, int] = {
+    "1.": 10,
+    "2.": 20,
+    "3.": 30,
+    "4.": 40,
+    "5.": 50,
+    "6.": 60,
+    "7.": 70,
+    "8.": 80,
+    "9.": 90,
+    "10.": 100,
+    "11.": 110,
+    "12.": 120,
+    "13.": 130,
+    "14": 140,
+}
+
+
+def _chapter_rank(item: Any) -> int:
+    """Sort rank for a trace item based on its ``node_id`` chapter prefix.
+
+    Mirrors upstream ``normalize_trace_list._chapter_rank``. Unrecognized
+    nodes land in the middle (500) so they don't displace real chapters.
+    """
+    if not isinstance(item, dict):
+        return 999
+    nid = str(item.get("node_id", "") or "").strip()
+    for prefix, rank in _CHAPTER_ORDER.items():
+        if nid.startswith(prefix) or nid == prefix.rstrip("."):
+            return rank
+    return 500
+
+
+def sort_trace_by_chapter(trace: list[Any]) -> None:
+    """Reorder trace items by ``node_id`` chapter (in-place).
+
+    AI may output nodes in any order; the canonical order is by chapter
+    prefix (1.x → 2.x → ... → 14). Mirrors upstream
+    ``normalize_trace_list`` sort step.
+    """
+    if not isinstance(trace, list):
+        return
+    trace.sort(key=_chapter_rank)
+
+
+def strip_ai_gate_14(gate_trace: list[Any]) -> int:
+    """Remove duplicate AI-written §14.1 nodes from gate_trace.
+
+    The model sometimes emits node 14.1 (禁止行为扫描) in gate_trace.
+    We keep the first occurrence and drop subsequent duplicates so the
+    validator's node-ordering check passes. Returns the number removed.
+    """
+    if not isinstance(gate_trace, list) or not gate_trace:
+        return 0
+    kept: list[Any] = []
+    seen_14 = False
+    removed = 0
+    for item in gate_trace:
+        if isinstance(item, dict) and str(item.get("node_id", "") or "").strip() == "14.1":
+            if not seen_14:
+                seen_14 = True
+                kept.append(item)
+            else:
+                removed += 1
+        else:
+            kept.append(item)
+    if removed:
+        gate_trace[:] = kept
+        logger.debug("Stripped %s duplicate AI-written 14.1 from gate_trace", removed)
+    return removed
+
+
+def repair_stage2_terminal(obj: dict[str, Any]) -> bool:
+    """When 10.3 is 否 on a no-order path, terminal must cite node 10.3.
+
+    Mirrors upstream ``_repair_stage2_terminal``. Returns True when
+    ``terminal.node_id`` was adjusted.
+    """
+    trace = obj.get("decision_trace")
+    terminal = obj.get("terminal")
+    decision = obj.get("decision")
+    if not isinstance(trace, list) or not isinstance(terminal, dict):
+        return False
+    if not isinstance(decision, dict) or decision.get("order_type") != "不下单":
+        return False
+    if terminal.get("outcome") not in ("wait", "reject"):
+        return False
+
+    for item in trace:
+        if not isinstance(item, dict) or str(item.get("node_id", "") or "").strip() != "10.3":
+            continue
+        if str(item.get("answer", "") or "").strip() != "否":
+            return False
+        old_nid = str(terminal.get("node_id", "") or "").strip()
+        if old_nid != "10.3":
+            terminal["node_id"] = "10.3"
+            logger.debug(
+                "stage2 terminal.node_id %r -> 10.3 (10.3 answer=否, order_type=不下单)",
+                old_nid,
+            )
+            return True
+        return False
+    return False

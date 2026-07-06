@@ -25,6 +25,7 @@ from price_action.trace_normalize import (  # noqa: E402
     _bar_range_is_canonical,
     _bar_seqs_from_range_text,
     _bar_seqs_from_reason_text,
+    _chapter_rank,
     _comma_separated_bar_range,
     _expand_bar_range_for_reason_citations,
     _is_nullish,
@@ -33,6 +34,9 @@ from price_action.trace_normalize import (  # noqa: E402
     infer_max_bar_seq_from_trace,
     normalize_trace_item_bar_range,
     normalize_trace_list_bar_range,
+    repair_stage2_terminal,
+    sort_trace_by_chapter,
+    strip_ai_gate_14,
 )
 
 
@@ -308,9 +312,10 @@ class TestNormalizeTraceListBarRange:
 
     def test_non_dict_items_skipped(self):
         trace = [None, "garbage", {"node_id": "1.1", "answer": "是", "reason": "K1", "bar_range": "K1"}]
-        # Should not raise
+        # Should not raise; non-dict items tolerated, dict still processed
         normalize_trace_list_bar_range(trace)
-        assert trace[2]["bar_range"] == "K1"
+        dict_items = [it for it in trace if isinstance(it, dict)]
+        assert dict_items[0]["bar_range"] == "K1"
 
 
 class TestNormalizeMarketDiagnosisIntegration:
@@ -366,3 +371,194 @@ class TestNormalizeTradeDecisionIntegration:
         original = decision["decision_trace"][0]["bar_range"]
         _ = normalize_trade_decision(decision)
         assert decision["decision_trace"][0]["bar_range"] == original
+
+
+# ── Batch B tests ──
+
+
+class TestChapterRank:
+    def test_section_3_first(self):
+        assert _chapter_rank({"node_id": "3.1"}) == 30
+
+    def test_section_14_last(self):
+        assert _chapter_rank({"node_id": "14.0"}) == 140
+
+    def test_double_digit_chapter_order(self):
+        # 10.x must come after 9.x
+        assert _chapter_rank({"node_id": "9.0"}) < _chapter_rank({"node_id": "10.0"})
+        assert _chapter_rank({"node_id": "10.0"}) < _chapter_rank({"node_id": "11.0"})
+
+    def test_unrecognized_in_middle(self):
+        assert _chapter_rank({"node_id": "garbage"}) == 500
+
+    def test_non_dict_at_end(self):
+        assert _chapter_rank(None) == 999
+        assert _chapter_rank("garbage") == 999
+
+    def test_bare_chapter_match(self):
+        # nid == prefix.rstrip('.') should also match
+        assert _chapter_rank({"node_id": "14"}) == 140
+
+
+class TestSortTraceByChapter:
+    def test_sorts_unordered_trace(self):
+        trace = [
+            {"node_id": "10.3"},
+            {"node_id": "9.0"},
+            {"node_id": "11.1"},
+            {"node_id": "3.1"},
+        ]
+        sort_trace_by_chapter(trace)
+        assert [t["node_id"] for t in trace] == ["3.1", "9.0", "10.3", "11.1"]
+
+    def test_already_sorted_unchanged(self):
+        trace = [{"node_id": "3.1"}, {"node_id": "9.0"}, {"node_id": "10.3"}]
+        original = [t["node_id"] for t in trace]
+        sort_trace_by_chapter(trace)
+        assert [t["node_id"] for t in trace] == original
+
+    def test_non_list_is_noop(self):
+        sort_trace_by_chapter(None)
+        sort_trace_by_chapter("garbage")
+
+    def test_non_dict_items_go_last(self):
+        trace = [{"node_id": "10.3"}, "garbage", {"node_id": "3.1"}]
+        sort_trace_by_chapter(trace)
+        assert trace[0]["node_id"] == "3.1"
+        assert trace[1]["node_id"] == "10.3"
+        assert trace[2] == "garbage"
+
+
+class TestStripAiGate14:
+    def test_removes_duplicate_14_1(self):
+        gate = [
+            {"node_id": "1.1", "answer": "是"},
+            {"node_id": "14.1", "answer": "否"},
+            {"node_id": "2.1", "answer": "是"},
+            {"node_id": "14.1", "answer": "是"},
+            {"node_id": "14.1", "answer": "是"},
+        ]
+        removed = strip_ai_gate_14(gate)
+        assert removed == 2
+        node_ids = [item["node_id"] for item in gate]
+        assert node_ids == ["1.1", "14.1", "2.1"]
+
+    def test_keeps_single_14_1(self):
+        gate = [{"node_id": "1.1"}, {"node_id": "14.1"}, {"node_id": "2.1"}]
+        removed = strip_ai_gate_14(gate)
+        assert removed == 0
+        assert len(gate) == 3
+
+    def test_no_14_1_returns_zero(self):
+        gate = [{"node_id": "1.1"}, {"node_id": "2.1"}]
+        assert strip_ai_gate_14(gate) == 0
+
+    def test_empty_or_non_list(self):
+        assert strip_ai_gate_14([]) == 0
+        assert strip_ai_gate_14(None) == 0
+
+
+class TestRepairStage2Terminal:
+    def test_aligns_terminal_to_10_3_when_no_order(self):
+        """When order=不下单 + 10.3=否 + terminal.outcome=wait, fix terminal.node_id."""
+        obj = {
+            "decision": {"order_type": "不下单"},
+            "decision_trace": [{"node_id": "10.3", "answer": "否"}],
+            "terminal": {"node_id": "14.0", "outcome": "wait"},
+        }
+        assert repair_stage2_terminal(obj) is True
+        assert obj["terminal"]["node_id"] == "10.3"
+
+    def test_skips_when_order_is_trade(self):
+        obj = {
+            "decision": {"order_type": "限价单"},
+            "decision_trace": [{"node_id": "10.3", "answer": "否"}],
+            "terminal": {"node_id": "14.0", "outcome": "trade"},
+        }
+        assert repair_stage2_terminal(obj) is False
+        assert obj["terminal"]["node_id"] == "14.0"
+
+    def test_skips_when_terminal_outcome_is_trade(self):
+        obj = {
+            "decision": {"order_type": "不下单"},
+            "decision_trace": [{"node_id": "10.3", "answer": "否"}],
+            "terminal": {"node_id": "11.0", "outcome": "trade"},
+        }
+        assert repair_stage2_terminal(obj) is False
+
+    def test_skips_when_10_3_answer_is_yes(self):
+        obj = {
+            "decision": {"order_type": "不下单"},
+            "decision_trace": [{"node_id": "10.3", "answer": "是"}],
+            "terminal": {"node_id": "14.0", "outcome": "wait"},
+        }
+        assert repair_stage2_terminal(obj) is False
+
+    def test_noop_when_terminal_already_10_3(self):
+        obj = {
+            "decision": {"order_type": "不下单"},
+            "decision_trace": [{"node_id": "10.3", "answer": "否"}],
+            "terminal": {"node_id": "10.3", "outcome": "wait"},
+        }
+        assert repair_stage2_terminal(obj) is False
+
+    def test_no_10_3_node_returns_false(self):
+        obj = {
+            "decision": {"order_type": "不下单"},
+            "decision_trace": [{"node_id": "9.0", "answer": "是"}],
+            "terminal": {"node_id": "14.0", "outcome": "wait"},
+        }
+        assert repair_stage2_terminal(obj) is False
+
+
+class TestBatchBIntegration:
+    def test_normalize_market_diagnosis_strips_duplicate_14_1(self):
+        diagnosis = {
+            "gate_trace": [
+                {"node_id": "1.1", "answer": "是", "reason": "K 线", "bar_range": "K5-K1"},
+                {"node_id": "14.1", "answer": "是", "reason": "扫描", "bar_range": "不适用"},
+                {"node_id": "2.1", "answer": "是", "reason": "K3", "bar_range": "K3"},
+                {"node_id": "14.1", "answer": "是", "reason": "重复", "bar_range": "不适用"},
+            ],
+        }
+        out = normalize_market_diagnosis(diagnosis)
+        node_ids = [item["node_id"] for item in out["gate_trace"]]
+        # 14.1 deduplicated to one, then sorted by chapter (1.x → 2.x → 14)
+        assert node_ids == ["1.1", "2.1", "14.1"]
+        # Original not mutated
+        assert len(diagnosis["gate_trace"]) == 4
+
+    def test_normalize_trade_decision_sorts_unordered_trace(self):
+        decision = {
+            "decision_trace": [
+                {"node_id": "10.3", "answer": "是", "reason": "通过", "bar_range": "K1"},
+                {"node_id": "9.0", "answer": "是", "reason": "K1", "bar_range": "K1"},
+                {"node_id": "3.1", "answer": "是", "reason": "K1", "bar_range": "K1"},
+            ],
+            "terminal": {"node_id": "10.3", "outcome": "trade"},
+        }
+        out = normalize_trade_decision(decision)
+        node_ids = [item["node_id"] for item in out["decision_trace"]]
+        assert node_ids == ["3.1", "9.0", "10.3"]
+
+    def test_normalize_trade_decision_repairs_terminal_after_coerce(self):
+        """End-to-end: coerce to 不下单 + repair terminal in one normalize pass."""
+        decision = {
+            "decision": {
+                "order_type": "突破单",
+                "order_direction": "做多",
+                "entry_price": 100.0,
+                "stop_loss_price": 95.0,
+                "take_profit_price": 110.0,
+                "trade_confidence": 50,
+                "trade_confidence_reasoning": "t",
+            },
+            "decision_trace": [
+                {"node_id": "10.3", "answer": "否", "reason": "方程不通过", "bar_range": "K1"},
+            ],
+            "terminal": {"node_id": "14.0", "outcome": "reject"},
+        }
+        out = normalize_trade_decision(decision)
+        assert out["decision"]["order_type"] == "不下单"
+        # After coerce, terminal.node_id should be aligned to 10.3
+        assert out["terminal"]["node_id"] == "10.3"
