@@ -29,6 +29,7 @@ from price_action.normalize import (  # noqa: E402
     _unwrap_flat_stage2_decision,
     normalize_market_diagnosis,
     normalize_trade_decision,
+    repair_diagnosis_summary_and_decision,
 )
 from price_action.price_tick import (  # noqa: E402
     infer_price_tick_from_rows,
@@ -998,6 +999,188 @@ class TestNormalizeTradeDecisionBatchDIntegration:
             "decision": "wait",
             "order_type": "突破单",
             "entry_price": 100.0,
+        }
+        original = copy.deepcopy(decision_json)
+        normalize_trade_decision(decision_json)
+        assert decision_json == original
+
+
+# ── Batch E: diagnosis_summary repair ──
+
+
+class TestRepairDiagnosisSummaryAndDecision:
+    def test_hoist_field_when_decision_missing(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {"trade_confidence": 75},
+        }
+        assert repair_diagnosis_summary_and_decision(out) is True
+        assert out["decision"]["trade_confidence"] == 75
+        assert "trade_confidence" not in out["diagnosis_summary"]
+
+    def test_keep_decision_field_when_already_present(self):
+        out = {
+            "decision": {"order_type": "限价单", "trade_confidence": 50},
+            "diagnosis_summary": {"trade_confidence": 75},
+        }
+        repair_diagnosis_summary_and_decision(out)
+        assert out["decision"]["trade_confidence"] == 50
+        assert "trade_confidence" not in out["diagnosis_summary"]
+
+    def test_drop_empty_dsum_field(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {"estimated_win_rate": None},
+        }
+        repair_diagnosis_summary_and_decision(out)
+        assert "estimated_win_rate" not in out["diagnosis_summary"]
+        assert "estimated_win_rate" not in out["decision"]
+
+    def test_drop_empty_string_dsum_field(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {"trade_confidence_reasoning": ""},
+        }
+        repair_diagnosis_summary_and_decision(out)
+        assert "trade_confidence_reasoning" not in out["diagnosis_summary"]
+
+    def test_fills_cycle_position_from_stage1(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {},
+        }
+        repair_diagnosis_summary_and_decision(
+            out, stage1_json={"cycle_position": "trading_range"}
+        )
+        assert out["diagnosis_summary"]["cycle_position"] == "trading_range"
+
+    def test_cycle_position_default_unknown(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {},
+        }
+        repair_diagnosis_summary_and_decision(out)
+        assert out["diagnosis_summary"]["cycle_position"] == "unknown"
+
+    def test_fills_direction_from_stage1(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {},
+        }
+        repair_diagnosis_summary_and_decision(out, stage1_json={"direction": "bullish"})
+        assert out["diagnosis_summary"]["direction"] == "bullish"
+
+    def test_direction_default_neutral(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {},
+        }
+        repair_diagnosis_summary_and_decision(out)
+        assert out["diagnosis_summary"]["direction"] == "neutral"
+
+    def test_fills_key_signals_from_stage1(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {},
+        }
+        repair_diagnosis_summary_and_decision(
+            out, stage1_json={"key_signals": ["signal_a", "signal_b"]}
+        )
+        assert out["diagnosis_summary"]["key_signals"] == ["signal_a", "signal_b"]
+
+    def test_key_signals_default_empty_list(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {},
+        }
+        repair_diagnosis_summary_and_decision(out)
+        assert out["diagnosis_summary"]["key_signals"] == []
+
+    def test_non_list_key_signals_replaced(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {"key_signals": "not a list"},
+        }
+        repair_diagnosis_summary_and_decision(out)
+        assert out["diagnosis_summary"]["key_signals"] == []
+
+    def test_preserves_existing_list_key_signals(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {"key_signals": ["already"]},
+        }
+        # key_signals already a list → not replaced; cycle_position/direction
+        # WILL be filled (empty), so changed=True is expected.
+        repair_diagnosis_summary_and_decision(out)
+        assert out["diagnosis_summary"]["key_signals"] == ["already"]
+
+    def test_preserves_existing_cycle_and_direction(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {
+                "cycle_position": "trend",
+                "direction": "bearish",
+                "key_signals": ["sig"],
+            },
+        }
+        # All three fields populated → genuinely no change.
+        assert repair_diagnosis_summary_and_decision(
+            out, stage1_json={"cycle_position": "trading_range", "direction": "bullish"}
+        ) is False
+        assert out["diagnosis_summary"]["cycle_position"] == "trend"
+        assert out["diagnosis_summary"]["direction"] == "bearish"
+
+    def test_no_decision_returns_false(self):
+        out = {"diagnosis_summary": {}}
+        assert repair_diagnosis_summary_and_decision(out) is False
+
+    def test_no_dsum_returns_false(self):
+        out = {"decision": {"order_type": "限价单"}}
+        assert repair_diagnosis_summary_and_decision(out) is False
+
+    def test_no_decision_no_dsum_returns_false(self):
+        out = {}
+        assert repair_diagnosis_summary_and_decision(out) is False
+
+    def test_multiple_fields_hoisted(self):
+        out = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {
+                "trade_confidence": 60,
+                "estimated_win_rate": 55,
+                "diagnosis_confidence": 80,
+            },
+        }
+        changed = repair_diagnosis_summary_and_decision(out)
+        assert changed is True
+        assert out["decision"]["trade_confidence"] == 60
+        assert out["decision"]["estimated_win_rate"] == 55
+        assert out["decision"]["diagnosis_confidence"] == 80
+
+
+class TestNormalizeTradeDecisionBatchEIntegration:
+    def test_hoist_via_normalize(self):
+        decision_json = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {"trade_confidence": 88},
+        }
+        out = normalize_trade_decision(decision_json)
+        assert out["decision"]["trade_confidence"] == 88
+        assert "trade_confidence" not in out["diagnosis_summary"]
+
+    def test_fills_dsum_defaults_via_normalize(self):
+        decision_json = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {},
+        }
+        out = normalize_trade_decision(decision_json)
+        assert out["diagnosis_summary"]["cycle_position"] == "unknown"
+        assert out["diagnosis_summary"]["direction"] == "neutral"
+
+    def test_does_not_mutate_input(self):
+        decision_json = {
+            "decision": {"order_type": "限价单"},
+            "diagnosis_summary": {"trade_confidence": 88},
         }
         original = copy.deepcopy(decision_json)
         normalize_trade_decision(decision_json)

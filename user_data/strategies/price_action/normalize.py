@@ -420,6 +420,71 @@ def _truncate_decision_reasoning(decision: dict[str, Any]) -> bool:
     return True
 
 
+# Decision fields models sometimes nest under diagnosis_summary by mistake.
+_DECISION_FIELDS_FROM_DIAG_SUMMARY: tuple[str, ...] = (
+    "estimated_win_rate_reasoning",
+    "estimated_win_rate",
+    "trade_confidence_reasoning",
+    "diagnosis_confidence_reasoning",
+    "diagnosis_confidence",
+    "trade_confidence",
+)
+
+
+def repair_diagnosis_summary_and_decision(
+    out: dict[str, Any],
+    *,
+    stage1_json: dict[str, Any] | None = None,
+) -> bool:
+    """Hoist misplaced decision fields out of diagnosis_summary, fill defaults.
+
+    Mirrors upstream ``_repair_diagnosis_summary_and_decision``. The model
+    sometimes writes trade_confidence / estimated_win_rate / etc. under
+    ``diagnosis_summary`` instead of ``decision`` — this hoists them back
+    to the canonical location and fills missing diagnosis_summary schema
+    fields (cycle_position, direction, key_signals) from stage1.
+    """
+    decision = out.get("decision")
+    if not isinstance(decision, dict):
+        return False
+    s1 = stage1_json or {}
+    dsum = out.get("diagnosis_summary")
+    if not isinstance(dsum, dict):
+        return False
+
+    changed = False
+    for key in _DECISION_FIELDS_FROM_DIAG_SUMMARY:
+        if key not in dsum:
+            continue
+        val = dsum.get(key)
+        existing = decision.get(key)
+        if existing not in (None, "", []) and key in decision:
+            dsum.pop(key, None)
+            changed = True
+            continue
+        if val in (None, "", []):
+            dsum.pop(key, None)
+            continue
+        decision[key] = val
+        dsum.pop(key, None)
+        logger.debug("Hoisted diagnosis_summary.%s -> decision.%s", key, key)
+        changed = True
+
+    if not str(dsum.get("cycle_position") or "").strip():
+        dsum["cycle_position"] = str(s1.get("cycle_position") or "unknown")
+        changed = True
+    if not str(dsum.get("direction") or "").strip():
+        dsum["direction"] = str(s1.get("direction") or "neutral")
+        changed = True
+    if not isinstance(dsum.get("key_signals"), list):
+        key_signals = dsum.get("key_signals")
+        if not isinstance(key_signals, list):
+            key_signals = list(s1.get("key_signals") or [])
+        dsum["key_signals"] = key_signals
+        changed = True
+    return changed
+
+
 def _coerce_decision_no_order(out: dict[str, Any]) -> bool:
     """When trace/terminal reject a trade, clear decision prices (common model slip).
 
@@ -903,7 +968,8 @@ def normalize_trade_decision(
     Fixes ``next_cycle_prediction.probabilities`` (float→int, clamp,
     rescale sum=100, cycle=argmax), maps decision_trace answer aliases
     (e.g. "不下单" → "否"), canonicalizes bar_range strings (Batch A port
-    from upstream ``normalize_stage2_traces``), repairs flat/scalar
+    from upstream ``normalize_stage2_traces``), hoists decision fields
+    misplaced under diagnosis_summary (Batch E), repairs flat/scalar
     decision payloads (Batch D: unwrap → hoist terminal → ensure required
     fields → truncate reasoning), coerces decision to 不下单 when
     trace/terminal reject the trade (ported from upstream
@@ -920,6 +986,8 @@ def normalize_trade_decision(
         default_max_seq=_max_seq_from_feature_rows(feature_rows),
     )
 
+    if repair_diagnosis_summary_and_decision(out, stage1_json=diagnosis):
+        logger.debug("diagnosis_summary decision fields hoisted / defaults filled")
     if _unwrap_flat_stage2_decision(out):
         logger.debug("flat stage2 decision hoisted into decision object")
     if _hoist_terminal_from_decision(out):
