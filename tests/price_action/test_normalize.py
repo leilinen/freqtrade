@@ -1,6 +1,7 @@
 """Tests for the normalize layer (PR1: probability + answer alias)."""
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
@@ -11,10 +12,15 @@ if str(_STRATEGY_DIR) not in sys.path:
     sys.path.insert(0, str(_STRATEGY_DIR))
 
 from price_action.normalize import (  # noqa: E402
+    _clear_decision_to_no_order,
+    _coerce_decision_no_order,
     _default_cycle_probs,
     _normalize_next_cycle_prediction,
+    _normalize_order_type_aliases,
     _resolve_trace_answer,
     _resolve_trace_answers,
+    _section14_violated,
+    _trace_node_answer,
     normalize_market_diagnosis,
     normalize_trade_decision,
 )
@@ -507,3 +513,231 @@ class TestBreakoutPriceNormalize:
             feature_rows=[{"k": "K1", "open": 100.0, "high": 4556.595, "low": 99.0, "close": 103.0}],
         )
         assert decision_json["decision"]["entry_price"] == original_entry
+
+
+def _trade_decision_payload(order_type: str = "突破单") -> dict:
+    """Build a minimal valid trade-decision payload (for coerce tests)."""
+    return {
+        "decision": {
+            "order_direction": "做多",
+            "order_type": order_type,
+            "entry_price": 10.88,
+            "entry_basis_bar": "K1",
+            "entry_basis_extreme": "high",
+            "entry_rule": "K1 高点上方 1 跳动",
+            "take_profit_price": 10.94,
+            "take_profit_price_2": 11.00,
+            "stop_loss_price": 10.81,
+            "reasoning": "方程不通过但仍写突破单",
+            "diagnosis_confidence": 58,
+            "diagnosis_confidence_reasoning": "t",
+            "trade_confidence": 30,
+            "trade_confidence_reasoning": "t",
+            "estimated_win_rate": 45,
+            "estimated_win_rate_reasoning": "t",
+            "key_factors": [],
+            "watch_points": [],
+            "risk_assessment": "t",
+            "invalidation_condition": "t",
+        },
+        "decision_trace": [],
+        "terminal": {"node_id": "10.3", "outcome": "trade", "label": "方程通过"},
+    }
+
+
+class TestNormalizeOrderTypeAliases:
+    def test_no_order_alias_mapped_to_zh(self):
+        d = {"order_type": "no_order"}
+        assert _normalize_order_type_aliases(d) is True
+        assert d["order_type"] == "不下单"
+
+    def test_breakout_alias_mapped(self):
+        d = {"order_type": "Breakout"}
+        assert _normalize_order_type_aliases(d) is True
+        assert d["order_type"] == "突破单"
+
+    def test_already_zh_noop(self):
+        d = {"order_type": "限价单"}
+        assert _normalize_order_type_aliases(d) is False
+        assert d["order_type"] == "限价单"
+
+    def test_empty_or_unknown_noop(self):
+        assert _normalize_order_type_aliases({"order_type": ""}) is False
+        assert _normalize_order_type_aliases({"order_type": "随便"}) is False
+
+
+class TestTraceNodeAnswer:
+    def test_returns_answer_for_matching_node(self):
+        trace = [{"node_id": "10.3", "answer": "否"}]
+        assert _trace_node_answer(trace, "10.3") == "否"
+
+    def test_returns_none_when_missing(self):
+        assert _trace_node_answer([], "10.3") is None
+        assert _trace_node_answer(None, "10.3") is None
+        assert _trace_node_answer([{"node_id": "9.0"}], "10.3") is None
+
+    def test_trims_whitespace(self):
+        trace = [{"node_id": " 10.3 ", "answer": " 是 "}]
+        assert _trace_node_answer(trace, "10.3") == "是"
+
+
+class TestSection14Violated:
+    def test_yes_answer_is_violation(self):
+        trace = [{"node_id": "14.0", "answer": "是", "reason": "方程不通过仍强行交易"}]
+        assert _section14_violated(trace) is True
+
+    def test_no_answer_is_not_violation(self):
+        trace = [{"node_id": "14.0", "answer": "否", "reason": "未触犯"}]
+        assert _section14_violated(trace) is False
+
+    def test_yes_with_denial_phrase_is_not_violation(self):
+        """Models that write answer=是 to mean 'scan done' must not trigger coerce."""
+        trace = [{"node_id": "14.0", "answer": "是", "reason": "扫描通过，未触犯禁止行为"}]
+        assert _section14_violated(trace) is False
+
+    def test_empty_or_no_section14(self):
+        assert _section14_violated([]) is False
+        assert _section14_violated(None) is False
+
+
+class TestClearDecisionToNoOrder:
+    def test_clears_prices_and_estimated_win_rate(self):
+        d = {
+            "order_type": "突破单",
+            "order_direction": "做多",
+            "entry_price": 100.0,
+            "take_profit_price": 110.0,
+            "stop_loss_price": 95.0,
+            "estimated_win_rate": 55,
+            "estimated_win_rate_reasoning": "t",
+            "trade_confidence": 30,
+        }
+        _clear_decision_to_no_order(d)
+        assert d["order_type"] == "不下单"
+        assert d["order_direction"] is None
+        assert d["entry_price"] is None
+        assert d["take_profit_price"] is None
+        assert d["stop_loss_price"] is None
+        assert d["estimated_win_rate"] is None
+        assert d["estimated_win_rate_reasoning"] is None
+
+    def test_fills_default_trade_confidence_when_missing(self):
+        d = {"order_type": "突破单", "trade_confidence": None, "trade_confidence_reasoning": ""}
+        _clear_decision_to_no_order(d)
+        assert d["trade_confidence"] == 0
+        assert d["trade_confidence_reasoning"] == "无入场计划，不存在交易信心"
+
+    def test_preserves_existing_trade_confidence(self):
+        """If the model already supplied trade_confidence, do not overwrite."""
+        d = {"order_type": "突破单", "trade_confidence": 25, "trade_confidence_reasoning": "低信心"}
+        _clear_decision_to_no_order(d)
+        assert d["trade_confidence"] == 25
+        assert d["trade_confidence_reasoning"] == "低信心"
+
+
+class TestCoerceDecisionNoOrder:
+    def test_10_3_no_coerces_to_no_order(self):
+        """When trader_equation node says 否, force 不下单 and clear prices."""
+        out = _trade_decision_payload()
+        out["decision_trace"] = [
+            {"node_id": "10.3", "answer": "否", "reason": "RR 0.86:1 方程不通过"}
+        ]
+        assert _coerce_decision_no_order(out) is True
+        d = out["decision"]
+        assert d["order_type"] == "不下单"
+        assert d["entry_price"] is None
+        assert d["take_profit_price"] is None
+        assert d["stop_loss_price"] is None
+        assert d["estimated_win_rate"] is None
+
+    def test_terminal_wait_coerces_to_no_order(self):
+        out = _trade_decision_payload()
+        out["terminal"] = {"node_id": "10.3", "outcome": "wait", "label": "等待"}
+        assert _coerce_decision_no_order(out) is True
+        assert out["decision"]["order_type"] == "不下单"
+
+    def test_terminal_reject_coerces_to_no_order(self):
+        out = _trade_decision_payload()
+        out["terminal"] = {"node_id": "14.0", "outcome": "reject", "label": "禁止"}
+        assert _coerce_decision_no_order(out) is True
+        assert out["decision"]["order_type"] == "不下单"
+
+    def test_section14_violated_coerces_to_no_order(self):
+        out = _trade_decision_payload()
+        out["decision_trace"] = [
+            {"node_id": "10.3", "answer": "是"},
+            {"node_id": "14.0", "answer": "是", "reason": "违反反转规则"},
+        ]
+        assert _coerce_decision_no_order(out) is True
+        assert out["decision"]["order_type"] == "不下单"
+
+    def test_section14_yes_with_denial_phrase_does_not_coerce(self):
+        out = _trade_decision_payload()
+        out["decision_trace"] = [
+            {"node_id": "10.3", "answer": "是"},
+            {"node_id": "14.0", "answer": "是", "reason": "扫描通过，未触犯"},
+        ]
+        assert _coerce_decision_no_order(out) is False
+        assert out["decision"]["order_type"] == "突破单"
+
+    def test_no_triggers_leaves_trade_intact(self):
+        out = _trade_decision_payload()
+        out["decision_trace"] = [{"node_id": "10.3", "answer": "是"}]
+        out["terminal"] = {"node_id": "10.3", "outcome": "trade"}
+        assert _coerce_decision_no_order(out) is False
+        assert out["decision"]["order_type"] == "突破单"
+        assert out["decision"]["entry_price"] == 10.88
+
+    def test_already_no_order_with_trade_terminal_is_noop(self):
+        out = _trade_decision_payload(order_type="不下单")
+        out["terminal"] = {"node_id": "10.3", "outcome": "trade"}
+        assert _coerce_decision_no_order(out) is False
+        assert out["decision"]["order_type"] == "不下单"
+
+    def test_english_no_order_alias_with_wait_terminal_is_idempotent(self):
+        """Regression: order_type=no_order + terminal=wait must not error."""
+        out = _trade_decision_payload(order_type="no_order")
+        out["terminal"] = {"node_id": "0.1", "outcome": "wait"}
+        # First call should normalize alias and recognize 不下单; no further coerce
+        # because order_type is already 不下单 after alias mapping — but we still
+        # don't trigger since 不下单 is not in _TRADE_ORDER_TYPES and the wait/reject
+        # branch only fires when current order_type != 不下单.
+        assert _coerce_decision_no_order(out) is False
+        assert out["decision"]["order_type"] == "不下单"
+
+    def test_idempotent(self):
+        """Running coerce twice yields the same result."""
+        out = _trade_decision_payload()
+        out["terminal"] = {"node_id": "14.0", "outcome": "reject"}
+        first = _coerce_decision_no_order(out)
+        snapshot = copy.deepcopy(out)
+        second = _coerce_decision_no_order(out)
+        assert first is True
+        assert second is False
+        assert out == snapshot
+
+    def test_missing_decision_returns_false(self):
+        assert _coerce_decision_no_order({}) is False
+        assert _coerce_decision_no_order({"decision": "garbage"}) is False
+
+
+class TestNormalizeTradeDecisionCoerceIntegration:
+    def test_normalize_clears_trade_when_terminal_rejects(self):
+        """End-to-end: normalize_trade_decision coerces to 不下单 before validator runs."""
+        decision_json = _trade_decision_payload()
+        out = normalize_trade_decision(decision_json)
+        # No rejection signals → still a trade
+        assert out["decision"]["order_type"] == "突破单"
+
+        decision_json = _trade_decision_payload()
+        decision_json["terminal"] = {"node_id": "14.0", "outcome": "reject"}
+        out = normalize_trade_decision(decision_json)
+        assert out["decision"]["order_type"] == "不下单"
+        assert out["decision"]["entry_price"] is None
+
+    def test_normalize_does_not_mutate_input_when_coercing(self):
+        decision_json = _trade_decision_payload()
+        decision_json["terminal"] = {"node_id": "14.0", "outcome": "reject"}
+        original_type = decision_json["decision"]["order_type"]
+        _ = normalize_trade_decision(decision_json)
+        assert decision_json["decision"]["order_type"] == original_type

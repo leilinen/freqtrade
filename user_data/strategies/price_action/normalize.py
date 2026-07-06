@@ -27,6 +27,185 @@ from .price_tick import (
 
 logger = logging.getLogger(__name__)
 
+# ── Decision no-order coercion (ported from PA_Agent stage2_normalizer) ──
+#
+# When the decision_trace or terminal indicates the trade was rejected
+# (node 10.3=否, terminal.outcome in {wait, reject}, or §14 violation),
+# the model often still emits a full trade decision with prices — a common
+# slip that wastes a retry cycle. These helpers detect the rejection signals
+# and clear the decision to 不下单 before validation, mirroring upstream
+# behavior.
+
+_TRADE_ORDER_TYPES = frozenset({"限价单", "突破单", "市价单"})
+
+_ORDER_TYPE_ALIASES: dict[str, str] = {
+    "no_order": "不下单",
+    "notrade": "不下单",
+    "no_trade": "不下单",
+    "hold": "不下单",
+    "skip": "不下单",
+    "none": "不下单",
+    "wait": "不下单",
+    "limit": "限价单",
+    "limit_order": "限价单",
+    "breakout": "突破单",
+    "breakout_order": "突破单",
+    "market": "市价单",
+    "market_order": "市价单",
+}
+
+_NO_ORDER_PRICE_FIELDS: tuple[str, ...] = (
+    "order_direction",
+    "entry_price",
+    "take_profit_price",
+    "take_profit_price_2",
+    "stop_loss_price",
+    "entry_basis_bar",
+    "entry_basis_extreme",
+    "entry_rule",
+)
+
+# Denial phrases that contradict answer=是 on §14 nodes. Some models write
+# answer=是 to mean "I completed the scan" — we cross-check the reason text
+# before treating it as a real violation.
+_SECTION14_DENIAL_PHRASES: tuple[str, ...] = (
+    "未触犯",
+    "未违反",
+    "无触犯",
+    "无违规",
+    "通过扫描",
+    "扫描通过",
+    "无禁止",
+    "未触发",
+)
+
+
+def _normalize_order_type_aliases(decision: dict[str, Any]) -> bool:
+    """Map English order_type slips (no_order, limit, …) to schema enums.
+
+    Mirrors upstream ``_normalize_order_type_aliases``. Returns ``True`` when
+    the field was changed.
+    """
+    raw = str(decision.get("order_type", "") or "").strip()
+    if not raw:
+        return False
+    key = raw.lower().replace(" ", "_").replace("-", "_")
+    mapped = _ORDER_TYPE_ALIASES.get(key) or _ORDER_TYPE_ALIASES.get(raw.lower())
+    if mapped and mapped != raw:
+        decision["order_type"] = mapped
+        logger.debug("order_type %r -> %r", raw, mapped)
+        return True
+    return False
+
+
+def _trace_node_answer(trace: Any, node_id: str) -> str | None:
+    """Return the trimmed ``answer`` for the first trace item with ``node_id``."""
+    if not isinstance(trace, list):
+        return None
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("node_id", "")).strip() == node_id:
+            return str(item.get("answer", "") or "").strip()
+    return None
+
+
+def _section14_violated(trace: Any) -> bool:
+    """Return True only when §14 answer is 是 AND reason confirms violation.
+
+    Cross-checks reason text against denial phrases because some models write
+    answer=是 to mean "scan completed" rather than "violation found".
+    """
+    if not isinstance(trace, list):
+        return False
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        nid = str(item.get("node_id", "") or "").strip()
+        if not nid.startswith("14"):
+            continue
+        if str(item.get("answer", "") or "").strip() != "是":
+            continue
+        reason = str(item.get("reason", "") or "")
+        if any(phrase in reason for phrase in _SECTION14_DENIAL_PHRASES):
+            logger.debug(
+                "_section14_violated: node %s answer=是 but reason contains "
+                "denial phrase; treating as NOT violated",
+                nid,
+            )
+            continue
+        return True
+    return False
+
+
+def _clear_decision_to_no_order(decision: dict[str, Any]) -> None:
+    """Force ``order_type`` to 不下单 and null out price/rule fields.
+
+    Provides valid defaults for ``trade_confidence`` and
+    ``trade_confidence_reasoning`` (schema-required non-null).
+    """
+    decision["order_type"] = "不下单"
+    for field in _NO_ORDER_PRICE_FIELDS:
+        decision[field] = None
+    decision["estimated_win_rate"] = None
+    decision["estimated_win_rate_reasoning"] = None
+    if decision.get("trade_confidence") is None:
+        decision["trade_confidence"] = 0
+    existing_reasoning = decision.get("trade_confidence_reasoning")
+    if not isinstance(existing_reasoning, str) or not existing_reasoning:
+        decision["trade_confidence_reasoning"] = "无入场计划，不存在交易信心"
+
+
+def _coerce_decision_no_order(out: dict[str, Any]) -> bool:
+    """When trace/terminal reject a trade, clear decision prices (common model slip).
+
+    Returns ``True`` when the decision was coerced to 不下单. Mirrors upstream
+    ``_coerce_decision_no_order``. Triggers:
+
+    * ``terminal.outcome`` in {wait, reject}
+    * ``decision_trace`` node 10.3 answer = 否
+    * §14 node answer = 是 (with no denial phrase in reason)
+    """
+    decision = out.get("decision")
+    if not isinstance(decision, dict):
+        return False
+    _normalize_order_type_aliases(decision)
+
+    terminal = out.get("terminal")
+    outcome = (
+        str(terminal.get("outcome", "") or "").strip()
+        if isinstance(terminal, dict)
+        else ""
+    )
+    order_type = decision.get("order_type")
+
+    if order_type not in _TRADE_ORDER_TYPES:
+        # Already 不下单 (or unmapped): only react to terminal/outcome mismatch.
+        if outcome in ("wait", "reject") and order_type != "不下单":
+            _clear_decision_to_no_order(decision)
+            logger.debug(
+                "Coerced %r + terminal=%s to 不下单", order_type, outcome
+            )
+            return True
+        return False
+
+    trace = out.get("decision_trace")
+    triggers: list[str] = []
+    if _trace_node_answer(trace, "10.3") == "否":
+        triggers.append("10.3=否")
+    if outcome in ("wait", "reject"):
+        triggers.append(f"terminal.outcome={outcome}")
+    if _section14_violated(trace):
+        triggers.append("§14触犯")
+
+    if not triggers:
+        return False
+
+    _clear_decision_to_no_order(decision)
+    logger.debug("Coerced decision to 不下单 (%s)", ", ".join(triggers))
+    return True
+
+
 # ── Cycle ordering (must stay in sync with validation.TRADE_DECISION_CYCLE_ORDER) ──
 
 _CYCLE_ORDER: tuple[str, ...] = (
@@ -441,14 +620,19 @@ def normalize_trade_decision(
 
     Fixes ``next_cycle_prediction.probabilities`` (float→int, clamp,
     rescale sum=100, cycle=argmax), maps decision_trace answer aliases
-    (e.g. "不下单" → "否"), and normalizes breakout entry_price to
-    basis extreme +/- 1 tick (ported from PA_Agent price_tick).
+    (e.g. "不下单" → "否"), coerces decision to 不下单 when trace/terminal
+    reject the trade (ported from upstream ``_coerce_decision_no_order``),
+    and normalizes breakout entry_price to basis extreme +/- 1 tick
+    (ported from PA_Agent price_tick).
     """
     out = copy.deepcopy(decision_json)
     prediction = out.get("next_cycle_prediction")
     if isinstance(prediction, dict):
         _normalize_next_cycle_prediction(prediction, stage1_json=diagnosis)
     _resolve_trace_answers(out.get("decision_trace") or [])
+
+    if _coerce_decision_no_order(out):
+        logger.debug("decision coerced to 不下单 (trace/terminal rejection)")
 
     decision = out.get("decision")
     if isinstance(decision, dict) and normalize_breakout_basis_extreme(decision):
