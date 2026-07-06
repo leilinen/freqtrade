@@ -1,11 +1,15 @@
 """Trade-decision validation."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
+import logging
 import math
 import re
+from dataclasses import dataclass, field
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 CHECK_JSON_SYNTAX = "json_syntax"
@@ -620,6 +624,9 @@ def _breakout_basis_errors(
     entry = _number(decision.get("entry_price"))
     if entry is None:
         return []
+    # Strict inequality matches upstream PA_Agent: normalize_breakout_entry_price
+    # (price_tick.py, called from normalize_trade_decision) snaps entry to
+    # extreme +/- tick, so equality never reaches the validator.
     if direction == "做多" and extreme == "high":
         high = _number(basis_row.get("high"))
         if high is not None and entry <= high:
@@ -1389,11 +1396,18 @@ def _parse_k_range(value: str) -> list[int]:
     text = value.strip().upper().replace(" ", "")
     range_match = _K_RANGE_RE.fullmatch(text)
     if range_match:
-        older = int(range_match.group(1))
-        newer = int(range_match.group(2))
-        if older < newer:
-            return [-1]
-        return list(range(newer, older + 1))
+        a = int(range_match.group(1))
+        b = int(range_match.group(2))
+        if a < b:
+            logger.warning(
+                "bar_range=%r has reversed order (K%d-K%d); K1=newest, K{N}=older. "
+                "Auto-corrected but this may indicate model confusion.",
+                text,
+                a,
+                b,
+            )
+        lo, hi = min(a, b), max(a, b)
+        return list(range(lo, hi + 1))
     single_match = _K_SINGLE_RE.fullmatch(text)
     if single_match:
         return [int(single_match.group(1))]

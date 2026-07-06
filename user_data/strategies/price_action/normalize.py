@@ -16,8 +16,16 @@ PR2 will add bar_by_bar pad + bar_type/role/context_effect enum repair.
 from __future__ import annotations
 
 import copy
+import logging
 import re
 from typing import Any
+
+from .price_tick import (
+    normalize_breakout_basis_extreme,
+    normalize_breakout_entry_price,
+)
+
+logger = logging.getLogger(__name__)
 
 # ── Cycle ordering (must stay in sync with validation.TRADE_DECISION_CYCLE_ORDER) ──
 
@@ -432,12 +440,28 @@ def normalize_trade_decision(
     """Stage2 normalize, called before :class:`DecisionValidator`.
 
     Fixes ``next_cycle_prediction.probabilities`` (float→int, clamp,
-    rescale sum=100, cycle=argmax) and maps decision_trace answer aliases
-    (e.g. "不下单" → "否").
+    rescale sum=100, cycle=argmax), maps decision_trace answer aliases
+    (e.g. "不下单" → "否"), and normalizes breakout entry_price to
+    basis extreme +/- 1 tick (ported from PA_Agent price_tick).
     """
     out = copy.deepcopy(decision_json)
     prediction = out.get("next_cycle_prediction")
     if isinstance(prediction, dict):
         _normalize_next_cycle_prediction(prediction, stage1_json=diagnosis)
     _resolve_trace_answers(out.get("decision_trace") or [])
+
+    decision = out.get("decision")
+    if isinstance(decision, dict) and normalize_breakout_basis_extreme(decision):
+        logger.debug(
+            "breakout entry_basis_extreme aligned to %s for %s",
+            decision.get("entry_basis_extreme"),
+            decision.get("order_direction"),
+        )
+    if isinstance(
+        decision, dict
+    ) and normalize_breakout_entry_price(decision, feature_rows=feature_rows):
+        logger.debug(
+            "breakout entry_price adjusted to basis extreme +/- 1 tick (basis=%s)",
+            decision.get("entry_basis_bar"),
+        )
     return out

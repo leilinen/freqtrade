@@ -2451,6 +2451,37 @@ class TestDecisionValidator:
         assert result.checks[-1] == "semantic_reasonableness"
         assert "short_breakout_entry_must_be_below_basis_low" in result.errors
 
+    def test_decision_trace_accepts_ascending_bar_range(self):
+        """K1-K8 (ascending) must be accepted, matching upstream coherence_checks behavior."""
+        decision = _trade_decision(diagnosis=self.diagnosis)
+        decision["decision_trace"][0]["bar_range"] = "K1-K3"
+
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+            feature_rows=self.feature_rows,
+        )
+
+        assert "decision_trace_bar_range_invalid" not in result.errors
+        assert "decision_trace_bar_range_format_invalid" not in result.errors
+
+    def test_decision_trace_ascending_bar_range_still_checked_for_out_of_frame(self):
+        """Ascending ranges still participate in out-of-frame checks."""
+        decision = _trade_decision(diagnosis=self.diagnosis)
+        decision["decision_trace"][0]["bar_range"] = "K1-K3"
+
+        # feature_rows 只到 K3，但人为把 max 限制到 K2 来验证越界检查
+        feature_rows = self.feature_rows[:2]
+        _, result = DecisionValidator().validate(
+            json.dumps(decision),
+            diagnosis=self.diagnosis,
+            price_action_features=self.features,
+            feature_rows=feature_rows,
+        )
+
+        assert "decision_trace_bar_range_out_of_frame" in result.errors
+
     def test_actionable_trade_requires_trader_equation_trace_node(self):
         decision = _trade_decision(diagnosis=self.diagnosis)
         decision["decision_trace"] = [

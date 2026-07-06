@@ -18,6 +18,12 @@ from price_action.normalize import (  # noqa: E402
     normalize_market_diagnosis,
     normalize_trade_decision,
 )
+from price_action.price_tick import (  # noqa: E402
+    infer_price_tick_from_rows,
+    normalize_breakout_basis_extreme,
+    normalize_breakout_entry_price,
+    round_to_tick,
+)
 
 
 # ── Probability normalization ──
@@ -339,3 +345,165 @@ class TestNormalizeMarketDiagnosis:
         once = normalize_market_diagnosis(diag)
         twice = normalize_market_diagnosis(once)
         assert once == twice
+
+
+# ── Breakout price normalization (ported from PA_Agent price_tick) ──
+
+
+def _feature_rows(high: float = 104.0, low: float = 99.0) -> list[dict]:
+    return [{"k": "K1", "open": 100.0, "high": high, "low": low, "close": 103.0}]
+
+
+class TestBreakoutPriceNormalize:
+    def test_infer_tick_from_three_decimal_prices(self):
+        rows = [{"k": "K1", "open": 0.0, "high": 4556.595, "low": 99.0, "close": 0.0}]
+        assert infer_price_tick_from_rows(rows) == 0.001
+
+    def test_infer_tick_returns_none_for_empty_rows(self):
+        assert infer_price_tick_from_rows(None) is None
+        assert infer_price_tick_from_rows([]) is None
+
+    def test_infer_tick_returns_one_for_integer_prices(self):
+        rows = [{"k": "K1", "open": 100.0, "high": 104.0, "low": 99.0, "close": 103.0}]
+        assert infer_price_tick_from_rows(rows) == 1.0
+
+    def test_round_to_tick_basic(self):
+        assert round_to_tick(4556.5951, 0.001) == 4556.595
+        # Python's round uses banker's rounding (round-half-to-even), so
+        # 100.5 -> 100, not 101. This is shared behavior with upstream.
+        assert round_to_tick(100.5, 1.0) == 100.0
+        assert round_to_tick(100.4, 1.0) == 100.0
+        assert round_to_tick(100.6, 1.0) == 101.0
+
+    def test_round_to_tick_zero_tick_is_noop(self):
+        assert round_to_tick(123.456, 0.0) == 123.456
+
+    def test_normalize_breakout_entry_at_high_bumps_up(self):
+        """entry == K1.high → pushed to high + tick (mirrors upstream behavior)."""
+        rows = _feature_rows(high=4556.595, low=4500.0)
+        decision = {
+            "order_type": "突破单",
+            "order_direction": "做多",
+            "entry_basis_bar": "K1",
+            "entry_basis_extreme": "high",
+            "entry_price": 4556.595,
+        }
+        assert normalize_breakout_entry_price(decision, feature_rows=rows) is True
+        assert decision["entry_price"] == round_to_tick(4556.595 + 0.001, 0.001)
+
+    def test_normalize_breakout_entry_at_low_pushes_down(self):
+        """entry == K1.low → pushed to low - tick."""
+        rows = _feature_rows(high=100.0, low=95.0)
+        decision = {
+            "order_type": "突破单",
+            "order_direction": "做空",
+            "entry_basis_bar": "K1",
+            "entry_basis_extreme": "low",
+            "entry_price": 95.0,
+        }
+        assert normalize_breakout_entry_price(decision, feature_rows=rows) is True
+        assert decision["entry_price"] == 94.0  # tick=1.0 inferred from integer prices
+
+    def test_normalize_short_breakout_extreme_high_to_low(self):
+        decision = {
+            "order_type": "突破单",
+            "order_direction": "做空",
+            "entry_basis_extreme": "high",
+            "entry_basis_bar": "K3",
+            "entry_price": 3.42,
+        }
+        assert normalize_breakout_basis_extreme(decision)
+        assert decision["entry_basis_extreme"] == "low"
+
+    def test_normalize_breakout_skips_non_breakout(self):
+        decision = {
+            "order_type": "限价单",
+            "order_direction": "做多",
+            "entry_basis_bar": "K1",
+            "entry_basis_extreme": "high",
+            "entry_price": 100.0,
+        }
+        assert normalize_breakout_entry_price(decision, feature_rows=_feature_rows()) is False
+        assert normalize_breakout_basis_extreme(decision) is False
+        assert decision["entry_price"] == 100.0
+
+    def test_normalize_breakout_skips_missing_basis_bar(self):
+        decision = {
+            "order_type": "突破单",
+            "order_direction": "做多",
+            "entry_basis_extreme": "high",
+            "entry_price": 100.0,
+        }
+        assert normalize_breakout_entry_price(decision, feature_rows=_feature_rows()) is False
+
+    def test_normalize_breakout_skips_missing_feature_rows(self):
+        decision = {
+            "order_type": "突破单",
+            "order_direction": "做多",
+            "entry_basis_bar": "K1",
+            "entry_basis_extreme": "high",
+            "entry_price": 100.0,
+        }
+        assert normalize_breakout_entry_price(decision, feature_rows=None) is False
+        assert decision["entry_price"] == 100.0
+
+    def test_normalize_breakout_skips_when_basis_row_absent(self):
+        decision = {
+            "order_type": "突破单",
+            "order_direction": "做多",
+            "entry_basis_bar": "K5",
+            "entry_basis_extreme": "high",
+            "entry_price": 100.0,
+        }
+        assert normalize_breakout_entry_price(decision, feature_rows=_feature_rows()) is False
+
+    def test_normalize_breakout_idempotent(self):
+        rows = _feature_rows(high=4556.595, low=4500.0)
+        decision = {
+            "order_type": "突破单",
+            "order_direction": "做多",
+            "entry_basis_bar": "K1",
+            "entry_basis_extreme": "high",
+            "entry_price": 4556.595,
+        }
+        first = normalize_breakout_entry_price(decision, feature_rows=rows)
+        second = normalize_breakout_entry_price(decision, feature_rows=rows)
+        assert first is True
+        assert second is False  # already at target, no further change
+
+    def test_normalize_trade_decision_snaps_breakout_entry(self):
+        """End-to-end: normalize_trade_decision pushes entry_price to high + tick."""
+        decision_json = {
+            "decision": {
+                "order_type": "突破单",
+                "order_direction": "做多",
+                "entry_basis_bar": "K1",
+                "entry_basis_extreme": "high",
+                "entry_price": 4556.595,
+                "stop_loss_price": 99.0,
+                "take_profit_price": 4600.0,
+                "take_profit_price_2": 4700.0,
+            },
+        }
+        out = normalize_trade_decision(
+            decision_json,
+            feature_rows=[{"k": "K1", "open": 100.0, "high": 4556.595, "low": 99.0, "close": 103.0}],
+        )
+        assert out["decision"]["entry_price"] == round_to_tick(4556.596, 0.001)
+
+    def test_normalize_trade_decision_does_not_mutate_input(self):
+        decision_json = {
+            "decision": {
+                "order_type": "突破单",
+                "order_direction": "做多",
+                "entry_basis_bar": "K1",
+                "entry_basis_extreme": "high",
+                "entry_price": 4556.595,
+            },
+        }
+        original_entry = decision_json["decision"]["entry_price"]
+        _ = normalize_trade_decision(
+            decision_json,
+            feature_rows=[{"k": "K1", "open": 100.0, "high": 4556.595, "low": 99.0, "close": 103.0}],
+        )
+        assert decision_json["decision"]["entry_price"] == original_entry
