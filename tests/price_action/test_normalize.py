@@ -1404,7 +1404,16 @@ class TestFormatBreakoutTickHint:
         rows = [{"high": 100.0}]
         hint = format_breakout_tick_hint(rows)
         assert "entry_rule" in hint
-        assert "K{n}" in hint
+        assert "Kn low/high = 实际价格" in hint
+
+    def test_hint_safe_for_str_format(self):
+        """The hint flows through str.format() via trade_decision_user.txt;
+        it must not contain unescaped '{' or '}'."""
+        rows = [{"high": 100.0}]
+        hint = format_breakout_tick_hint(rows)
+        # No standalone '{' or '}' allowed (only safe text)
+        assert "{" not in hint
+        assert "}" not in hint
 
     def test_includes_recompute_warning(self):
         rows = [{"high": 100.0}]

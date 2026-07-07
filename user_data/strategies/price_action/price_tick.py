@@ -173,12 +173,15 @@ def format_breakout_tick_hint(feature_rows: list[dict[str, Any]] | None) -> str:
     if tick is None:
         return ""
     tick_s = f"{tick:g}"
+    # NOTE: this string flows through str.format() via trade_decision_user.txt,
+    # so the literal value must not contain any unescaped '{' or '}' — they
+    # would be re-interpreted as format placeholders and raise KeyError.
     return (
         f"**突破单定价（程序推断最小跳动 ≈ {tick_s}）**：做多时 "
         f"`entry_price` 必须 **严格大于** `entry_basis_bar` 的 high，"
         f"推荐 `entry_price = 该 K 线 high + {tick_s}`（禁止等于 high）；"
         f"做空时 `entry_price` 必须 **严格低于** low，推荐 `low - {tick_s}`。"
-        f"`entry_rule` 必须写明：`K{{n}} low/high = {{实际价格}}，entry = {{实际价格}} ± {tick_s}`，"
+        f"`entry_rule` 必须写明：`Kn low/high = 实际价格，entry = 实际价格 ± {tick_s}`，"
         f"勿重复 order_type/方向长句。"
         f"**程序会用 entry_basis_bar 对应棒的极点重算 entry_price，忽略你给的数值——"
         f"请确保 entry_basis_bar 序号与你实际引用的 K 线一致。**"
