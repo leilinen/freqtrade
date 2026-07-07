@@ -36,6 +36,7 @@ from price_action.normalize import (  # noqa: E402
     repair_diagnosis_summary_and_decision,
 )
 from price_action.price_tick import (  # noqa: E402
+    format_breakout_tick_hint,
     infer_price_tick_from_rows,
     normalize_breakout_basis_extreme,
     normalize_breakout_entry_price,
@@ -1372,3 +1373,52 @@ class TestNormalizeTradeDecisionEnumIntegration:
         original = copy.deepcopy(decision_json)
         normalize_trade_decision(decision_json)
         assert decision_json == original
+
+
+# ── format_breakout_tick_hint ──
+
+
+class TestFormatBreakoutTickHint:
+    def test_empty_when_no_rows(self):
+        assert format_breakout_tick_hint(None) == ""
+        assert format_breakout_tick_hint([]) == ""
+
+    def test_includes_tick_value(self):
+        rows = [{"open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0}]
+        hint = format_breakout_tick_hint(rows)
+        assert "0.1" in hint
+
+    def test_includes_long_rule(self):
+        rows = [{"high": 100.0}]
+        hint = format_breakout_tick_hint(rows)
+        assert "严格大于" in hint
+        assert "high" in hint
+
+    def test_includes_short_rule(self):
+        rows = [{"low": 100.0}]
+        hint = format_breakout_tick_hint(rows)
+        assert "严格低于" in hint
+        assert "low" in hint
+
+    def test_includes_entry_rule_template(self):
+        rows = [{"high": 100.0}]
+        hint = format_breakout_tick_hint(rows)
+        assert "entry_rule" in hint
+        assert "K{n}" in hint
+
+    def test_includes_recompute_warning(self):
+        rows = [{"high": 100.0}]
+        hint = format_breakout_tick_hint(rows)
+        assert "重算 entry_price" in hint
+        assert "entry_basis_bar" in hint
+
+    def test_three_decimal_tick(self):
+        rows = [{"high": 100.123}]
+        hint = format_breakout_tick_hint(rows)
+        assert "0.001" in hint
+
+    def test_integer_tick(self):
+        rows = [{"high": 100.0}]
+        hint = format_breakout_tick_hint(rows)
+        # 100.0 → 1 decimal place → tick = 1.0 → {1:g} = "1"
+        assert "≈ 1）" in hint

@@ -159,3 +159,27 @@ def normalize_breakout_entry_price(
 
     decision["entry_price"] = target
     return True
+
+
+def format_breakout_tick_hint(feature_rows: list[dict[str, Any]] | None) -> str:
+    """One-line stage-2 user hint with inferred tick and entry-price formula.
+
+    Mirrors upstream ``format_breakout_tick_hint``. Adapted to freqtrade's
+    ``feature_rows`` (list of dicts) instead of upstream's kline_frame.
+    Injected into the stage-2 user message to prime the LLM with the
+    correct entry-price arithmetic before it emits the decision JSON.
+    """
+    tick = infer_price_tick_from_rows(feature_rows)
+    if tick is None:
+        return ""
+    tick_s = f"{tick:g}"
+    return (
+        f"**突破单定价（程序推断最小跳动 ≈ {tick_s}）**：做多时 "
+        f"`entry_price` 必须 **严格大于** `entry_basis_bar` 的 high，"
+        f"推荐 `entry_price = 该 K 线 high + {tick_s}`（禁止等于 high）；"
+        f"做空时 `entry_price` 必须 **严格低于** low，推荐 `low - {tick_s}`。"
+        f"`entry_rule` 必须写明：`K{{n}} low/high = {{实际价格}}，entry = {{实际价格}} ± {tick_s}`，"
+        f"勿重复 order_type/方向长句。"
+        f"**程序会用 entry_basis_bar 对应棒的极点重算 entry_price，忽略你给的数值——"
+        f"请确保 entry_basis_bar 序号与你实际引用的 K 线一致。**"
+    )

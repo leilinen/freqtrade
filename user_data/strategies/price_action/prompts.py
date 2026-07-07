@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .features import PriceActionFeatureResult
+from .price_tick import format_breakout_tick_hint
 from .strategy_templates import StrategyTemplate
 
 
@@ -286,6 +287,7 @@ class PromptAssembler:
             previous_text=json.dumps(previous_decision or {}, ensure_ascii=False, indent=2),
             decision_stance=stance_key,
             decision_stance_text=stance_text,
+            breakout_tick_hint=format_breakout_tick_hint(features.rows),
             schema_json=json.dumps(TRADE_DECISION_SCHEMA, ensure_ascii=False, indent=2),
         )
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
