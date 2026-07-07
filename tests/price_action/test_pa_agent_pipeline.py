@@ -101,7 +101,7 @@ def _market_diagnosis(
         gate_trace = [
             {
                 "node_id": "1.1",
-                "question": "K线数据是否足够完成市场诊断？",
+                "question": "数据是否足够？",
                 "answer": "是",
                 "reason": "已提供足够的已收盘 K 线",
                 "branch": None,
@@ -110,7 +110,7 @@ def _market_diagnosis(
             },
             {
                 "node_id": "1.2",
-                "question": "是否能识别出当前市场周期？",
+                "question": "是否能识别市场周期？",
                 "answer": "是",
                 "reason": "通道结构可识别",
                 "branch": cycle_position,
@@ -119,7 +119,7 @@ def _market_diagnosis(
             },
             {
                 "node_id": "1.3",
-                "question": "市场是否不是极端混乱？",
+                "question": "当前市场是否极端混乱？",
                 "answer": "是",
                 "reason": "-",
                 "branch": None,
@@ -128,7 +128,7 @@ def _market_diagnosis(
             },
             {
                 "node_id": "2.1",
-                "question": "近期结构是否呈现明确惯性方向？",
+                "question": "是否存在明确惯性方向？",
                 "answer": "是",
                 "reason": "-",
                 "branch": direction,
@@ -137,7 +137,7 @@ def _market_diagnosis(
             },
             {
                 "node_id": "2.2",
-                "question": "长程背景是否支持近期方向？",
+                "question": "长程大背景方向与近期方向的关系？",
                 "answer": "中性",
                 "reason": "-",
                 "branch": "mixed",
@@ -146,7 +146,7 @@ def _market_diagnosis(
             },
             {
                 "node_id": "2.3",
-                "question": "Always In 方向是否与顶层方向一致？",
+                "question": "当前方向是多头还是空头？",
                 "answer": "是",
                 "reason": "方向判断一致",
                 "branch": direction,
@@ -155,7 +155,7 @@ def _market_diagnosis(
             },
             {
                 "node_id": "2.4",
-                "question": "当前是否没有明显反向陷阱？",
+                "question": "当前是否处于 Always In 状态？",
                 "answer": "是",
                 "reason": "未见反向陷阱",
                 "branch": None,
@@ -164,7 +164,7 @@ def _market_diagnosis(
             },
             {
                 "node_id": "2.5",
-                "question": "当前惯性强度是否足以进入交易决策？",
+                "question": "当前惯性强度是否足够支持趋势跟踪？",
                 "answer": "是",
                 "reason": "闸门通过，进入交易决策",
                 "branch": direction,

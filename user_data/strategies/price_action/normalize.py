@@ -27,6 +27,8 @@ from .price_tick import (
 from .trace_normalize import (
     normalize_trace_list_bar_range,
     repair_stage1_gate_trace,
+    repair_stage1_gate_trace_questions,
+    repair_stage2_decision_trace_questions,
     repair_stage2_terminal,
     strip_ai_gate_14,
 )
@@ -1162,6 +1164,8 @@ def normalize_market_diagnosis(
     if isinstance(gate, list):
         strip_ai_gate_14(gate)
     repair_stage1_gate_trace(out)
+    if isinstance(gate, list) and repair_stage1_gate_trace_questions(gate):
+        logger.debug("gate_trace questions aligned with decision tree spec")
     _resolve_trace_answers(gate or [])
     normalize_trace_list_bar_range(
         gate,
@@ -1197,7 +1201,12 @@ def normalize_trade_decision(
     prediction = out.get("next_cycle_prediction")
     if isinstance(prediction, dict):
         _normalize_next_cycle_prediction(prediction, stage1_json=diagnosis)
-    _resolve_trace_answers(out.get("decision_trace") or [])
+    decision_trace = out.get("decision_trace")
+    if isinstance(decision_trace, list) and repair_stage2_decision_trace_questions(
+        decision_trace
+    ):
+        logger.debug("decision_trace questions aligned with decision tree spec")
+    _resolve_trace_answers(decision_trace or [])
     normalize_trace_list_bar_range(
         out.get("decision_trace"),
         default_max_seq=_max_seq_from_feature_rows(feature_rows),

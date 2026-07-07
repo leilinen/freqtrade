@@ -668,3 +668,68 @@ def repair_stage1_gate_trace(obj: dict[str, Any]) -> bool:
                 mutated = True
 
     return mutated
+
+
+# ── Canonical question repair (Batch D2) ──
+#
+# Models often paraphrase the binary decision tree questions
+# ("数据是否足够?" → "数据是否充足？"). The canonical wording lives in
+# ``二元决策.txt``; these helpers overwrite AI paraphrases with the
+# spec text so downstream consumers see consistent node questions.
+
+
+def _canonical_gate_questions() -> dict[str, str]:
+    """Return ``{node_id: canonical_question}`` from the decision tree spec.
+
+    Mirrors upstream ``_canonical_gate_questions``. Same dict serves
+    gate_trace (stage1) and decision_trace (stage2).
+    """
+    # Local import to avoid module-load cycle on missing asset.
+    from .decision_tree import canonical_tree_questions
+
+    return canonical_tree_questions()
+
+
+def repair_stage1_gate_trace_questions(gate_trace: list[Any]) -> bool:
+    """Overwrite gate_trace node questions with canonical wording.
+
+    Mirrors upstream behavior inside ``_repair_stage1_gate_trace``
+    (the canonical question sync was inline there). Returns True when
+    any item was modified.
+    """
+    canonical_q = _canonical_gate_questions()
+    if not canonical_q:
+        return False
+    changed = False
+    for item in gate_trace:
+        if not isinstance(item, dict):
+            continue
+        nid = str(item.get("node_id", "") or "").strip()
+        if nid in canonical_q:
+            canonical = canonical_q[nid]
+            if str(item.get("question", "") or "").strip() != canonical:
+                item["question"] = canonical
+                changed = True
+    return changed
+
+
+def repair_stage2_decision_trace_questions(trace: list[Any]) -> bool:
+    """Align decision_trace question text with the decision tree (format-only).
+
+    Mirrors upstream ``_repair_stage2_decision_trace_questions``.
+    Returns True when any item was modified.
+    """
+    canonical_q = _canonical_gate_questions()
+    if not canonical_q:
+        return False
+    changed = False
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        nid = str(item.get("node_id", "") or "").strip()
+        if nid in canonical_q:
+            canonical = canonical_q[nid]
+            if str(item.get("question", "") or "").strip() != canonical:
+                item["question"] = canonical
+                changed = True
+    return changed
