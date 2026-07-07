@@ -33,6 +33,219 @@ from .trace_normalize import (
 
 logger = logging.getLogger(__name__)
 
+# ── Closed-enum normalization (ported from PA_Agent stage2_normalizer) ──
+#
+# LLMs often append annotations to closed enums (e.g. ``doji（十字星）``)
+# or use synonyms (``strong`` → ``high``). ``_normalize_closed_enum`` strips
+# the suffix and maps synonyms back to schema tokens before the validator
+# rejects them. Applied to stage2 ``bar_analysis.{bar_type, entry_bar,
+# signal_bar}`` enums.
+
+# Separators that mark the start of an annotation: CJK + ASCII brackets,
+# em/en dash, colon. Anything after the first separator is dropped.
+_ENUM_SUFFIX_SEPARATORS: tuple[str, ...] = (
+    "（", "(", "【", "[", "—", "–", " - ", "：", ":",
+)
+
+
+def _strip_enum_suffix(raw: str) -> str:
+    """Drop trailing annotations models append to closed enums.
+
+    Mirrors upstream ``_strip_enum_suffix``. Splits on the first CJK/ASCII
+    bracket / dash / colon and returns the trimmed head.
+    """
+    text = raw.strip()
+    for sep in _ENUM_SUFFIX_SEPARATORS:
+        if sep in text:
+            head = text.split(sep, 1)[0].strip()
+            if head:
+                return head
+    return text
+
+
+def _normalize_closed_enum(
+    raw: object,
+    allowed: frozenset[str],
+    *,
+    aliases: dict[str, str] | None = None,
+) -> str | None:
+    """Map messy model enum text to a schema token, or None if unrecognized.
+
+    Mirrors upstream ``_normalize_closed_enum``. Order: strip suffix →
+    lowercase + underscore → alias map → membership check →
+    longest-prefix match fallback.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = _strip_enum_suffix(raw)
+    key = text.strip().lower().replace(" ", "_")
+    if aliases:
+        key = aliases.get(key, key)
+    if key in allowed:
+        return key
+    for token in sorted(allowed, key=len, reverse=True):
+        if key.startswith(token):
+            return token
+    return None
+
+
+_BAR_TYPE_ENUM = frozenset({
+    "trend_bull", "trend_bear", "doji", "inside",
+    "outside_bull", "outside_bear", "flat", "other",
+})
+_BAR_TYPE_ALIASES: dict[str, str] = {
+    "ine": "inside",
+    "ins": "inside",
+    "insid": "inside",
+    "doj": "doji",
+    "trendbull": "trend_bull",
+    "trendbear": "trend_bear",
+    "outsidebull": "outside_bull",
+    "outsidebear": "outside_bear",
+}
+_ENTRY_BAR_FRESHNESS_ENUM = frozenset({"fresh", "pending", "stale", "invalid"})
+_ENTRY_BAR_FRESHNESS_ALIASES: dict[str, str] = {
+    "expired": "stale",
+    "old": "stale",
+    "aged": "stale",
+    "too_old": "stale",
+    "active": "fresh",
+    "ready": "fresh",
+    "new": "fresh",
+    "waiting": "pending",
+    "trigger": "pending",
+    "k0_trigger": "pending",
+    "limit_order_pending": "pending",
+    "limit_pending": "pending",
+    "order_pending": "pending",
+    "awaiting_fill": "pending",
+    "awaiting_trigger": "pending",
+}
+_ENTRY_BAR_STRENGTH_ENUM = frozenset({"strong", "weak", "not_triggered"})
+_ENTRY_BAR_STRENGTH_ALIASES: dict[str, str] = {
+    "pending": "not_triggered",
+    "waiting": "not_triggered",
+    "triggered": "strong",
+    "not_triggered": "not_triggered",
+    "strong": "strong",
+    "weak": "weak",
+}
+_SIGNAL_BAR_QUALITY_ENUM = frozenset({"strong", "medium", "weak", "invalid"})
+_SIGNAL_BAR_QUALITY_ALIASES: dict[str, str] = {
+    "low": "weak",
+    "high": "strong",
+    "moderate": "medium",
+    "poor": "weak",
+    "good": "strong",
+    "bad": "invalid",
+    "弱": "weak",
+    "中": "medium",
+    "强": "strong",
+    "无效": "invalid",
+}
+
+
+def _stage1_bar_analysis_bar_type(stage1_json: dict[str, Any] | None) -> str | None:
+    """Return the canonical bar_type from stage1 bar_analysis, if any."""
+    if not isinstance(stage1_json, dict):
+        return None
+    bar_analysis = stage1_json.get("bar_analysis")
+    if not isinstance(bar_analysis, dict):
+        return None
+    return _normalize_closed_enum(
+        bar_analysis.get("bar_type"), _BAR_TYPE_ENUM, aliases=_BAR_TYPE_ALIASES
+    )
+
+
+def _normalize_entry_bar_freshness(entry_bar: dict[str, Any]) -> bool:
+    raw = entry_bar.get("freshness")
+    mapped = _normalize_closed_enum(
+        raw,
+        _ENTRY_BAR_FRESHNESS_ENUM,
+        aliases=_ENTRY_BAR_FRESHNESS_ALIASES,
+    )
+    if mapped and mapped != raw:
+        entry_bar["freshness"] = mapped
+        return True
+    return False
+
+
+def _normalize_second_entry(second_entry: dict[str, Any]) -> bool:
+    """``type`` must be a string; models often emit null when not a second entry."""
+    raw_type = second_entry.get("type")
+    if raw_type is not None and (
+        isinstance(raw_type, str) and str(raw_type).strip()
+    ):
+        return False
+    second_entry["type"] = "none"
+    return True
+
+
+def normalize_stage2_bar_analysis_enums(
+    out: dict[str, Any],
+    *,
+    stage1_json: dict[str, Any] | None = None,
+) -> bool:
+    """Strip enum annotations and sync bar_type from stage1 when available.
+
+    Mirrors upstream ``_normalize_stage2_bar_analysis_enums``. Repairs
+    bar_type / entry_bar.{freshness, strength} / signal_bar.{quality,
+    pattern, reason} / second_entry.type before validation.
+    """
+    changed = False
+    bar_analysis = out.get("bar_analysis")
+    if not isinstance(bar_analysis, dict):
+        return False
+
+    stage1_bt = _stage1_bar_analysis_bar_type(stage1_json)
+    raw_bt = bar_analysis.get("bar_type")
+    norm_bt = stage1_bt or _normalize_closed_enum(
+        raw_bt, _BAR_TYPE_ENUM, aliases=_BAR_TYPE_ALIASES
+    )
+    if norm_bt and norm_bt != raw_bt:
+        bar_analysis["bar_type"] = norm_bt
+        changed = True
+
+    entry_bar = bar_analysis.get("entry_bar")
+    if isinstance(entry_bar, dict):
+        if _normalize_entry_bar_freshness(entry_bar):
+            changed = True
+        raw_strength = entry_bar.get("strength")
+        norm_strength = _normalize_closed_enum(
+            raw_strength,
+            _ENTRY_BAR_STRENGTH_ENUM,
+            aliases=_ENTRY_BAR_STRENGTH_ALIASES,
+        )
+        if norm_strength and norm_strength != raw_strength:
+            entry_bar["strength"] = norm_strength
+            changed = True
+
+    signal_bar = bar_analysis.get("signal_bar")
+    if isinstance(signal_bar, dict):
+        raw_q = signal_bar.get("quality")
+        norm_q = _normalize_closed_enum(
+            raw_q,
+            _SIGNAL_BAR_QUALITY_ENUM,
+            aliases=_SIGNAL_BAR_QUALITY_ALIASES,
+        )
+        if norm_q and norm_q != raw_q:
+            signal_bar["quality"] = norm_q
+            changed = True
+        raw_pat = str(signal_bar.get("pattern", "") or "").strip().lower()
+        if raw_pat in ("no_signal", "no-signal", "nosignal", "not_triggered"):
+            signal_bar["pattern"] = "none"
+            changed = True
+        if not str(signal_bar.get("reason") or "").strip():
+            signal_bar["reason"] = "无独立信号棒（quality=invalid 或计划型观望）"
+            changed = True
+
+    second_entry = bar_analysis.get("second_entry")
+    if isinstance(second_entry, dict) and _normalize_second_entry(second_entry):
+        changed = True
+
+    return changed
+
+
 # ── Decision no-order coercion (ported from PA_Agent stage2_normalizer) ──
 #
 # When the decision_trace or terminal indicates the trade was rejected
@@ -966,17 +1179,21 @@ def normalize_trade_decision(
     """Stage2 normalize, called before :class:`DecisionValidator`.
 
     Fixes ``next_cycle_prediction.probabilities`` (float→int, clamp,
-    rescale sum=100, cycle=argmax), maps decision_trace answer aliases
-    (e.g. "不下单" → "否"), canonicalizes bar_range strings (Batch A port
-    from upstream ``normalize_stage2_traces``), hoists decision fields
-    misplaced under diagnosis_summary (Batch E), repairs flat/scalar
-    decision payloads (Batch D: unwrap → hoist terminal → ensure required
-    fields → truncate reasoning), coerces decision to 不下单 when
-    trace/terminal reject the trade (ported from upstream
-    ``_coerce_decision_no_order``), and normalizes breakout entry_price
-    to basis extreme +/- 1 tick (ported from PA_Agent price_tick).
+    rescale sum=100, cycle=argmax), normalizes stage2 ``bar_analysis``
+    closed enums (bar_type / entry_bar / signal_bar / second_entry),
+    maps decision_trace answer aliases (e.g. "不下单" → "否"),
+    canonicalizes bar_range strings (Batch A port from upstream
+    ``normalize_stage2_traces``), hoists decision fields misplaced under
+    diagnosis_summary (Batch E), repairs flat/scalar decision payloads
+    (Batch D: unwrap → hoist terminal → ensure required fields →
+    truncate reasoning), coerces decision to 不下单 when trace/terminal
+    reject the trade (ported from upstream ``_coerce_decision_no_order``),
+    and normalizes breakout entry_price to basis extreme +/- 1 tick
+    (ported from PA_Agent price_tick).
     """
     out = copy.deepcopy(decision_json)
+    if normalize_stage2_bar_analysis_enums(out, stage1_json=diagnosis):
+        logger.debug("stage2 bar_analysis enums normalized")
     prediction = out.get("next_cycle_prediction")
     if isinstance(prediction, dict):
         _normalize_next_cycle_prediction(prediction, stage1_json=diagnosis)

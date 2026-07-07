@@ -18,16 +18,20 @@ from price_action.normalize import (  # noqa: E402
     _default_cycle_probs,
     _ensure_decision_required_fields,
     _hoist_terminal_from_decision,
+    _normalize_closed_enum,
     _normalize_next_cycle_prediction,
     _normalize_order_type_aliases,
     _order_type_from_decision_scalar,
     _resolve_trace_answer,
     _resolve_trace_answers,
     _section14_violated,
+    _stage1_bar_analysis_bar_type,
+    _strip_enum_suffix,
     _trace_node_answer,
     _truncate_decision_reasoning,
     _unwrap_flat_stage2_decision,
     normalize_market_diagnosis,
+    normalize_stage2_bar_analysis_enums,
     normalize_trade_decision,
     repair_diagnosis_summary_and_decision,
 )
@@ -1181,6 +1185,189 @@ class TestNormalizeTradeDecisionBatchEIntegration:
         decision_json = {
             "decision": {"order_type": "限价单"},
             "diagnosis_summary": {"trade_confidence": 88},
+        }
+        original = copy.deepcopy(decision_json)
+        normalize_trade_decision(decision_json)
+        assert decision_json == original
+
+
+# ── Closed-enum normalization ──
+
+
+class TestStripEnumSuffix:
+    def test_plain_text(self):
+        assert _strip_enum_suffix("doji") == "doji"
+
+    def test_cjk_bracket_annotation(self):
+        assert _strip_enum_suffix("doji（十字星）") == "doji"
+
+    def test_ascii_paren_annotation(self):
+        assert _strip_enum_suffix("inside(ii)") == "inside"
+
+    def test_em_dash_annotation(self):
+        assert _strip_enum_suffix("trend_bull — strong") == "trend_bull"
+
+    def test_colon_annotation(self):
+        assert _strip_enum_suffix("fresh:just formed") == "fresh"
+
+    def test_first_separator_wins(self):
+        assert _strip_enum_suffix("trend_bull（牛）— strong") == "trend_bull"
+
+    def test_whitespace_trimmed(self):
+        assert _strip_enum_suffix("  doji  ") == "doji"
+
+    def test_empty_returns_empty(self):
+        assert _strip_enum_suffix("") == ""
+
+
+class TestNormalizeClosedEnum:
+    def test_exact_match_returned(self):
+        assert _normalize_closed_enum("doji", frozenset({"doji", "inside"})) == "doji"
+
+    def test_case_insensitive(self):
+        assert _normalize_closed_enum("DOJI", frozenset({"doji"})) == "doji"
+
+    def test_alias_applied(self):
+        out = _normalize_closed_enum(
+            "high",
+            frozenset({"strong", "weak"}),
+            aliases={"high": "strong"},
+        )
+        assert out == "strong"
+
+    def test_suffix_stripped_first(self):
+        assert _normalize_closed_enum(
+            "doji（十字星）", frozenset({"doji"})
+        ) == "doji"
+
+    def test_prefix_match_fallback(self):
+        # "trendbullxxx" startswith "trendbull" only after alias map fails.
+        # Use allowed set with the token as prefix.
+        assert _normalize_closed_enum(
+            "trend_bull_extra",
+            frozenset({"trend_bull", "trend_bear"}),
+        ) == "trend_bull"
+
+    def test_unrecognized_returns_none(self):
+        assert _normalize_closed_enum("garbage", frozenset({"doji"})) is None
+
+    def test_non_string_returns_none(self):
+        assert _normalize_closed_enum(None, frozenset({"doji"})) is None
+        assert _normalize_closed_enum(42, frozenset({"doji"})) is None
+
+    def test_longest_token_wins_on_prefix_conflict(self):
+        # both "strong" and "strong_x" could prefix-match "strong_x_y"
+        allowed = frozenset({"strong", "strong_x"})
+        assert _normalize_closed_enum("strong_x_y", allowed) == "strong_x"
+
+
+class TestStage1BarAnalysisBarType:
+    def test_returns_canonical_when_valid(self):
+        s1 = {"bar_analysis": {"bar_type": "doji"}}
+        assert _stage1_bar_analysis_bar_type(s1) == "doji"
+
+    def test_normalizes_via_alias(self):
+        s1 = {"bar_analysis": {"bar_type": "doj"}}
+        assert _stage1_bar_analysis_bar_type(s1) == "doji"
+
+    def test_strips_suffix(self):
+        s1 = {"bar_analysis": {"bar_type": "trend_bull（牛）"}}
+        assert _stage1_bar_analysis_bar_type(s1) == "trend_bull"
+
+    def test_none_when_no_bar_analysis(self):
+        assert _stage1_bar_analysis_bar_type({}) is None
+
+    def test_none_when_invalid_value(self):
+        s1 = {"bar_analysis": {"bar_type": "garbage"}}
+        assert _stage1_bar_analysis_bar_type(s1) is None
+
+
+class TestNormalizeStage2BarAnalysisEnums:
+    def test_bar_type_normalized_with_alias(self):
+        out = {"bar_analysis": {"bar_type": "doj"}}
+        assert normalize_stage2_bar_analysis_enums(out) is True
+        assert out["bar_analysis"]["bar_type"] == "doji"
+
+    def test_bar_type_synced_from_stage1(self):
+        out = {"bar_analysis": {"bar_type": "garbage"}}
+        s1 = {"bar_analysis": {"bar_type": "inside"}}
+        assert normalize_stage2_bar_analysis_enums(out, stage1_json=s1) is True
+        assert out["bar_analysis"]["bar_type"] == "inside"
+
+    def test_entry_bar_freshness_alias(self):
+        out = {"bar_analysis": {"entry_bar": {"freshness": "expired"}}}
+        assert normalize_stage2_bar_analysis_enums(out) is True
+        assert out["bar_analysis"]["entry_bar"]["freshness"] == "stale"
+
+    def test_entry_bar_strength_alias(self):
+        out = {"bar_analysis": {"entry_bar": {"strength": "triggered"}}}
+        assert normalize_stage2_bar_analysis_enums(out) is True
+        assert out["bar_analysis"]["entry_bar"]["strength"] == "strong"
+
+    def test_signal_bar_quality_alias(self):
+        out = {"bar_analysis": {"signal_bar": {"quality": "high"}}}
+        assert normalize_stage2_bar_analysis_enums(out) is True
+        assert out["bar_analysis"]["signal_bar"]["quality"] == "strong"
+
+    def test_signal_bar_pattern_none_for_no_signal(self):
+        out = {"bar_analysis": {"signal_bar": {"pattern": "no_signal"}}}
+        normalize_stage2_bar_analysis_enums(out)
+        assert out["bar_analysis"]["signal_bar"]["pattern"] == "none"
+
+    def test_signal_bar_pattern_none_for_no_signal_dash_variant(self):
+        out = {"bar_analysis": {"signal_bar": {"pattern": "no-signal"}}}
+        normalize_stage2_bar_analysis_enums(out)
+        assert out["bar_analysis"]["signal_bar"]["pattern"] == "none"
+
+    def test_signal_bar_reason_filled_when_blank(self):
+        out = {"bar_analysis": {"signal_bar": {"quality": "weak"}}}
+        normalize_stage2_bar_analysis_enums(out)
+        assert out["bar_analysis"]["signal_bar"]["reason"]
+
+    def test_second_entry_type_filled_when_null(self):
+        out = {"bar_analysis": {"second_entry": {"type": None}}}
+        assert normalize_stage2_bar_analysis_enums(out) is True
+        assert out["bar_analysis"]["second_entry"]["type"] == "none"
+
+    def test_second_entry_type_preserved_when_string(self):
+        out = {"bar_analysis": {"second_entry": {"type": "follow_through"}}}
+        normalize_stage2_bar_analysis_enums(out)
+        assert out["bar_analysis"]["second_entry"]["type"] == "follow_through"
+
+    def test_no_bar_analysis_returns_false(self):
+        out = {}
+        assert normalize_stage2_bar_analysis_enums(out) is False
+
+    def test_bar_analysis_not_dict_returns_false(self):
+        out = {"bar_analysis": "x"}
+        assert normalize_stage2_bar_analysis_enums(out) is False
+
+    def test_already_canonical_no_change(self):
+        out = {"bar_analysis": {"bar_type": "doji"}}
+        assert normalize_stage2_bar_analysis_enums(out) is False
+
+
+class TestNormalizeTradeDecisionEnumIntegration:
+    def test_bar_type_normalized_via_normalize(self):
+        decision_json = {
+            "decision": {"order_type": "限价单"},
+            "bar_analysis": {"bar_type": "doj"},
+        }
+        out = normalize_trade_decision(decision_json)
+        assert out["bar_analysis"]["bar_type"] == "doji"
+
+    def test_entry_bar_freshness_via_normalize(self):
+        decision_json = {
+            "decision": {"order_type": "限价单"},
+            "bar_analysis": {"entry_bar": {"freshness": "aged"}},
+        }
+        out = normalize_trade_decision(decision_json)
+        assert out["bar_analysis"]["entry_bar"]["freshness"] == "stale"
+
+    def test_does_not_mutate_input(self):
+        decision_json = {
+            "decision": {"order_type": "限价单"},
+            "bar_analysis": {"bar_type": "doj"},
         }
         original = copy.deepcopy(decision_json)
         normalize_trade_decision(decision_json)
