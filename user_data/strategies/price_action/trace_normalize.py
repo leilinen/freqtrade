@@ -272,9 +272,18 @@ def _expand_bar_range_for_reason_citations(
         return
 
     merged = allowed | cited
-    # Clip only when frame cap is known; always keep cited seqs from reason.
+    # Clip to the valid bar window [1, default_max_seq]. Out-of-window
+    # citations in the reason text (e.g. K0 for the forming bar, or K10
+    # when only 8 bars are in frame) are dropped — they would push
+    # bar_range into validator-rejected state. The narrative mention
+    # itself is fine, but bar_range must stay within frame.
     if default_max_seq and default_max_seq >= 1:
-        merged = {s for s in merged if 1 <= s <= default_max_seq} | cited
+        merged = {s for s in merged if 1 <= s <= default_max_seq}
+        if not merged:
+            return
+    else:
+        # No frame cap known: at minimum drop K0 (validator hard-rejects it).
+        merged = {s for s in merged if s >= 1}
         if not merged:
             return
 

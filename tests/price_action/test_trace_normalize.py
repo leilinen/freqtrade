@@ -252,12 +252,12 @@ class TestExpandBarRangeForReasonCitations:
         assert item["bar_range"] == "不适用"
 
     def test_clips_to_default_when_known(self):
-        """Reason citations are always kept even outside frame; non-cited parts clip."""
+        """Out-of-frame reason citations (K9 when frame=5) are dropped so
+        bar_range stays within validator-accepted window."""
         item = {"node_id": "9.0", "bar_range": "K3-K1", "reason": "K9 引用"}
         _expand_bar_range_for_reason_citations(item, default_max_seq=5)
-        # Cited K9 is preserved; non-cited K3,K1 clipped (but K3,K1 are ≤5 so kept)
-        # merged = {1,2,3} | {9} (after clip applied to non-cited only)
-        assert item["bar_range"] == "K9-K1"
+        # K9 cited but out-of-frame (5); dropped. K1..K3 in frame, kept.
+        assert item["bar_range"] == "K3-K1"
 
 
 class TestNormalizeTraceItemBarRange:
