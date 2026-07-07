@@ -24,6 +24,7 @@ from .price_tick import (
     normalize_breakout_basis_extreme,
     normalize_breakout_entry_price,
 )
+from .pattern_routing import ensure_detected_patterns_coherent
 from .trace_normalize import (
     normalize_trace_list_bar_range,
     repair_stage1_gate_trace,
@@ -1171,6 +1172,8 @@ def normalize_market_diagnosis(
         gate,
         default_max_seq=_max_seq_from_feature_rows(feature_rows),
     )
+    if ensure_detected_patterns_coherent(out):
+        logger.debug("detected_patterns synced with key_signals/entry_setup_type")
     return out
 
 

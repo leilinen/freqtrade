@@ -193,7 +193,9 @@ def _market_diagnosis(
         "climax_risk": "none",
         "market_phase": "stable",
         "transition_risk": None,
-        "detected_patterns": ["breakout_up"] if direction == "bullish" else [],
+        "detected_patterns": (
+            ["breakout_up", "breakout_pullback"] if direction == "bullish" else ["breakout_pullback"]
+        ),
         "key_signals": ["K1 close"],
         "htf_context": "背景中性",
         "entry_setup": "breakout_pullback",
