@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .coherence_checks import validate_bar_by_bar_vs_features
+
 
 logger = logging.getLogger(__name__)
 
@@ -1287,9 +1289,12 @@ def validate_market_diagnosis(
                 errors.append("market_diagnosis_bar_by_bar_follow_through_invalid")
             if item.get("trapped_side") not in MARKET_DIAGNOSIS_TRAPPED_SIDES:
                 errors.append("market_diagnosis_bar_by_bar_trapped_side_invalid")
-            row = rows_by_k.get(bar)
-            if row and item.get("bar_type") != row.get("bar_type"):
-                errors.append(f"market_diagnosis_bar_by_bar_{bar}_bar_type_mismatch")
+        for msg in validate_bar_by_bar_vs_features(
+            diagnosis,
+            feature_rows=feature_rows,
+            strict=False,
+        ):
+            logger.info("stage1 coherence warning: %s", msg)
 
     gate_trace = diagnosis.get("gate_trace")
     gate_result = str(diagnosis.get("gate_result", "")).lower()
@@ -1317,7 +1322,6 @@ def validate_market_diagnosis(
         _sync_gate_23_with_direction(diagnosis)
         _validate_gate_trace_order(gate_trace, gate_result, errors)
         _validate_gate_trace_branch_consistency(gate_trace, diagnosis, errors)
-        _validate_duplicate_bar_ranges(gate_trace, errors)
         for item in gate_trace:
             if not isinstance(item, dict):
                 errors.append("market_diagnosis_gate_trace_item_must_be_object")

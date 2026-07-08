@@ -748,7 +748,9 @@ class TestMarketDiagnosisPrompt:
         assert '"cycle_position"' in content
         assert '"gate_trace"' in content
         assert '"gate_result"' in content
-        assert "1.1、1.2、1.3、2.1、2.2、2.3、2.4、2.5" in content
+        assert "1.2、1.3、2.1、2.2、2.5" in content
+        assert "§1.1" in content  # prompt declares 1.1/2.3/2.4 are program-judged
+        assert "§2.3" in content
         assert '"market_state"' not in content
         assert '"signal_chain"' not in content
 
@@ -782,7 +784,7 @@ class TestMarketDiagnosisPrompt:
 
         assert errors == []
 
-    def test_market_diagnosis_validation_rejects_bar_type_mismatch(self):
+    def test_market_diagnosis_validation_lenient_on_bar_type_mismatch(self):
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
         features = build_price_action_features(
             df,
@@ -795,10 +797,12 @@ class TestMarketDiagnosisPrompt:
         )
         diagnosis = _market_diagnosis(features)
         diagnosis["bar_analysis"]["bar_type"] = "trend_bear"
+        diagnosis["bar_by_bar_summary"][0]["bar_type"] = "trend_bear"
 
         errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
 
         assert "market_diagnosis_bar_analysis_bar_type_mismatch" in errors
+        assert not any("bar_by_bar_K1_bar_type_mismatch" in err for err in errors)
 
     def test_market_diagnosis_validation_requires_proceed_gate_nodes(self):
         features = self._features()
@@ -1533,7 +1537,12 @@ class TestMarketDiagnosisOrchestrator:
         payload = notify_args.args[2]
         assert payload["decision"] == outcome.decision
         assert payload["validation"]["valid"] is True
-        assert payload["diagnosis"] == diagnosis
+        # Diagnosis payload is the post-normalize form: DecisionNodeEngine
+        # overwrites direction/gate_trace 2.3+2.4 (see issue #37), so the
+        # persisted diagnosis no longer equals the raw AI mock input.
+        persisted_diagnosis = save_kwargs["market_diagnosis"]
+        assert payload["diagnosis"] == persisted_diagnosis
+        assert persisted_diagnosis["direction"] in ("bullish", "bearish", "neutral")
         assert payload["experience_cases"] == [{"id": 1, "title": "case"}]
 
     def test_market_diagnosis_validation_retry_uses_feedback(self):

@@ -25,6 +25,7 @@ from .price_tick import (
     normalize_breakout_entry_price,
 )
 from .pattern_routing import ensure_detected_patterns_coherent
+from .coherence_checks import auto_fix_bar_by_bar_types
 from .trace_normalize import (
     normalize_trace_list_bar_range,
     repair_stage1_gate_trace,
@@ -1172,6 +1173,25 @@ def normalize_market_diagnosis(
         gate,
         default_max_seq=_max_seq_from_feature_rows(feature_rows),
     )
+
+    # Program-computed §1.1 (data), §2.3 (direction), and §2.4 (Always-In):
+    # override whatever the LLM emitted. Mirrors upstream PA_Agent
+    # DecisionNodeEngine apply_stage1. See issue #37: GLM-5.2 systematically mis-fills the
+    # 2.3 ``branch`` field (null / position words like "middle"), causing
+    # ``direction_branch_conflict`` rejections.
+    if feature_rows:
+        try:
+            from .decision_nodes import apply_stage1_nodes
+
+            if apply_stage1_nodes(out, feature_rows):
+                logger.debug("stage1 nodes 1.1/2.3/2.4 computed by DecisionNodeEngine")
+                gate = out.get("gate_trace") or []
+        except Exception as exc:  # pragma: no cover - safety net
+            logger.warning("DecisionNodeEngine.apply_stage1_nodes failed: %s", exc)
+
+    for msg in auto_fix_bar_by_bar_types(out, feature_rows=feature_rows):
+        logger.info("stage1 %s", msg)
+
     if ensure_detected_patterns_coherent(out):
         logger.debug("detected_patterns synced with key_signals/entry_setup_type")
     return out
@@ -1229,6 +1249,16 @@ def normalize_trade_decision(
 
     if _coerce_decision_no_order(out):
         logger.debug("decision coerced to 不下单 (trace/terminal rejection)")
+
+    # Sync stage2 diagnosis_summary.direction with program-overwritten
+    # stage1 direction. The DecisionNodeEngine (§2.3) rewrites
+    # diagnosis.direction during stage1 normalize; AI's stage2 reply still
+    # carries the older value it saw in the stage2 user prompt. Without
+    # this sync the validator trips ``diagnosis_summary_direction_mismatch``.
+    if isinstance(diagnosis, dict) and isinstance(out.get("diagnosis_summary"), dict):
+        stage1_dir = diagnosis.get("direction")
+        if stage1_dir and out["diagnosis_summary"].get("direction") != stage1_dir:
+            out["diagnosis_summary"]["direction"] = stage1_dir
 
     if repair_stage2_terminal(out):
         logger.debug("terminal.node_id aligned to 10.3 (no-order rejection)")
