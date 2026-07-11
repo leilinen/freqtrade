@@ -379,6 +379,213 @@ def _clear_decision_to_no_order(decision: dict[str, Any]) -> None:
         decision["trade_confidence_reasoning"] = "无入场计划，不存在交易信心"
 
 
+def _set_trace_node_answer(
+    trace: Any,
+    node_id: str,
+    answer: str,
+    *,
+    reason_suffix: str = "",
+) -> None:
+    """Set ``answer`` (and optionally append a reason suffix) on a trace node.
+
+    Ported from PA_Agent ``stage2_normalizer._set_trace_node_answer``. If the
+    node is absent the call is a no-op (the validator/normalizer owns trace
+    structure; we do not fabricate nodes here).
+    """
+    if not isinstance(trace, list):
+        return
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("node_id", "")).strip() != node_id:
+            continue
+        item["answer"] = answer
+        if reason_suffix:
+            base = str(item.get("reason", "") or "").strip()
+            item["reason"] = f"{base}{reason_suffix}".strip()
+        return
+
+
+# ── Planned-limit trace fix (ported from PA_Agent stage2_normalizer:1434-1516) ──
+#
+# When the model writes a valid planned-limit decision but leaves §9.0=否/等待,
+# two fixes are required:
+#   1. ``_fix_9_0_for_planned_limit``: upgrade §9.0 answer to 是 (limit plan
+#      accepts weak/invalid signal bars or no signal bar at all).
+#   2. ``_fix_background_limit_trace``: ensure §9.0P=是 is present in trace,
+#      recording the background-driven limit path.
+# Order matters: 9.0 first, then 9.0P (9.0P only fires when 9.0 ∈ {否,等待},
+# so it is safe to run after 9.0 is upgraded — in that case it is a no-op).
+
+
+def _fix_background_limit_trace(out: dict[str, Any]) -> bool:
+    """Ensure §9.0P=是 when a planned limit order follows §9.0=否/等待.
+
+    Direct port of upstream ``stage2_normalizer._fix_background_limit_trace``.
+    """
+    from .decision_nodes import is_planned_limit_order
+
+    if not is_planned_limit_order(out):
+        return False
+    trace = out.get("decision_trace")
+    if not isinstance(trace, list):
+        return False
+
+    node_90: dict[str, Any] | None = None
+    node_90p: dict[str, Any] | None = None
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        nid = str(item.get("node_id", "")).strip()
+        if nid == "9.0":
+            node_90 = item
+        elif nid == "9.0P":
+            node_90p = item
+
+    changed = False
+    if node_90 is not None:
+        ans = str(node_90.get("answer", "") or "").strip()
+        if ans in ("否", "等待"):
+            if node_90p is None:
+                trace.insert(
+                    trace.index(node_90) + 1,
+                    {
+                        "node_id": "9.0P",
+                        "section": "入场信号",
+                        "question": "背景驱动限价单评估（§9.0=否 时必须评估）",
+                        "answer": "是",
+                        "reason": (
+                            "程序校正：计划型限价单，周期/结构位支持挂限价，"
+                            "继续 §10 定三价。"
+                        ),
+                        "skipped": False,
+                        "bar_range": "K10-K1",
+                    },
+                )
+                changed = True
+            elif str(node_90p.get("answer", "") or "").strip() in ("否", "等待"):
+                node_90p["answer"] = "是"
+                base = str(node_90p.get("reason", "") or "").strip()
+                suffix = "（程序校正：背景限价路径，非信号棒路径。）"
+                node_90p["reason"] = f"{base}{suffix}".strip() if base else suffix.strip()
+                changed = True
+    return changed
+
+
+def _fix_9_0_for_planned_limit(out: dict[str, Any]) -> bool:
+    """When model outputs a valid planned limit but §9.0=否/等待, upgrade to 是.
+
+    Direct port of upstream ``stage2_normalizer._fix_9_0_for_planned_limit``.
+    """
+    from .decision_nodes import is_planned_limit_order
+
+    if not is_planned_limit_order(out):
+        return False
+    trace = out.get("decision_trace")
+    if not isinstance(trace, list):
+        return False
+    changed = False
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("node_id", "")).strip() != "9.0":
+            continue
+        ans = str(item.get("answer", "") or "").strip()
+        if ans not in ("否", "等待"):
+            return False
+        item["answer"] = "是"
+        base = str(item.get("reason", "") or "").strip()
+        suffix = (
+            "（程序校正：计划型限价单，接受 weak/invalid 或无信号棒，"
+            "等待回撤/反弹到位入场，非等下一根确认棒后放弃。）"
+        )
+        item["reason"] = f"{base}{suffix}".strip() if base else suffix.strip()
+        changed = True
+        break
+    return changed
+
+
+# ── Trade-metrics veto (ported from PA_Agent stage2_normalizer:882-925) ──
+#
+# After the breakout entry snap and stop-widening, an order can still fail
+# the risk/reward / trader-equation / K1-freshness / TP2-geometry checks
+# (e.g. a malformed stop the LLM refuses to fix, or a stale limit order).
+# Upstream forces such orders to 不下单 so a failed cycle still persists a
+# valid "no-order" decision rather than an invalid one. See the plan's
+# safety-net #3 (metrics 失败强制不下单).
+
+def _coerce_decision_when_trade_metrics_fail(
+    out: dict[str, Any],
+    *,
+    feature_rows: list[dict[str, Any]] | None = None,
+    decision_stance: str | None = None,
+) -> bool:
+    """After breakout entry snap + stop widening, reject orders that still fail RR / trader equation / K1 freshness.
+
+    Returns ``True`` when the decision was coerced to 不下单. Ported from
+    upstream ``stage2_normalizer._coerce_decision_when_trade_metrics_fail``;
+    the ``kline_frame`` argument is replaced by ``feature_rows``.
+    """
+    decision = out.get("decision")
+    if not isinstance(decision, dict) or decision.get("order_type") not in _TRADE_ORDER_TYPES:
+        return False
+    # Require a complete entry/tp/sl triple. Incomplete price plans are left
+    # for the validator (``actionable_decision_requires_full_price_plan``);
+    # coercing a half-formed decision here would mask the real "missing
+    # field" error and make unit tests of other normalize sub-features
+    # (entry-snap, field-hoist) depend on metrics geometry they don't set.
+    if any(
+        decision.get(field) is None
+        for field in ("entry_price", "take_profit_price", "stop_loss_price")
+    ):
+        return False
+
+    # Planned-limit orders (background-driven pending limits) are exempt from
+    # the trade-metrics veto: a pending limit may legitimately omit TP2 or
+    # carry §9.0=否, and its geometry is finalised only when the limit fills.
+    # Without this guard the coerce would flip a valid planned limit to
+    # 不下单 before ``_fix_9_0_for_planned_limit`` / ``_fix_background_limit_trace``
+    # can reconcile the trace.
+    try:
+        from .decision_nodes import is_planned_limit_order
+
+        if is_planned_limit_order(out):
+            return False
+    except ImportError:
+        pass
+
+    from .trade_metrics import validate_order_trade_metrics
+
+    bar_analysis = out.get("bar_analysis")
+    metric_errors = validate_order_trade_metrics(
+        decision,
+        decision_stance=decision_stance,
+        feature_rows=feature_rows,
+        bar_analysis=bar_analysis if isinstance(bar_analysis, dict) else None,
+    )
+    if not metric_errors:
+        return False
+
+    summary = metric_errors[0]
+    _clear_decision_to_no_order(decision)
+    _set_trace_node_answer(
+        out.get("decision_trace"),
+        "10.3",
+        "否",
+        reason_suffix=f"（程序按 decision 三价校验未通过：{summary}，已改为不下单。）",
+    )
+    terminal = out.get("terminal")
+    if isinstance(terminal, dict):
+        terminal["outcome"] = "reject"
+        terminal["node_id"] = "10.3"
+        terminal.setdefault(
+            "label",
+            "交易者方程/盈亏比未达标，不下单",
+        )
+    logger.debug("Coerced decision to 不下单 (trade metrics: %s)", summary)
+    return True
+
+
 # ── Stage2 unwrap / required-fields / truncate (Batch D) ──
 #
 # When the model puts trade-decision fields at the JSON root instead of
@@ -734,6 +941,22 @@ def _coerce_decision_no_order(out: dict[str, Any]) -> bool:
             )
             return True
         return False
+
+    # Planned-limit orders (background-driven pending limits) are legitimate
+    # and must not be coerced to 不下单 by trace/terminal rejection triggers —
+    # they often carry §9.0=否 (no closed signal bar) yet still warrant a limit
+    # plan. Let the dedicated ``_fix_9_0_for_planned_limit`` /
+    # ``_fix_background_limit_trace`` normalizers (run later in the pipeline)
+    # reconcile the trace instead. (Mirrors the guard intent of upstream
+    # ``_coerce_decision_no_order`` for the planned-limit path.)
+    if order_type in _TRADE_ORDER_TYPES:
+        try:
+            from .decision_nodes import is_planned_limit_order
+
+            if is_planned_limit_order(out):
+                return False
+        except ImportError:
+            pass
 
     trace = out.get("decision_trace")
     triggers: list[str] = []
@@ -1277,4 +1500,43 @@ def normalize_trade_decision(
             "breakout entry_price adjusted to basis extreme +/- 1 tick (basis=%s)",
             decision.get("entry_basis_bar"),
         )
+
+    # ── TP1 RR cap (widen stop) + trade-metrics veto ────────────────────────
+    # Mirrors PA_Agent stage2_normalizer.py:1561-1570. First widen the stop so
+    # TP1 reward:risk falls within the 1.5 program cap (entry/TP unchanged),
+    # then reject the whole order to 不下单 if it still fails RR / trader
+    # equation / K1 freshness / TP2 geometry. This is the bottom-line safety
+    # net (#1 widen_stop + #3 metrics 失败强制不下单) — without it a malformed
+    # stop (e.g. 0.94-pt stop → TP1 R/R=16.81) passes through after retries.
+    if isinstance(decision, dict):
+        from .trade_metrics import adjust_decision_stop_for_tp1_rr_cap
+
+        if adjust_decision_stop_for_tp1_rr_cap(decision, feature_rows=feature_rows):
+            logger.debug("stop_loss widened to bring TP1 RR within program cap")
+    if _coerce_decision_when_trade_metrics_fail(out, feature_rows=feature_rows):
+        logger.debug("decision coerced to 不下单 (trade metrics failed)")
+
+    # ── Planned-limit trace fixes (ported from stage2_normalizer:1571-1573) ──
+    # Order per SOURCE: ensure §9.0P=是 background node first, then upgrade
+    # §9.0 answer. Both gate on is_planned_limit_order (requires order_type
+    # still being 限价单), so they must run before any coercion flips it.
+    if _fix_background_limit_trace(out):
+        logger.debug("§9.0P=是 background-limit trace node ensured")
+    if _fix_9_0_for_planned_limit(out):
+        logger.debug("§9.0 upgraded to 是 for planned-limit order")
+
+    # ── Stage2 decision-node engine (ported from stage2_normalizer:1576-1582) ──
+    # Program-compute §9.1/§9.2/§9.3/§9.5 signal-bar judges + §11 order-method
+    # routing, then apply node_overrides and merge into decision_trace. Runs
+    # after the planned-limit trace fixes so the §9.0/§9.0P background path is
+    # already reconciled before the §9 judges decide whether to skip.
+    if feature_rows is not None:
+        try:
+            from .decision_nodes import DecisionNodeEngine
+
+            DecisionNodeEngine.apply_stage2(out, feature_rows, diagnosis)
+            logger.debug("stage2 §9/§11 nodes computed by DecisionNodeEngine")
+        except Exception as exc:  # pragma: no cover - safety net
+            logger.warning("DecisionNodeEngine.apply_stage2 failed: %s", exc)
+
     return out
