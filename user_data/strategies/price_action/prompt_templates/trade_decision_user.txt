@@ -44,6 +44,7 @@
   estimated_win_rate 必须齐全。
 - 突破单必须填写 `entry_basis_bar`、`entry_basis_extreme` 和 `entry_rule`。
 {breakout_tick_hint}
+{continuity_block}
 - 不满足策略模板信号链时输出 `order_type=不下单`。
 - 必须填写 `next_cycle_prediction`；如果不可预测，
   cycle/direction/probabilities 写 null，unpredictable 写 true，并说明原因。

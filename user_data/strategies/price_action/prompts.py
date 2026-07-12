@@ -4,12 +4,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from .features import PriceActionFeatureResult
 from .price_tick import format_breakout_tick_hint
 from .strategy_templates import StrategyTemplate
+
+
+logger = logging.getLogger(__name__)
 
 
 TEMPLATE_DIR = Path(__file__).with_name("prompt_templates")
@@ -278,6 +282,11 @@ class PromptAssembler:
             stance_key,
             DECISION_STANCE_TEXT["conservative"],
         )
+        continuity_block = _render_continuity_block(
+            features=features,
+            diagnosis=diagnosis,
+            previous_decision=previous_decision,
+        )
         user = self._load("trade_decision_user.txt").render(
             diagnosis_json=json.dumps(diagnosis, ensure_ascii=False, indent=2),
             strategy_text=strategy_text,
@@ -288,6 +297,7 @@ class PromptAssembler:
             decision_stance=stance_key,
             decision_stance_text=stance_text,
             breakout_tick_hint=format_breakout_tick_hint(features.rows),
+            continuity_block=continuity_block,
             schema_json=json.dumps(TRADE_DECISION_SCHEMA, ensure_ascii=False, indent=2),
         )
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -311,6 +321,44 @@ class PromptAssembler:
         path = self.template_dir / name
         content = path.read_text(encoding="utf-8")
         return PromptTemplate(name=name, content=content)
+
+
+def _render_continuity_block(
+    *,
+    features: PriceActionFeatureResult,
+    diagnosis: dict[str, Any],
+    previous_decision: dict[str, Any] | None,
+) -> str:
+    """Render the program-enforced continuity rules block for the stage-2 prompt.
+
+    Mirrors PA_Agent ``prompt_assembler.py:1619-1625``. When there is no
+    previous decision (first cycle) the block still carries the neutral
+    direction + same-structure flip-cooldown rules. Returns ``""`` if
+    continuity context cannot be built (keeps the prompt valid).
+    """
+    if not previous_decision:
+        # Still inject the generic rules (no previous-plan branch).
+        ctx_input = None
+    else:
+        ctx_input = previous_decision
+    try:
+        from .decision_continuity import (
+            build_continuity_context,
+            render_continuity_prompt_block,
+        )
+
+        ctx = build_continuity_context(
+            feature_rows=features.rows,
+            stage1_json=diagnosis,
+            symbol=features.symbol,
+            timeframe=features.timeframe,
+            candle_time_iso=features.candle_time.isoformat(),
+            previous_record=ctx_input,
+        )
+        return render_continuity_prompt_block(ctx)
+    except Exception as exc:  # pragma: no cover - safety net
+        logger.warning("continuity prompt block failed: %s", exc)
+        return ""
 
 
 DEFAULT_ASSEMBLER = PromptAssembler()

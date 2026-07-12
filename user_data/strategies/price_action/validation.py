@@ -375,7 +375,7 @@ class DecisionValidator:
             if not tp1 > tp2:
                 errors.append("short_tp2_must_be_below_tp1")
 
-        errors.extend(_trade_metric_errors(decision))
+        errors.extend(_trade_metric_errors(decision, feature_rows))
 
         atr_expand = _number(price_action_features.get("atr_expand_ratio"))
         gate_break = str(price_action_features.get("gate_break", "none")).lower()
@@ -640,7 +640,21 @@ def _breakout_basis_errors(
     return errors
 
 
-def _trade_metric_errors(decision: dict[str, Any]) -> list[str]:
+def _trade_metric_errors(
+    decision: dict[str, Any],
+    feature_rows: list[dict[str, Any]] | None,
+) -> list[str]:
+    """RR floor + trader-equation check (validator layer).
+
+    The TP1 RR *upper* cap, stop-widening, K1 freshness, and TP2 geometry are
+    enforced by the normalizer (:func:`normalize._coerce_decision_when_trade_metrics_fail`
+    via :mod:`.trade_metrics`), not here — mirroring PA_Agent's layering where
+    the schema validator only guards the RR floor / trader equation and the
+    normalizer owns the program-enforced adjustments. ``feature_rows`` is kept
+    on the signature for parity with the normalizer's checks but the RR floor
+    below needs no bar data.
+    """
+    _ = feature_rows  # not used at the validator layer (normalizer owns it)
     if decision.get("order_type") not in TRADE_DECISION_ACTIONABLE_ORDER_TYPES:
         return []
     rr = _compute_risk_reward(
@@ -1168,8 +1182,15 @@ def validate_market_diagnosis(
     diagnosis: dict[str, Any],
     *,
     feature_rows: list[dict[str, Any]] | None = None,
+    coherence_checks: bool = False,
 ) -> list[str]:
-    """Validate the PA_Agent market-diagnosis contract used before routing."""
+    """Validate the PA_Agent market-diagnosis contract used before routing.
+
+    When ``coherence_checks`` is False (default, matching PA_Agent
+    ``stage1_coherence_checks=False``), gate_trace ordering and branch
+    consistency issues are logged as warnings rather than treated as hard
+    validation errors.
+    """
     errors: list[str] = []
     if not isinstance(diagnosis, dict):
         return ["market_diagnosis_root_must_be_object"]
@@ -1243,7 +1264,11 @@ def validate_market_diagnosis(
         if bar_type is not None and bar_type not in MARKET_DIAGNOSIS_BAR_TYPES:
             errors.append("market_diagnosis_bar_analysis_bar_type_invalid")
         if latest and bar_type != latest.get("bar_type"):
-            errors.append("market_diagnosis_bar_analysis_bar_type_mismatch")
+            logger.info(
+                "stage1 coherence warning: bar_analysis.bar_type=%r mismatches K1 feature=%r",
+                bar_type,
+                latest.get("bar_type"),
+            )
         signal_bar = bar_analysis.get("signal_bar")
         if isinstance(signal_bar, dict):
             quality = signal_bar.get("quality")
@@ -1257,10 +1282,6 @@ def validate_market_diagnosis(
         expected_count = min(5, len(feature_rows or summary))
         if len(feature_rows or []) >= 5 and len(summary) != 5:
             errors.append("market_diagnosis_bar_by_bar_summary_must_cover_k5_to_k1")
-        expected_bars = {f"K{i}" for i in range(1, expected_count + 1)}
-        seen_bars = {str(item.get("bar")) for item in summary if isinstance(item, dict)}
-        if expected_bars and seen_bars and seen_bars != expected_bars:
-            errors.append("market_diagnosis_bar_by_bar_summary_bars_invalid")
         for item in summary:
             if not isinstance(item, dict):
                 errors.append("market_diagnosis_bar_by_bar_summary_item_must_be_object")
@@ -1320,8 +1341,15 @@ def validate_market_diagnosis(
                 )
         _sync_gate_12_with_cycle(diagnosis)
         _sync_gate_23_with_direction(diagnosis)
-        _validate_gate_trace_order(gate_trace, gate_result, errors)
-        _validate_gate_trace_branch_consistency(gate_trace, diagnosis, errors)
+        if coherence_checks:
+            _validate_gate_trace_order(gate_trace, gate_result, errors)
+            _validate_gate_trace_branch_consistency(gate_trace, diagnosis, errors)
+        else:
+            logger.debug(
+                "stage1 coherence checks disabled; skipping gate_trace order/branch checks "
+                "(%d trace items)",
+                len(gate_trace),
+            )
         for item in gate_trace:
             if not isinstance(item, dict):
                 errors.append("market_diagnosis_gate_trace_item_must_be_object")

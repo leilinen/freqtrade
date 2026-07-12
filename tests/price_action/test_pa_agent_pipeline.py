@@ -785,6 +785,12 @@ class TestMarketDiagnosisPrompt:
         assert errors == []
 
     def test_market_diagnosis_validation_lenient_on_bar_type_mismatch(self):
+        """bar_analysis.bar_type mismatch with K1 feature is a soft warning, not a hard error.
+
+        Aligns with PA_Agent source: SOURCE never checks bar_analysis.bar_type vs feature
+        at all; only bar_by_bar_summary is checked (coherence_checks.py:415) and only for
+        directional opposites with threshold tolerance.
+        """
         df = _df_from_ohlc([(100.0, 104.0, 99.0, 103.0)] * 6)
         features = build_price_action_features(
             df,
@@ -801,8 +807,31 @@ class TestMarketDiagnosisPrompt:
 
         errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
 
-        assert "market_diagnosis_bar_analysis_bar_type_mismatch" in errors
+        # mismatch is now a soft log warning, NOT a hard error
+        assert "market_diagnosis_bar_analysis_bar_type_mismatch" not in errors
         assert not any("bar_by_bar_K1_bar_type_mismatch" in err for err in errors)
+
+    def test_market_diagnosis_validation_bar_by_bar_count_only_no_exact_label_match(self):
+        """bar_by_bar_summary only validates item count, not exact bar label set.
+
+        Aligns with PA_Agent source: coherence_checks.py:385 only checks
+        ``count != expected``, never checks exact label set equality. The MIGRATED
+        code previously required ``seen_bars == {K1..K5}`` which rejected
+        reasonable LLM outputs (e.g. different ordering, minor format slips).
+        """
+        features = self._features()
+        diagnosis = _market_diagnosis(features)
+        # Reverse the bar order in summary — should still pass (count-based check only)
+        diagnosis["bar_by_bar_summary"] = list(reversed(diagnosis["bar_by_bar_summary"]))
+
+        errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
+
+        assert "market_diagnosis_bar_by_bar_summary_bars_invalid" not in errors
+        # but count check still fires when wrong
+        diagnosis_short = _market_diagnosis(features)
+        diagnosis_short["bar_by_bar_summary"] = diagnosis_short["bar_by_bar_summary"][:3]
+        errors_short = validate_market_diagnosis(diagnosis_short, feature_rows=features.rows)
+        assert "market_diagnosis_bar_by_bar_summary_must_cover_k5_to_k1" in errors_short
 
     def test_market_diagnosis_validation_requires_proceed_gate_nodes(self):
         features = self._features()
@@ -813,10 +842,20 @@ class TestMarketDiagnosisPrompt:
 
         assert "market_diagnosis_gate_trace_missing_proceed_nodes" in errors
 
-    def test_market_diagnosis_validation_rejects_trace_answer_and_order_errors(self):
+    def test_market_diagnosis_validation_rejects_trace_answer_invalid_by_default(self):
+        # answer 校验始终启用 (硬错误); 与 SOURCE json_validator answer enum 检查对齐。
         features = self._features()
         diagnosis = _market_diagnosis(features)
         diagnosis["gate_trace"][0]["answer"] = "maybe"
+
+        errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
+
+        assert "market_diagnosis_gate_trace_answer_invalid" in errors
+
+    def test_market_diagnosis_validation_skips_trace_order_check_by_default(self):
+        # 默认 coherence_checks=False, 节点顺序检查降级为软日志 (对齐 SOURCE 默认)。
+        features = self._features()
+        diagnosis = _market_diagnosis(features)
         diagnosis["gate_trace"][2], diagnosis["gate_trace"][3] = (
             diagnosis["gate_trace"][3],
             diagnosis["gate_trace"][2],
@@ -824,7 +863,21 @@ class TestMarketDiagnosisPrompt:
 
         errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
 
-        assert "market_diagnosis_gate_trace_answer_invalid" in errors
+        assert "market_diagnosis_gate_trace_node_order_invalid" not in errors
+
+    def test_market_diagnosis_validation_enables_trace_order_check_with_coherence_flag(self):
+        # coherence_checks=True 时恢复节点顺序硬错误。
+        features = self._features()
+        diagnosis = _market_diagnosis(features)
+        diagnosis["gate_trace"][2], diagnosis["gate_trace"][3] = (
+            diagnosis["gate_trace"][3],
+            diagnosis["gate_trace"][2],
+        )
+
+        errors = validate_market_diagnosis(
+            diagnosis, feature_rows=features.rows, coherence_checks=True
+        )
+
         assert "market_diagnosis_gate_trace_node_order_invalid" in errors
 
     def test_market_diagnosis_validation_rejects_trace_bar_range_out_of_frame(self):
@@ -836,13 +889,28 @@ class TestMarketDiagnosisPrompt:
 
         assert "market_diagnosis_gate_trace_bar_range_out_of_frame" in errors
 
-    def test_market_diagnosis_validation_rejects_trace_branch_conflicts(self):
+    def test_market_diagnosis_validation_skips_trace_branch_conflicts_by_default(self):
+        # 默认 coherence_checks=False, branch 一致性检查降级为软日志。
         features = self._features()
         diagnosis = _market_diagnosis(features)
         diagnosis["gate_trace"][1]["branch"] = "spike"
         diagnosis["gate_trace"][5]["branch"] = "bearish"
 
         errors = validate_market_diagnosis(diagnosis, feature_rows=features.rows)
+
+        assert "market_diagnosis_gate_trace_cycle_branch_conflict" not in errors
+        assert "market_diagnosis_gate_trace_direction_branch_conflict" not in errors
+
+    def test_market_diagnosis_validation_enables_trace_branch_conflicts_with_coherence_flag(self):
+        # coherence_checks=True 时恢复 branch 一致性硬错误。
+        features = self._features()
+        diagnosis = _market_diagnosis(features)
+        diagnosis["gate_trace"][1]["branch"] = "spike"
+        diagnosis["gate_trace"][5]["branch"] = "bearish"
+
+        errors = validate_market_diagnosis(
+            diagnosis, feature_rows=features.rows, coherence_checks=True
+        )
 
         assert "market_diagnosis_gate_trace_cycle_branch_conflict" in errors
         assert "market_diagnosis_gate_trace_direction_branch_conflict" in errors
@@ -1636,9 +1704,10 @@ class TestMarketDiagnosisOrchestrator:
         invalid_decision = _trade_decision(
             order_direction="做多",
             entry=100,
-            stop=110,
-            tp1=120,
-            tp2=130,
+            stop=95,
+            tp1=110,
+            tp2=115,
+            trade_confidence=200,
             diagnosis=diagnosis,
         )
         valid_decision = _trade_decision(order_type="不下单", diagnosis=diagnosis)
@@ -1812,11 +1881,13 @@ class TestMarketDiagnosisOrchestrator:
         kwargs = repository.save_analysis.call_args.kwargs
         assert kwargs["status"] == "failed"
         assert kwargs["raw_responses"]["market_diagnosis"]["content"] == raw_diagnosis
+        # retry_max 默认 3 (Step 1.1), category "missing field" 错误使用 base retry 预算,
+        # 共 4 次 LLM 调用 (1 + 3 retries), 每次 50/10 tokens。
         assert kwargs["usage_total"] == {
-            "prompt_tokens": 50,
+            "prompt_tokens": 200,
             "cached_prompt_tokens": 0,
-            "completion_tokens": 10,
-            "total_tokens": 60,
+            "completion_tokens": 40,
+            "total_tokens": 240,
         }
         assert kwargs["exception"]["stage"] == "market_diagnosis"
         assert kwargs["exception"]["type"] == "ValueError"
@@ -2240,8 +2311,9 @@ class TestValidationRetryLimitBound:
         """Setting retry_max=99 returns 5 (was previously 3)."""
         assert _validation_retry_limit({"pa_validation_retry_max": 99}) == 5
 
-    def test_retry_limit_default_zero(self):
-        assert _validation_retry_limit({}) == 0
+    def test_retry_limit_default_three(self):
+        """Default retry_max=3 aligns with PA_Agent ValidationSettings.retry_max."""
+        assert _validation_retry_limit({}) == 3
 
     def test_retry_limit_within_bound(self):
         assert _validation_retry_limit({"pa_validation_retry_max": 4}) == 4
