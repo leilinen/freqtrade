@@ -39,7 +39,7 @@ class TestBuildRetryFeedback:
         assert "字段值/一致性不符合规则" in fb
         # Human-readable explanation, not just the code
         assert "direction" in fb and "branch" in fb
-        assert "long/short/neutral" in fb
+        assert "bullish/bearish/neutral" in fb
         # Attempt counter
         assert "1/1" in fb
         # Must NOT be just the raw code dump
@@ -127,7 +127,7 @@ class TestBuildRetryFeedback:
 class TestLookupHint:
     def test_known_code_returns_hint(self):
         hint = _lookup_hint("market_diagnosis_direction_invalid")
-        assert "long/short/neutral" in hint
+        assert "bullish/bearish/neutral" in hint
 
     def test_missing_field_pattern(self):
         hint = _lookup_hint("market_diagnosis_missing_some_field")

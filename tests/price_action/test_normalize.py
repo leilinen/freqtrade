@@ -325,11 +325,13 @@ class TestNormalizeTradeDecision:
         assert decision["decision_trace"][0]["answer"] == original_answer
         assert decision["next_cycle_prediction"]["probabilities"] == original_probs
 
-    def test_missing_next_cycle_prediction_passes_through(self):
+    def test_missing_next_cycle_prediction_injected(self):
         decision = {"decision": {"order_type": "不下单"}}
         result = normalize_trade_decision(decision)
-        # No exception, no prediction added.
-        assert "next_cycle_prediction" not in result
+        # SOURCE ensure_stage2_predictions injects stubs when model omits them.
+        assert "next_cycle_prediction" in result
+        assert isinstance(result["next_cycle_prediction"], dict)
+        assert "next_bar_prediction" in result
 
 
 class TestNormalizeMarketDiagnosis:
@@ -498,9 +500,10 @@ class TestBreakoutPriceNormalize:
                 "entry_basis_bar": "K1",
                 "entry_basis_extreme": "high",
                 "entry_price": 4556.595,
-                "stop_loss_price": 99.0,
-                "take_profit_price": 4600.0,
-                "take_profit_price_2": 4700.0,
+                "stop_loss_price": 4550.0,
+                "take_profit_price": 4566.0,
+                "take_profit_price_2": 4575.0,
+                "estimated_win_rate": 55,
             },
         }
         out = normalize_trade_decision(
@@ -528,7 +531,12 @@ class TestBreakoutPriceNormalize:
 
 
 def _trade_decision_payload(order_type: str = "突破单") -> dict:
-    """Build a minimal valid trade-decision payload (for coerce tests)."""
+    """Build a minimal valid trade-decision payload (for coerce tests).
+
+    Geometry is metrics-valid (RR within [1.0, 1.5], trader equation passes at
+    win_rate=55) so the payload survives the trade-metrics veto and only the
+    explicitly-injected rejection signals (terminal/trace) flip it to 不下单.
+    """
     return {
         "decision": {
             "order_direction": "做多",
@@ -537,15 +545,15 @@ def _trade_decision_payload(order_type: str = "突破单") -> dict:
             "entry_basis_bar": "K1",
             "entry_basis_extreme": "high",
             "entry_rule": "K1 高点上方 1 跳动",
-            "take_profit_price": 10.94,
-            "take_profit_price_2": 11.00,
+            "take_profit_price": 10.96,
+            "take_profit_price_2": 11.04,
             "stop_loss_price": 10.81,
-            "reasoning": "方程不通过但仍写突破单",
+            "reasoning": "突破单，方程通过",
             "diagnosis_confidence": 58,
             "diagnosis_confidence_reasoning": "t",
             "trade_confidence": 30,
             "trade_confidence_reasoning": "t",
-            "estimated_win_rate": 45,
+            "estimated_win_rate": 55,
             "estimated_win_rate_reasoning": "t",
             "key_factors": [],
             "watch_points": [],
@@ -1431,3 +1439,142 @@ class TestFormatBreakoutTickHint:
         hint = format_breakout_tick_hint(rows)
         # 100.0 → 1 decimal place → tick = 1.0 → {1:g} = "1"
         assert "≈ 1）" in hint
+
+
+# ── Planned-limit trace fixes (Step 2.2 + 2.3) ──────────────────────────────
+
+
+def _planned_limit_stage2_obj() -> dict:
+    """Minimal stage2 payload that qualifies as a planned-limit order.
+
+    Mirrors SOURCE test_decision_nodes_judges.py:631 fixture shape.
+    """
+    return {
+        "decision": {
+            "order_type": "限价单",
+            "order_direction": "做空",
+            "entry_price": 101.0,
+            "take_profit_price": 98.0,
+            "stop_loss_price": 103.0,
+            "reasoning": "test",
+            "diagnosis_confidence": 60,
+            "diagnosis_confidence_reasoning": "test",
+            "trade_confidence": 50,
+            "trade_confidence_reasoning": "test",
+            "estimated_win_rate": 52,
+            "estimated_win_rate_reasoning": "test",
+            "key_factors": [],
+            "watch_points": [],
+            "risk_assessment": "test",
+            "invalidation_condition": "test",
+        },
+        "diagnosis_summary": {
+            "cycle_position": "broad_channel",
+            "direction": "neutral",
+            "key_signals": [],
+        },
+        "bar_analysis": {
+            "always_in": "neutral",
+            "last_closed_bar": "K1",
+            "bar_type": "doji",
+            "signal_bar": {
+                "bar": None,
+                "quality": "invalid",
+                "pattern": "none",
+                "reason": "计划型限价",
+            },
+            "entry_bar": {
+                "bar": None,
+                "strength": "not_triggered",
+                "follow_through": "pending",
+                "still_valid": True,
+                "freshness": "pending",
+            },
+            "second_entry": {"is_second_entry": False, "type": "none"},
+        },
+        "decision_trace": [
+            {
+                "node_id": "9.0",
+                "question": "信号棒是否已经收盘且质量足够？",
+                "answer": "否",
+                "reason": "K1 doji",
+                "bar_range": "K1",
+            },
+            {
+                "node_id": "10.3",
+                "question": "交易者方程是否通过？",
+                "answer": "是",
+                "reason": "test",
+                "bar_range": "K1",
+            },
+        ],
+        "terminal": {"node_id": "11.4", "outcome": "trade", "label": "test"},
+    }
+
+
+class TestPlannedLimitTraceFix:
+    def test_upgrades_9_0_answer_to_yes_for_planned_limit(self):
+        obj = _planned_limit_stage2_obj()
+        out = normalize_trade_decision(copy.deepcopy(obj))
+        node_90 = next(n for n in out["decision_trace"] if n["node_id"] == "9.0")
+        assert node_90["answer"] == "是"
+        assert "程序校正" in node_90["reason"]
+
+    def test_inserts_9_0p_yes_node_after_9_0(self):
+        obj = _planned_limit_stage2_obj()
+        out = normalize_trade_decision(copy.deepcopy(obj))
+        trace = out["decision_trace"]
+        idx_90 = next(i for i, n in enumerate(trace) if n["node_id"] == "9.0")
+        # 9.0P should be inserted right after 9.0
+        assert idx_90 + 1 < len(trace)
+        assert trace[idx_90 + 1]["node_id"] == "9.0P"
+        assert trace[idx_90 + 1]["answer"] == "是"
+
+    def test_no_change_when_9_0_already_yes(self):
+        """When 9.0=是 already, neither fix should fire."""
+        obj = _planned_limit_stage2_obj()
+        obj["decision_trace"][0]["answer"] = "是"
+        original_trace = copy.deepcopy(obj["decision_trace"])
+        out = normalize_trade_decision(copy.deepcopy(obj))
+        # 9.0P should NOT be inserted (9.0=是 means no background path needed)
+        node_90p = [n for n in out["decision_trace"] if n["node_id"] == "9.0P"]
+        assert node_90p == []
+        # 9.0 answer unchanged
+        node_90 = next(n for n in out["decision_trace"] if n["node_id"] == "9.0")
+        assert node_90["answer"] == "是"
+
+    def test_fix_9_0_upgrades_waiting_answer(self):
+        obj = _planned_limit_stage2_obj()
+        obj["decision_trace"][0]["answer"] = "等待"
+        out = normalize_trade_decision(copy.deepcopy(obj))
+        node_90 = next(n for n in out["decision_trace"] if n["node_id"] == "9.0")
+        assert node_90["answer"] == "是"
+
+    def test_no_change_for_non_limit_order(self):
+        """Non-limit orders should not trigger planned-limit fixes."""
+        obj = _planned_limit_stage2_obj()
+        obj["decision"]["order_type"] = "市价单"
+        original_90_answer = obj["decision_trace"][0]["answer"]
+        out = normalize_trade_decision(copy.deepcopy(obj))
+        node_90 = next(n for n in out["decision_trace"] if n["node_id"] == "9.0")
+        assert node_90["answer"] == original_90_answer
+        node_90p = [n for n in out["decision_trace"] if n["node_id"] == "9.0P"]
+        assert node_90p == []
+
+    def test_9_0p_answer_upgraded_when_present_as_no(self):
+        """If 9.0P already exists with answer=否, it should be upgraded to 是."""
+        obj = _planned_limit_stage2_obj()
+        obj["decision_trace"].insert(
+            1,
+            {
+                "node_id": "9.0P",
+                "question": "背景驱动限价单评估",
+                "answer": "否",
+                "reason": "original",
+                "bar_range": "K1",
+            },
+        )
+        out = normalize_trade_decision(copy.deepcopy(obj))
+        node_90p = next(n for n in out["decision_trace"] if n["node_id"] == "9.0P")
+        assert node_90p["answer"] == "是"
+        assert "背景限价路径" in node_90p["reason"]

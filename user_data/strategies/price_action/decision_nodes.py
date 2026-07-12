@@ -1696,31 +1696,48 @@ def apply_stage1_nodes(
     node_24 = _build_program_trace_node(fill_24)
     program_nodes = [node_11, node_23, node_24]
 
+    # Step 4: Apply overrides (mirror upstream apply_stage1 step 4).
+    node_overrides = out.get("node_overrides")
+    final_nodes = apply_overrides(
+        program_nodes,
+        node_overrides,
+        out=out,
+        stage="stage1",
+    )
+
+    # Step 5: Merge into gate_trace.
+    # If gate_result is wait/unknown, prepend program nodes so the AI's
+    # terminating node (answer=否/等待) remains at the end.
     gate_trace = out.get("gate_trace")
     if not isinstance(gate_trace, list):
         gate_trace = []
-    merged = _merge_program_nodes(gate_trace, program_nodes)
-    out["gate_trace"] = merged
+    gate_result = str(out.get("gate_result", "")).lower()
+    if gate_result in ("wait", "unknown"):
+        out["gate_trace"] = _merge_program_nodes_head(gate_trace, final_nodes)
+    else:
+        out["gate_trace"] = _merge_program_nodes(gate_trace, final_nodes)
 
     # Sync top-level direction with program-computed §2.3 result.
-    # Mirror upstream behavior (decision_nodes.py line 956-959 returns direction
-    # and stage1_normalizer assigns it to out["direction"]).
     out["direction"] = direction
 
-    # bar_analysis.always_in sync (mirror upstream apply_stage1, Step 6).
-    # The validator's MARKET_DIAGNOSIS_ALWAYS_IN enum is {"long","short","neutral"},
-    # so the §2.4 branch vocabulary (AIL/AIS) must be translated. See upstream
-    # decision_nodes.py apply_stage1 lines 2832-2837.
-    bar_analysis = out.get("bar_analysis")
-    if isinstance(bar_analysis, dict):
-        branch_24 = str(fill_24.branch or "").strip()
-        answer_24 = str(fill_24.answer or "").strip()
-        if branch_24 == "AIL":
-            bar_analysis["always_in"] = "long"
-        elif branch_24 == "AIS":
-            bar_analysis["always_in"] = "short"
-        elif answer_24 == "否":
-            bar_analysis["always_in"] = "neutral"
+    # Step 6: Sync bar_analysis.always_in from the final §2.4 node.
+    # apply_overrides handles the AI-override path via
+    # _sync_always_in_from_24_override; this covers the non-override path.
+    node_24_final = next(
+        (n for n in final_nodes if isinstance(n, dict) and str(n.get("node_id", "")) == "2.4"),
+        None,
+    )
+    if node_24_final is not None:
+        bar_analysis = out.get("bar_analysis")
+        if isinstance(bar_analysis, dict):
+            branch_24 = str(node_24_final.get("branch", "") or "").strip()
+            answer_24 = str(node_24_final.get("answer", "") or "").strip()
+            if branch_24 == "AIL":
+                bar_analysis["always_in"] = "long"
+            elif branch_24 == "AIS":
+                bar_analysis["always_in"] = "short"
+            elif answer_24 == "否":
+                bar_analysis["always_in"] = "neutral"
 
     return True
 

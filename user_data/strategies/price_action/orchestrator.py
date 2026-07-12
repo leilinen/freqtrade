@@ -239,6 +239,10 @@ class PriceActionOrchestrator:
                     feature_rows=features.rows,
                     strategies=selected,
                     raw_responses=raw_responses,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    candle_time_iso=features.candle_time.isoformat(),
+                    previous_record=previous,
                 )
             )
             usage_total = _usage_total_from_responses(raw_responses)
@@ -404,7 +408,11 @@ class PriceActionOrchestrator:
             try:
                 parsed = parse_json_object(raw_text)
                 parsed = normalize_market_diagnosis(parsed, feature_rows=feature_rows)
-                errors = validate_market_diagnosis(parsed, feature_rows=feature_rows)
+                errors = validate_market_diagnosis(
+                    parsed,
+                    feature_rows=feature_rows,
+                    coherence_checks=bool(self.config.get("pa_coherence_checks", False)),
+                )
             except Exception as exc:
                 parsed = None
                 errors = [f"{type(exc).__name__}:{exc}"]
@@ -444,6 +452,10 @@ class PriceActionOrchestrator:
         feature_rows: list[dict[str, Any]],
         strategies: list[dict[str, Any]],
         raw_responses: dict[str, Any],
+        symbol: str = "",
+        timeframe: str = "",
+        candle_time_iso: str | None = None,
+        previous_record: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any] | None, Any, list[dict[str, str]]]:
         failed_attempts: list[dict[str, Any]] = []
         current_messages = list(messages)
@@ -462,6 +474,31 @@ class PriceActionOrchestrator:
                     diagnosis=diagnosis,
                     feature_rows=feature_rows,
                 )
+                # ── Decision continuity guard ────────────────────────────────
+                # Mirrors PA_Agent stage2_normalizer.py:1717-1732: after
+                # normalize (which already widened stop / coerced failed
+                # metrics to 不下单), force a continuity violation
+                # (same-structure flip in cooldown, or Always-In direction
+                # breach under direction=neutral) to 不下单 too. This is the
+                # post-processing backstop the port was missing (#4 决策连续性守卫).
+                if previous_record is not None:
+                    try:
+                        from .decision_continuity import (
+                            apply_continuity_guard,
+                            build_continuity_context,
+                        )
+
+                        ctx = build_continuity_context(
+                            feature_rows=feature_rows,
+                            stage1_json=diagnosis,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            candle_time_iso=candle_time_iso,
+                            previous_record=previous_record,
+                        )
+                        parsed = apply_continuity_guard(parsed, ctx)
+                    except Exception as exc:  # pragma: no cover - safety net
+                        logger.warning("apply_continuity_guard failed: %s", exc)
             except json.JSONDecodeError as exc:
                 parsed = None
                 validation = ValidationResult(
@@ -664,14 +701,14 @@ def _usage_total_from_responses(raw_responses: dict[str, Any]) -> dict[str, Any]
 
 
 def _validation_retry_limit(config: dict[str, Any]) -> int:
-    """总 retry 上限,默认 0,允许上调到 5。
+    """总 retry 上限,默认 3,允许上调到 5。
 
-    上调到 5 对应上游 PA_Agent ``ValidationSettings.retry_max`` 的 ``le=5`` 上限。
+    对齐上游 PA_Agent ``ValidationSettings.retry_max`` 的 ``default=3, le=5``。
     """
     try:
-        value = int(config.get("pa_validation_retry_max", 0))
+        value = int(config.get("pa_validation_retry_max", 3))
     except (TypeError, ValueError):
-        return 0
+        return 3
     return max(0, min(value, 5))
 
 
@@ -780,10 +817,10 @@ _ERROR_HINTS: dict[str, str] = {
     # ── market_diagnosis 阶段 ──
     "market_diagnosis_gate_trace_direction_branch_conflict":
         "gate_trace 中某条的 direction 字段与 branch 字段语义冲突。请检查每条 gate_trace,"
-        "direction 取 long/short/neutral,branch 必须与 direction 自洽"
-        "(如 direction=long 时 branch 应为 aligned/bullish,不能是 bearish/conflict)。",
+        "direction 取 bullish/bearish/neutral,branch 必须与 direction 自洽"
+        "(如 direction=bullish 时 branch 应为 aligned/bullish,不能是 bearish/conflict)。",
     "market_diagnosis_gate_trace_direction_answer_conflict":
-        "gate_trace 中某条的 direction 与 answer 冲突。direction=long 对应的 answer 应为「是/中性」,"
+        "gate_trace 中某条的 direction 与 answer 冲突。direction=bullish 对应的 answer 应为「是/中性」,"
         "不能是「否」(除非 branch 显式标记 reversal)。",
     "market_diagnosis_gate_trace_cycle_branch_conflict":
         "gate_trace 中 cycle_position 与 branch 冲突。请检查 cycle_position=spike 时 "
@@ -813,9 +850,11 @@ _ERROR_HINTS: dict[str, str] = {
         "strengthens_bull/weakens_bull/strengthens_bear/weakens_bear/neutral/transition。"
         "注意 strengthens_bear 不要拼成 strengthens_bash。",
     "market_diagnosis_direction_invalid":
-        "顶层 direction 只能用 long/short/neutral。",
+        "顶层 direction 只能用 bullish/bearish/neutral。",
     "market_diagnosis_cycle_position_invalid":
-        "cycle_position 只能用 spike/transitioning/barbwire/trading_range/trend 之一。",
+        "cycle_position 只能用 "
+        "spike/micro_channel/tight_channel/normal_channel/broad_channel/"
+        "trending_tr/trading_range/extreme_tr/unknown 之一。",
     # ── trade_decision 阶段 ──
     "risk_reward_below_minimum":
         "盈亏比(R/R)低于最低要求。请重新计算 entry/stop/tp1,"

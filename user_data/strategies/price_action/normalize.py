@@ -667,6 +667,141 @@ def _order_type_from_decision_scalar(value: str) -> str | None:
     return None
 
 
+# ── §stage2 enum alias normalization (mirror stage2_normalizer:36-47, 316-426) ─
+# Maps order_direction synonyms (long/buy/bullish/…) to the canonical 做多/做空.
+_ORDER_DIRECTION_ALIASES: dict[str, str] = {
+    "bearish": "做空",
+    "bullish": "做多",
+    "short": "做空",
+    "long": "做多",
+    "sell": "做空",
+    "buy": "做多",
+    "空头": "做空",
+    "多头": "做多",
+    "做空": "做空",
+    "做多": "做多",
+}
+
+
+def _normalize_order_direction_value(raw: object) -> str | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text in ("做多", "做空"):
+        return text
+    return _ORDER_DIRECTION_ALIASES.get(text.lower())
+
+
+def _normalize_always_in_value(
+    raw: object,
+    *,
+    diagnosis_direction: str | None = None,
+) -> str | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    key = text.lower().replace(" ", "")
+    if key in ("long", "short", "neutral"):
+        return key
+    if "失效" in text or "invalid" in key or key in ("none", "n/a", "na"):
+        return "neutral"
+    if "ais" in key or "空头" in text:
+        return "short"
+    if "ail" in key or "多头" in text:
+        return "long"
+    if "bear" in key:
+        return "short"
+    if "bull" in key:
+        return "long"
+    if "中性" in text or key == "neutral":
+        return "neutral"
+    if diagnosis_direction == "bearish":
+        return "short"
+    if diagnosis_direction == "bullish":
+        return "long"
+    return None
+
+
+def _normalize_terminal_outcome_value(
+    raw: object,
+    *,
+    order_type: str | None = None,
+) -> str | None:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    key = text.lower().replace(" ", "_")
+    mapped = _TERMINAL_OUTCOME_ALIASES.get(key)
+    if mapped:
+        if order_type == "不下单" and mapped == "trade":
+            return "wait"
+        return mapped
+    if key in ("wait", "reject", "trade", "proceed"):
+        return key
+    return None
+
+
+def _normalize_stage2_enum_aliases(out: dict[str, Any]) -> bool:
+    """Map common enum slips before schema validation.
+
+    Normalizes ``decision.order_direction`` (bullish/short/buy → 做多/做空),
+    ``bar_analysis.always_in`` (AIS/空头/bear → short), and
+    ``terminal.outcome`` (action/execute → trade, with 不下单→wait downgrade).
+    Mirrors upstream ``_normalize_stage2_enum_aliases``.
+    """
+    changed = False
+    diag = out.get("diagnosis_summary")
+    diag_direction = (
+        str(diag.get("direction", "")).strip()
+        if isinstance(diag, dict)
+        else ""
+    ) or None
+
+    decision = out.get("decision")
+    order_type = (
+        str(decision.get("order_type", "")).strip()
+        if isinstance(decision, dict)
+        else None
+    ) or None
+    if isinstance(decision, dict):
+        raw_dir = decision.get("order_direction")
+        mapped_dir = _normalize_order_direction_value(raw_dir)
+        if mapped_dir and mapped_dir != raw_dir:
+            decision["order_direction"] = mapped_dir
+            logger.debug("order_direction %r -> %r", raw_dir, mapped_dir)
+            changed = True
+
+    bar_analysis = out.get("bar_analysis")
+    if isinstance(bar_analysis, dict):
+        raw_ai = bar_analysis.get("always_in")
+        mapped_ai = _normalize_always_in_value(
+            raw_ai, diagnosis_direction=diag_direction
+        )
+        if mapped_ai and mapped_ai != raw_ai:
+            bar_analysis["always_in"] = mapped_ai
+            logger.debug("always_in %r -> %r", raw_ai, mapped_ai)
+            changed = True
+
+    terminal = out.get("terminal")
+    if isinstance(terminal, dict):
+        raw_outcome = terminal.get("outcome")
+        mapped_outcome = _normalize_terminal_outcome_value(
+            raw_outcome, order_type=order_type
+        )
+        if mapped_outcome and mapped_outcome != raw_outcome:
+            terminal["outcome"] = mapped_outcome
+            logger.debug("terminal.outcome %r -> %r", raw_outcome, mapped_outcome)
+            changed = True
+
+    return changed
+
+
 def _unwrap_flat_stage2_decision(out: dict[str, Any]) -> bool:
     """Repair models that put decision fields at root or use decision=scalar.
 
@@ -1164,6 +1299,185 @@ def _default_cycle_probs(cycle: str) -> dict[str, int]:
     return base
 
 
+def _default_bar_probs(direction: str) -> dict[str, int]:
+    """Build a default bar-direction probability distribution (mirror SOURCE:1335)."""
+    d = (direction or "neutral").strip().lower()
+    if d == "bullish":
+        return {"bullish": 45, "bearish": 30, "neutral": 25}
+    if d == "bearish":
+        return {"bearish": 45, "bullish": 30, "neutral": 25}
+    return {"neutral": 40, "bearish": 30, "bullish": 30}
+
+
+# ── terminal / entry_bar / predictions repair (mirror SOURCE:773-879,1367-1423) ─
+# Local K-seq parser (same regex as price_tick._parse_k_seq / decision_nodes._seq_from_k).
+_K_SEQ_RE = re.compile(r"K\s*(\d+)", re.IGNORECASE)
+
+
+def _parse_k_seq_local(value: Any) -> int | None:
+    m = _K_SEQ_RE.search(str(value or ""))
+    return int(m.group(1)) if m else None
+
+
+def _repair_terminal_trade_node(out: dict[str, Any]) -> bool:
+    """A successful trade should not terminate at §14 (prohibition scan)."""
+    decision = out.get("decision")
+    terminal = out.get("terminal")
+    trace = out.get("decision_trace")
+    if not isinstance(decision, dict) or not isinstance(terminal, dict):
+        return False
+    if decision.get("order_type") not in _TRADE_ORDER_TYPES:
+        return False
+    if terminal.get("outcome") != "trade":
+        return False
+
+    node_id = str(terminal.get("node_id", "") or "").strip()
+    if not node_id.startswith("14"):
+        return False
+
+    replacement: str | None = None
+    if isinstance(trace, list):
+        for item in reversed(trace):
+            if not isinstance(item, dict):
+                continue
+            nid = str(item.get("node_id", "") or "").strip()
+            if nid.startswith("11."):
+                replacement = nid
+                break
+        if replacement is None:
+            for item in reversed(trace):
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("node_id", "") or "").strip() == "10.3":
+                    replacement = "10.3"
+                    break
+
+    if replacement is None:
+        replacement = "10.3"
+    terminal["node_id"] = replacement
+    logger.debug("terminal.node_id %r -> %r (trade cannot terminate at §14)", node_id, replacement)
+    return True
+
+
+def _normalize_market_order_entry_bar(
+    bar_analysis: dict[str, Any],
+    decision: dict[str, Any],
+) -> bool:
+    """Market orders need a concrete entry_bar; borrow signal_bar when model left it pending."""
+    if decision.get("order_type") != "市价单":
+        return False
+    entry_bar = bar_analysis.get("entry_bar")
+    signal_bar = bar_analysis.get("signal_bar")
+    if not isinstance(entry_bar, dict) or not isinstance(signal_bar, dict):
+        return False
+    if entry_bar.get("bar") is not None:
+        return False
+    sig_bar = signal_bar.get("bar")
+    if not sig_bar:
+        return False
+    # Market order fills on the latest closed bar; signal_bar stays older (K2+).
+    entry_bar["bar"] = str(bar_analysis.get("last_closed_bar") or "K1").strip() or "K1"
+    raw_strength = str(entry_bar.get("strength") or signal_bar.get("quality") or "weak").strip().lower()
+    strength_map = {"strong": "strong", "medium": "weak", "weak": "weak", "low": "weak", "high": "strong"}
+    entry_bar["strength"] = strength_map.get(raw_strength, "weak")
+    entry_bar["freshness"] = "fresh"
+    entry_bar["follow_through"] = True
+    entry_bar["still_valid"] = entry_bar.get("still_valid", True)
+    logger.debug("market order: entry_bar.bar set from signal_bar %s", sig_bar)
+    return True
+
+
+def _normalize_signal_entry_bar_chain(bar_analysis: dict[str, Any], decision: dict[str, Any]) -> bool:
+    """Signal K must be strictly older than entry K (larger seq); pending entry exempt."""
+    if decision.get("order_type") not in _TRADE_ORDER_TYPES:
+        return False
+    signal_bar = bar_analysis.get("signal_bar")
+    entry_bar = bar_analysis.get("entry_bar")
+    if not isinstance(signal_bar, dict) or not isinstance(entry_bar, dict):
+        return False
+
+    strength = str(entry_bar.get("strength", "") or "").strip().lower()
+    freshness = str(entry_bar.get("freshness", "") or "").strip().lower()
+    pending = (
+        strength == "not_triggered"
+        or not entry_bar.get("bar")
+        or freshness in ("pending", "stale", "invalid")
+    )
+    if pending:
+        entry_bar["bar"] = None
+        entry_bar["strength"] = "not_triggered"
+        entry_bar.setdefault("freshness", "pending")
+        if entry_bar.get("follow_through") in (None, "", False):
+            entry_bar["follow_through"] = "pending"
+        return False
+
+    signal_seq = _parse_k_seq_local(signal_bar.get("bar"))
+    entry_seq = _parse_k_seq_local(entry_bar.get("bar"))
+    if signal_seq is None or entry_seq is None:
+        return False
+    if signal_seq > entry_seq:
+        return False
+
+    signal_bar["bar"] = f"K{entry_seq + 1}"
+    logger.debug(
+        "signal_bar K%s -> K%s (must be older than entry K%s)",
+        signal_seq,
+        entry_seq + 1,
+        entry_seq,
+    )
+    return True
+
+
+def ensure_stage2_predictions(
+    out: dict[str, Any],
+    *,
+    stage1_json: dict[str, Any] | None = None,
+    skip_next_bar: bool = False,
+) -> bool:
+    """Inject next_bar/next_cycle prediction stubs when the model omitted them."""
+    changed = False
+    diag = out.get("diagnosis_summary") if isinstance(out.get("diagnosis_summary"), dict) else {}
+    s1 = stage1_json or {}
+    direction = str(diag.get("direction") or s1.get("direction") or "neutral")
+    cycle = str(diag.get("cycle_position") or s1.get("cycle_position") or "unknown")
+
+    decision = out.get("decision") if isinstance(out.get("decision"), dict) else {}
+    reasoning = str(decision.get("reasoning") or "").strip()
+    synth_note = "（程序根据阶段二诊断摘要补全，原模型未输出预测字段）"
+
+    if not skip_next_bar and not isinstance(out.get("next_bar_prediction"), dict):
+        probs = _default_bar_probs(direction)
+        dom = max(probs, key=probs.get)  # type: ignore[arg-type]
+        out["next_bar_prediction"] = {
+            "direction": dom,
+            "probabilities": probs,
+            "unpredictable": False,
+            "reasoning": (
+                (reasoning[:400] + "…") if len(reasoning) > 400 else reasoning
+            ) or f"基于当前方向 {direction} 的参考预测{synth_note}",
+            "features_used": ["stage1_diagnosis", "stage2_decision"],
+        }
+        changed = True
+
+    if not isinstance(out.get("next_cycle_prediction"), dict):
+        c_probs = _default_cycle_probs(cycle)
+        dom_c = max(c_probs, key=c_probs.get)  # type: ignore[arg-type]
+        out["next_cycle_prediction"] = {
+            "cycle": dom_c,
+            "direction": direction if direction in ("bullish", "bearish", "neutral") else "neutral",
+            "probabilities": c_probs,
+            "unpredictable": False,
+            "reasoning": (
+                f"当前周期 {cycle}，方向 {direction}。"
+                f"下一周期概率为程序参考分布{synth_note}"
+            ),
+            "features_used": ["stage1_diagnosis", "stage2_decision"],
+        }
+        changed = True
+
+    return changed
+
+
 # ── next_cycle_prediction normalize (ported from stage2_normalizer.py:928-1063) ──
 
 def _normalize_next_cycle_prediction(
@@ -1470,6 +1784,11 @@ def normalize_trade_decision(
     if isinstance(decision_obj, dict) and _truncate_decision_reasoning(decision_obj):
         logger.debug("decision.reasoning truncated to %d chars", DECISION_REASONING_MAX_LEN)
 
+    # Normalize enum aliases (order_direction / always_in / terminal.outcome)
+    # before coercion and validation. Mirrors SOURCE step 9.
+    if _normalize_stage2_enum_aliases(out):
+        logger.debug("stage2 enum aliases normalized")
+
     if _coerce_decision_no_order(out):
         logger.debug("decision coerced to 不下单 (trace/terminal rejection)")
 
@@ -1538,5 +1857,66 @@ def normalize_trade_decision(
             logger.debug("stage2 §9/§11 nodes computed by DecisionNodeEngine")
         except Exception as exc:  # pragma: no cover - safety net
             logger.warning("DecisionNodeEngine.apply_stage2 failed: %s", exc)
+
+    # ── Post-engine cleanup (mirror SOURCE normalize_stage2:1589-1650) ────────
+    # No-order re-null: engine/trace may have changed order_type; re-assert the
+    # schema "then" branch (all price fields + direction null for 不下单).
+    decision = out.get("decision")
+    if isinstance(decision, dict) and decision.get("order_type") == "不下单":
+        for field in _NO_ORDER_PRICE_FIELDS:
+            decision[field] = None
+        decision["estimated_win_rate"] = None
+        if decision.get("trade_confidence") is None:
+            decision["trade_confidence"] = 0
+        if not isinstance(decision.get("trade_confidence_reasoning"), str) or not decision["trade_confidence_reasoning"]:
+            decision["trade_confidence_reasoning"] = "无入场计划，不存在交易信心"
+
+    # Terminal trade-node repair (trade cannot terminate at §14).
+    if _repair_terminal_trade_node(out):
+        logger.debug("terminal.node_id repaired (was §14)")
+
+    # Entry-bar / signal-bar chain normalization.
+    bar_analysis = out.get("bar_analysis")
+    if isinstance(bar_analysis, dict) and isinstance(decision, dict):
+        if _normalize_market_order_entry_bar(bar_analysis, decision):
+            logger.debug("market order entry_bar borrowed from signal_bar")
+        _normalize_signal_entry_bar_chain(bar_analysis, decision)
+
+    # Pending entry_bar state normalization.
+    if isinstance(bar_analysis, dict):
+        signal_bar = bar_analysis.get("signal_bar")
+        if isinstance(signal_bar, dict):
+            if not signal_bar.get("bar"):
+                signal_bar["bar"] = None
+                signal_bar.setdefault("quality", "invalid")
+                signal_bar.setdefault("pattern", "none")
+
+        entry_bar = bar_analysis.get("entry_bar")
+        if isinstance(entry_bar, dict):
+            strength = str(entry_bar.get("strength", "") or "").strip().lower()
+            # Only treat as pending when the model explicitly said not_triggered
+            # or the entry bar is None with a pending-ish freshness. Aged/stale
+            # freshness is left to _normalize_entry_bar_freshness (run earlier).
+            if strength == "not_triggered":
+                entry_bar.setdefault("bar", None)
+                fresh = str(entry_bar.get("freshness") or "").strip().lower()
+                if fresh not in ("stale", "aged", "expired"):
+                    entry_bar["freshness"] = "pending"
+                if entry_bar.get("follow_through") in (None, "", "pending"):
+                    entry_bar["follow_through"] = "pending"
+
+    # diagnosis_summary injection-if-missing.
+    if not isinstance(out.get("diagnosis_summary"), dict):
+        s1 = diagnosis or {}
+        out["diagnosis_summary"] = {
+            "cycle_position": s1.get("cycle_position", "unknown"),
+            "direction": s1.get("direction", "neutral"),
+            "key_signals": [],
+        }
+        logger.debug("Injected missing diagnosis_summary from stage1")
+
+    # Prediction stub injection.
+    if ensure_stage2_predictions(out, stage1_json=diagnosis):
+        logger.debug("stage2 prediction stubs injected")
 
     return out
