@@ -1,2 +1,0 @@
-"""Price Action monitor components."""
-
