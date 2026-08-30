@@ -3,6 +3,7 @@
 > 源项目：`/Users/lilin/Documents/lilin/code/PA_Agent`（PyQt6 GUI 桌面应用，两阶段 LLM 价格行为决策系统）
 > 目标：将 PA 核心策略迁入 freqtrade，复用 freqtrade 的 K线拉取、DatabasePairList、原生 telegram、PG 存储，保留 PA_Agent 的完整 LLM 决策能力。
 > 决策：不保留 GUI，核心策略作为 `pa_core/` 包放入 freqtrade 仓库。
+> **迁移基线**：PA_Agent commit `1090a5b`（2026-08-28），2026-08-30 核对。此后 PA_Agent 的新变更需手动同步到 pa_core（见第9节风险7）。
 
 ---
 
@@ -80,16 +81,18 @@ def populate_entry_trend(self, dataframe, metadata):
 
 ## 3. 核心策略代码完整清单
 
-核心策略分 **6 层**，共约 **16,800 行代码 + 32 个 prompt 文本文件**。
+核心策略分 **6 层**，共约 **17,200 行代码 + 29 个 prompt 文本文件 + 3 个参考文档**。
 
-### 第1层：数据结构（190 行）— 需适配
+### 第1层：数据结构（200 行）— 需适配
 
 | 文件 | 行数 | 职责 | 迁移处理 |
 |---|---|---|---|
-| `data/base.py` | 127 | `KlineBar`/`KlineFrame`/`IndicatorBundle` 数据类 + `DataSource` ABC | 保留数据类，丢弃 `DataSource` ABC（freqtrade 有自己的数据层） |
+| `data/base.py` | 127 | `KlineBar`/`KlineFrame`/`IndicatorBundle` 数据类 + `DataSource` ABC + `normalize_kline_bar()` | 保留数据类和 normalize 辅助函数，丢弃 `DataSource` ABC（freqtrade 有自己的数据层） |
 | `data/datetime_ts.py` | 73 | 时区安全的 epoch/datetime 转换 | 直接移植 |
 
 > ⚠️ 这是核心策略的**数据地基**——所有特征计算都依赖 `KlineBar`。迁移时需写 `df_adapter.py`，把 freqtrade 的 pandas DataFrame 行映射成 `KlineBar`。
+>
+> **KlineBar 字段清单**（基线 `1090a5b`）：`ts_open`、`open`、`high`、`low`、`close`、`volume`、`closed`、`seq`，以及 8月新增的 `amount: float = 0.0`（成交额）、`pct_chg: float | None = None`（涨跌幅）。后两个字段 freqtrade df 无对应列，适配层用默认值即可。
 
 ### 第2层：指标计算（194 行）— 直接移植
 
@@ -98,39 +101,39 @@ def populate_entry_trend(self, dataframe, metadata):
 | `indicators/ema.py` | 81 | EMA（全量 + 增量） | 直接移植，用原版（保证与 PA 决策一致，不用 TA-Lib） |
 | `indicators/atr.py` | 113 | ATR Wilder（全量 + 增量） | 直接移植 |
 
-### 第3层：客观特征计算（2,595 行）— 核心资产
+### 第3层：客观特征计算（2,832 行）— 核心资产
 
 | 文件 | 行数 | 职责 | 迁移处理 |
 |---|---|---|---|
 | `ai/kline_features.py` | 323 | 单根K线几何特征（body/wick/close_pos、bar_type、inside/ioi、micro-double、gap、breakout、follow-through） | 改 import 路径 |
-| `ai/market_features.py` | 822 | 市场结构特征（区间、波段、突破、HL计数、支撑阻力、measured-move） | 改 import 路径 |
+| `ai/market_features.py` | 1,058 | 市场结构特征（区间、波段、突破、HL计数、支撑阻力、measured-move）+ **嵌套周期研究函数**（`_classify_breakout_quality`/`_spike_aftermath_hint`/`_scale_conflict`，8月16日新增） | 改 import 路径 |
 | `ai/structure_levels.py` | 296 | 确定性支撑/阻力刷新 | 改 import 路径 |
-| `ai/trend_context.py` | 252 | Brooks 趋势上下文 + spike 检测 | 改 import 路径 |
+| `ai/trend_context.py` | 253 | Brooks 趋势上下文 + spike 检测 | 改 import 路径 |
 | `ai/decision_nodes.py` | 3,071 | **决策树节点引擎**（PreflightDataGate、§1.1/§2.3/§2.4/§9/§11 判定器、OverrideArbiter） | 改 import 路径 |
 | `ai/decision_tree.py` | 666 | 二元决策树加载器（解析 `二元决策.txt`）+ trace 辅助 | 改 import 路径，依赖 `config.paths` 的 PROMPT_DIR |
 | `ai/cycle_enums.py` | 119 | cycle_position 枚举唯一真相源 | 直接移植 |
 
-### 第4层：Prompt 组装与路由（3,318 行）— 核心资产
+### 第4层：Prompt 组装与路由（3,327 行）— 核心资产
 
 | 文件 | 行数 | 职责 | 迁移处理 |
 |---|---|---|---|
-| `ai/prompt_assembler.py` | 1,953 | 组装阶段一/二消息列表（人设、术语、K线表、特征、策略文件、经验库） | 改 import 路径 |
+| `ai/prompt_assembler.py` | 1,959 | 组装阶段一/二消息列表（人设、术语、K线表、特征、策略文件、经验库）+ **增量阶段一**（`build_incremental_stage1`，4消息续写省 ~14.5K tokens） | 改 import 路径 |
 | `ai/router.py` | 246 | 阶段一诊断 → 策略 `.txt` 文件列表映射 | 改 import 路径 |
 | `ai/pattern_routing.py` | 365 | 形态标签合并 + 阶段一路由简报 | 直接移植 |
-| `ai/decision_stance.py` | 155 | 保守/平衡/激进立场配置 | 直接移植 |
-| `ai/decision_continuity.py` | 712 | 前决策失效、翻转冷却、阶段二连续性阻断 | 🔴 **改造**：去掉 `trade_records/*.csv` 读取，改读 freqtrade PG |
+| `ai/decision_stance.py` | 155 | 保守/平衡/激进/**极端激进**（4档）立场配置 | 直接移植 |
+| `ai/decision_continuity.py` | 712 | 前决策失效、翻转冷却、阶段二连续性阻断。**现为两层设计**：`previous_record`（AnalysisRecord）为主、`trade_records/*.csv` 兜底 | 🔴 **改造**：从 PG 加载上一条 AnalysisRecord 传入；CSV 兜底路径直接删除 |
 
-### 第5层：LLM 调用 + 校验（5,577 行）— 核心资产
+### 第5层：LLM 调用 + 校验（5,646 行）— 核心资产
 
 | 文件 | 行数 | 职责 | 迁移处理 |
 |---|---|---|---|
-| `orchestrator/two_stage.py` | 1,217 | **两阶段编排器**——完整流程驱动（核心入口） | 🔴 **改造**：去掉 QClaw/Cursor/WorkBuddy fallback（1058-1164行），去 GUI 回调 |
+| `orchestrator/two_stage.py` | 1,268 | **两阶段编排器**——完整流程驱动（核心入口）。`submit()` 支持增量分析参数（`previous_record`/`incremental_new_bar_count`） | 🔴 **改造**：去掉 4 个备用通道 fallback（~1006-1215行），去 GUI 回调 |
 | `orchestrator/validation_retry.py` | 201 | validate_with_retry 包装 | 改 import 路径 |
-| `ai/deepseek_client.py` | 812 | OpenAI 兼容流式 chat client | 改 import（去 `config.settings` GUI 部分） |
+| `ai/deepseek_client.py` | 862 | OpenAI 兼容流式 chat client（含 Sensenova 等多家 provider 检测辅助）。`AIReply`/`AIUsage` 是所有 client 共享的返回契约 | 改 import（去 `config.settings` GUI 部分） |
 | `ai/mimo_compat.py` | 247 | MiMo reasoning_content 兼容 | 直接移植 |
 | `ai/json_validator.py` | 1,165 | 阶段一/二 JSON 校验（分类 a–e） | 改 import 路径 |
-| `ai/stage1_normalizer.py` | 744 | 阶段一 JSON 规范化 | 改 import 路径 |
-| `ai/stage2_normalizer.py` | 1,816 | 阶段二 JSON 规范化 | 改 import 路径 |
+| `ai/stage1_normalizer.py` | 797 | 阶段一 JSON 规范化（+ `_apply_empiric_risk_caps` 经验风险上限） | 改 import 路径 |
+| `ai/stage2_normalizer.py` | 1,763 | 阶段二 JSON 规范化 | 改 import 路径 |
 | `ai/coherence_checks.py` | 787 | 跨字段一致性校验 | 改 import 路径 |
 | `ai/trace_normalize.py` | 912 | gate_trace/decision_trace 规范化 | 改 import 路径 |
 | `ai/trace_semantic_checks.py` | 257 | trace 语义校验 | 改 import 路径 |
@@ -142,13 +145,16 @@ def populate_entry_trend(self, dataframe, metadata):
 | `ai/token_counter.py` | 32 | tiktoken token 估算 | 直接移植 |
 | `ai/validation_messages.py` | 53 | 校验错误前缀的人类可读标签 | 直接移植 |
 
-### 第6层：知识资产（32 个文本文件）— 原样复制
+### 第6层：知识资产（29 个 .txt + 3 个参考 markdown）— 原样复制
 
-`prompt_engineering/*.txt`（32 文件），复制到 `pa_core/prompts/`：
+`prompt_engineering/*.txt`（29 文件）复制到 `pa_core/prompts/`，`_reference/*.md`（3 文件）一并复制作为人读参考（已验证无任何运行时代码引用）：
 
 - 核心框架：`二元决策.txt`、`提示词大纲_人设与思维方式.txt`、`市场诊断框架.txt`、`逐棒分析检查单.txt`
 - 形态规则（文件13~28）：窄通道、宽通道、楔形、二次入场、K线信号识别、止损止盈与仓位管理、突破失败与突破测试、H1H2L1L2计数、AlwaysIn与20GB、铁丝网与无交易环境、信号失败后的磁力位、MeasuredMove与结构目标、最终旗形与趋势末端、主要趋势反转MTR、三角形与收敛形态、双重顶底与微型结构
 - 通道/尖峰/区间分析+策略对：上涨/下跌通道分析识别+交易策略、极速上涨/下跌分析识别+交易策略、震荡区间分析识别+交易策略
+- `_reference/`（参考文档，126行）：`abbrev_glossary.md`、`kb_concept_map.md`、`pattern_enum.md`
+
+> 📌 7 个 .txt 在 8月16日 有内容更新（二元决策、市场诊断框架、提示词大纲、文件18-突破失败、文件23-MeasuredMove、极速上涨/下跌交易策略），**迁移时以基线 `1090a5b` 的最新版为准**。
 
 ### 辅助工具（必带）
 
@@ -160,7 +166,7 @@ def populate_entry_trend(self, dataframe, metadata):
 | `util/timefmt.py` | 8 | `now_local_ms()` | 直接移植 |
 | `util/threading.py` | 43 | `CancelToken` + `OrchestratorEvent` 枚举 | 直接移植 |
 | `config/paths.py` | 29 | 路径常量（PROMPT_DIR、EXPERIENCE_DIR、RECORDS_PENDING_DIR） | 改路径指向 `pa_core/prompts/` |
-| `config/settings.py` | 280 | Pydantic 设置 | 🔴 **精简**：只保留 AI/Prompt/Validation/General 部分，去掉 GUI/数据源设置 |
+| `config/settings.py` | 280 | Pydantic 设置（AI/Prompt/Validation/General 混合；`decision_stance` 已扩至 4 档含 `extreme_aggressive`） | 🔴 **精简**：只保留 AI/Prompt/Validation/General 部分，去掉 GUI/数据源设置 |
 
 ### 记录持久化（改造后带）
 
@@ -177,11 +183,13 @@ def populate_entry_trend(self, dataframe, metadata):
 
 | 类别 | 文件 | 理由 |
 |---|---|---|
-| **GUI 全部** | `gui/`（30文件）、`main.py`、`app_context.py`、`demo/`、`util/event_bus.py`、`ai/session_ledger.py` | 不保留 GUI |
-| **数据源全部** | `data/mt5.py`、`tradingview*.py`、`akshare_source.py`、`eastmoney*.py`（7文件）、`tushare_source.py`、`yfinance_source.py`、`factory.py`、`refresh_loop.py`、`refresh_policy.py`、`market_defaults.py`、`kline_adjust.py` | freqtrade 有自己的数据层 |
+| **GUI 全部** | `gui/`（30文件）、`main.py`、`app_context.py`、`demo/`、`util/event_bus.py`、`ai/session_ledger.py`（仍耦合 PyQt6） | 不保留 GUI |
+| **数据源全部** | `data/mt5.py`、`tradingview*.py`、`akshare_source.py`、`eastmoney*.py`（7文件）、`eastmoney_futures_source.py`（570行，8月新增国内期货源）、`tushare_source.py`、`yfinance_source.py`、`factory.py`、`refresh_loop.py`、`refresh_policy.py`、`market_defaults.py`、`kline_adjust.py` | freqtrade 有自己的数据层 |
 | **通知** | `notify/feishu_notifier.py`、`notify/pushplus_notifier.py` | freqtrade 有原生 telegram |
-| **LLM 备用通道** | `cursor_connector.py`、`cursor_sdk_client.py`、`qclaw_*.py`（3文件）、`workbuddy_connector.py`、`client_factory.py` | 只保留 deepseek client |
+| **LLM 备用通道** | `cursor_connector.py`、`cursor_sdk_client.py`、`qclaw_*.py`（3文件）、`workbuddy_connector.py`、`trae_client.py`（556行）、`trae_connector.py`（671行）、`qoder_client.py`（582行）、`qoder_connector.py`（404行，后四者8月新增）、`client_factory.py` | 只保留 deepseek client |
 | **trade_logger.py** | `records/trade_logger.py`（CSV+matplotlib 记录器） | freqtrade 有自己的交易 DB |
+
+> 📌 `client_factory.py` 现按模型名路由 4 种 client（`openclaw_cs*`→Cursor、`openclaw_twc*`→Trae、`openclaw_qc*`→Qoder、其余→DeepSeek）。pa_core 直接用 `deepseek_client.py`（`AIReply`/`AIUsage` 契约也定义在此文件），丢弃路由和其余 client，决策不变。
 
 ---
 
@@ -242,11 +250,12 @@ freqtrade/
 │   │   ├── threading.py
 │   │   └── df_adapter.py                  ← 新建：freqtrade DataFrame ↔ KlineBar 适配（关键桥梁）
 │   ├── config.py                           ← config/settings.py + paths.py（精简，去 GUI/数据源设置）
-│   ├── prompts/                            ← prompt_engineering/ 的 32 个 .txt 文件原样复制
+│   ├── prompts/                            ← prompt_engineering/ 的 29 个 .txt + _reference/ 3 个 .md 原样复制
 │   │   ├── 二元决策.txt
 │   │   ├── 提示词大纲_人设与思维方式.txt
 │   │   ├── 市场诊断框架.txt
-│   │   ├── ... (共 32 个文件)
+│   │   ├── ... (共 29 个 .txt)
+│   │   └── _reference/ (3 个参考 .md，无运行时引用)
 │   └── experience/                         ← 经验库目录结构（目前为空，保留结构）
 │       ├── tight_channel/{success,failure}_cases/
 │       └── ... (按 cycle_position 分类)
@@ -263,6 +272,18 @@ freqtrade/
 
 ## 6. 策略层对接
 
+### 6.1 增量分析集成（基线 `1090a5b` 新增能力，建议采用）
+
+`two_stage.py` 的 `submit()` 新增了 `previous_record: AnalysisRecord | None` 和 `incremental_new_bar_count: int | None` 两个参数（增量分析模式）：
+
+- 两者都非 None 时，阶段一走 `build_incremental_stage1()`：4 消息续写（system + 上次完整阶段一 prompt + 上次回复 + 只含新K线的增量任务），**每次省 ~14.5K tokens**，且 `[system, user]` 前缀相同可命中 LLM 前缀缓存
+- 两者传 None 时退化为完整分析，行为与旧版一致，**不采用也无风险**
+- 依赖"上一条 AnalysisRecord 可持久化恢复"——与 records 层的 PG 持久化改造（`records/persistence.py`）天然配合：live 每次分析后存 PG，下次从 PG 恢复传入
+
+**集成方式**：live/dry-run 分支维护 `(pair → previous_record)` 状态，每根新K线走增量模式；重启后从 PG 恢复最后一条记录。
+
+### 6.2 策略骨架
+
 ```python
 # user_data/strategies/price_action_watch.py
 from freqtrade.strategy import IStrategy, BooleanParameter
@@ -277,9 +298,10 @@ class PriceActionWatch(IStrategy):
     use_exit_signal = False
 
     def bot_start(self, **kwargs):
-        """初始化 PA 核心 + 建 PG signal 表。"""
+        """初始化 PA 核心 + 建 PG signal 表 + 从 PG 恢复各 pair 的 previous_record。"""
         self._pa = TwoStageAnalyzer(self.config["pa_llm"])
-        # create_engine + 建 signal 表
+        self._prev_records = {}   # pair -> 上一条 AnalysisRecord（增量分析用）
+        # create_engine + 建 signal 表 + load_last_records()
 
     def populate_indicators(self, dataframe, metadata):
         """几何特征 + 结构特征（确定性，向量化，回测/live 都算）。"""
@@ -288,19 +310,30 @@ class PriceActionWatch(IStrategy):
     def populate_entry_trend(self, dataframe, metadata):
         """信号判定：调 PA 两阶段 LLM 决策。"""
         if self.dp.runmode in (RunMode.LIVE, RunMode.DRY_RUN):
-            # Live：只对最后一根调 LLM
+            # Live：只对最后一根调 LLM，优先增量模式
             frame = df_to_kline_frame(dataframe)
-            decision = self._pa.decide(frame, metadata)
-            if decision.is_entry:
+            record = self._pa.submit(
+                frame, metadata,
+                previous_record=self._prev_records.get(metadata["pair"]),
+                incremental_new_bar_count=1,   # 新K线数量
+            )
+            self._prev_records[metadata["pair"]] = record  # 存 PG + 内存
+            decision = record.stage2_decision
+            if decision and decision.is_entry:
                 self._record_signal(decision)  # 写 signal 表 + send_msg
                 if not self.watch_only.value:
                     dataframe.loc[dataframe.index[-1], 'enter_long'] = 1
         elif self.dp.runmode == RunMode.BACKTEST:
-            # 回测：逐根调 LLM
+            # 回测：逐根调 LLM（回测也可用增量模式：串行推进时天然有序）
+            prev = None
             for i in range(self.startup_candle_count, len(dataframe)):
                 frame = df_to_kline_frame(dataframe.iloc[:i+1])
-                decision = self._pa.decide(frame, metadata)
-                if decision.is_entry:
+                record = self._pa.submit(
+                    frame, metadata,
+                    previous_record=prev, incremental_new_bar_count=1,
+                )
+                prev = record
+                if record.stage2_decision and record.stage2_decision.is_entry:
                     dataframe.loc[dataframe.index[i], 'enter_long'] = 1
         return dataframe
 
@@ -315,14 +348,14 @@ class PriceActionWatch(IStrategy):
 | 部分 | 行数 | 难度 | 说明 |
 |---|---|---|---|
 | 直接复制（prompt 文本、小工具） | ~3,500 | 🟢 低 | 基本原样，改 import 路径 |
-| 特征/决策树代码 | ~6,000 | 🟡 中 | 改 import 路径 + 适配 KlineBar 数据源 |
-| LLM 编排/校验 | ~6,000 | 🟡 中 | 改 import + 去 GUI 耦合 + 去 cursor/qclaw 备用通道 |
+| 特征/决策树代码 | ~6,300 | 🟡 中 | 改 import 路径 + 适配 KlineBar 数据源（market_features 已增至 1058 行） |
+| LLM 编排/校验 | ~6,200 | 🟡 中 | 改 import + 去 GUI 耦合 + 剥离 4 个备用通道 fallback |
 | **需改造** | | 🔴 高 | |
-| - `decision_continuity.py` | 712 | 🔴 | 去 `trade_records/*.csv` 读取，改读 freqtrade PG |
-| - `pending_writer.py` → PG | 175 | 🔴 | 改成写 PG signal 表 |
-| - `config/settings.py` | 280 | 🔴 | 精简，去 GUI/数据源设置 |
-| - `df_adapter.py` | 新建 | 🔴 | freqtrade DataFrame ↔ KlineBar 映射（关键桥梁） |
-| - `two_stage.py` | 1,217 | 🔴 | 去 QClaw/Cursor/WorkBuddy fallback（1058-1164行），去 GUI 回调 |
+| - `decision_continuity.py` | 712 | 🔴 | 现两层设计（previous_record 为主、CSV 兜底）：从 PG 加载上一条 AnalysisRecord 传入，CSV 兜底路径直接删。**比原计划更简单** |
+| - `pending_writer.py` → PG | 175 | 🔴 | 改成写 PG signal 表；同时承担增量分析的 previous_record 存取 |
+| - `config/settings.py` | 280 | 🔴 | 精简，去 GUI/数据源设置（保留 4 档 decision_stance） |
+| - `df_adapter.py` | 新建 | 🔴 | freqtrade DataFrame ↔ KlineBar 映射（关键桥梁；含 amount/pct_chg 默认值处理） |
+| - `two_stage.py` | 1,268 | 🔴 | 剥离 fallback 块（**~1006-1215 行**，含 QClaw/Cursor/WorkBuddy/TRAE CN 四个备用通道的 lazy import），去 GUI 回调 |
 
 ---
 
@@ -345,9 +378,11 @@ class PriceActionWatch(IStrategy):
 
 ## 9. 关键风险
 
-1. **`df_adapter.py` 是迁移成败关键**：PA_Agent 所有特征计算都基于 `KlineBar` 对象（dataclass），freqtrade 用的是 pandas DataFrame。适配层必须正确映射（尤其"最新在前"vs"最旧在前"的顺序约定——PA_Agent 的 bars 是最新在前，freqtrade df 是时间升序最旧在前）。
-2. **`two_stage.py` 去 GUI 回调**：编排器有大量 `on_stage1_reasoning`/`on_stage2_content` 等回调（GUI 流式显示用），迁移后这些回调要改成 no-op 或去掉。
+1. **`df_adapter.py` 是迁移成败关键**：PA_Agent 所有特征计算都基于 `KlineBar` 对象（dataclass），freqtrade 用的是 pandas DataFrame。适配层必须正确映射（尤其"最新在前"vs"最旧在前"的顺序约定——PA_Agent 的 bars 是最新在前，freqtrade df 是时间升序最旧在前）。映射字段含 8月新增的 `amount`/`pct_chg`（freqtrade df 无对应列，用默认值 `0.0`/`None`）。
+2. **`two_stage.py` 去 GUI 回调**：编排器 `submit()` 有大量 `on_stage1_reasoning`/`on_stage2_content` 等回调参数（GUI 流式显示用），迁移后这些回调要改成 no-op 或去掉。
 3. **prompt 路径硬编码**：`config/paths.py` 的 `PROMPT_DIR = PROJECT_ROOT / "prompt_engineering"`，迁移后要改成指向 `pa_core/prompts/`。
-4. **`decision_continuity.py` 的 trade_records 依赖**：这个模块读 CSV 判断"上一笔交易状态"，迁移后要改读 freqtrade PG 的 trades 表，或 signal 表。
+4. **`decision_continuity.py` 的上一决策依赖**：现为两层设计（`previous_record` 为主、`trade_records/*.csv` 兜底）。迁移后从 PG 恢复上一条 AnalysisRecord 传入；CSV 兜底路径删除。若 PG 无上一条记录（首次运行），该模块退化为无前决策状态，行为安全。
 5. **LLM 非确定性**：同样历史数据，两次回测结果可能不同。这是 LLM 固有特性，不是 bug——回测结果应多次取平均或看分布。
-6. **回测时间**：几千根K线逐根调 LLM，回测耗时会很长（小时~天级）。不考虑成本，但需接受等待时间。
+6. **回测时间**：几千根K线逐根调 LLM，回测耗时会很长（小时~天级）。不考虑成本，但需接受等待时间。回测串行推进时可配合增量模式（见 6.1）减少每次调用的 token 量。
+7. **PA_Agent 活跃演进导致两边分叉**：基线 `1090a5b` 之后 PA_Agent 仍在更新（核对前 6 周有 27 次提交）。迁移完成后，PA_Agent 后续的 prompt 文本更新、特征函数调整需**手动同步**到 `pa_core/`。建议：prompt 文本以 PA_Agent 为主库、定期整目录覆盖同步；pa_core 代码改动在 freqtrade 侧演进，不回传。
+8. **PA_Agent 文档行号锚点漂移**：`PRICE_ACTION_FLOW.md`（未纳管，mtime 2026-07-01）中"关键实现代码位置"的行号（如 `prompt_assembler.py:1041/1074/1541`）已随文件增长漂移 +6~10 行，迁移时以实际代码搜索定位为准，不要照抄行号。

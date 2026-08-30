@@ -102,6 +102,7 @@ target/
 
 .env
 .venv
+.venv*/
 .idea
 .vscode
 
