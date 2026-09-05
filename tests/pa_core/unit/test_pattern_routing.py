@@ -41,7 +41,6 @@ def test_route_loads_file18_on_breakout_pullback_entry_setup() -> None:
     assert "文件18-突破失败与突破测试.txt" in files
 
 
-@pytest.mark.skip(reason="layer-5 stage1_normalizer not ported yet")
 def test_trading_range_syncs_range_patterns_from_text() -> None:
     s1 = {
         "cycle_position": "trading_range",
@@ -59,7 +58,6 @@ def test_trading_range_syncs_range_patterns_from_text() -> None:
     assert "middle_range" in tags or "overlap" in tags
 
 
-@pytest.mark.skip(reason="layer-5 stage1_normalizer not ported yet")
 def test_transition_role_mapped_to_structure() -> None:
     from pa_core.validation.stage1_normalizer import normalize_stage1
 
@@ -72,7 +70,6 @@ def test_transition_role_mapped_to_structure() -> None:
         normalization_mode="strict",
     )
     assert out["bar_by_bar_summary"][0]["role"] == "structure"
-@pytest.mark.skip(reason="layer-5 coherence_checks not ported yet")
 
 
 def test_key_signals_wedge_without_detected_patterns_fails_coherence() -> None:
@@ -92,7 +89,6 @@ def test_key_signals_wedge_without_detected_patterns_fails_coherence() -> None:
     assert any("wedge" in e for e in coherence)
 
 
-@pytest.mark.skip(reason="layer-5 stage1_normalizer not ported yet")
 def test_tr_boundary_syncs_middle_range_and_barbwire() -> None:
     s1 = {
         "cycle_position": "trending_tr",

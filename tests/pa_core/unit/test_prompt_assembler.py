@@ -303,7 +303,6 @@ def test_stage2_message_roles(assembler: PromptAssembler):
     assert messages[1]["role"] == "user"
 
 
-@pytest.mark.skip(reason="layer-5 forward refs: deepseek_client / json_validator")
 def test_stage2_continuation_is_standalone_not_stage1_chat(assembler: PromptAssembler):
     """Stage 2 standalone mode must not prepend Stage 1 (OpenClaw Agent chat-mode retries)."""
     frame = _make_frame()
@@ -341,7 +340,6 @@ def test_stage1_stage2_system_prompt_byte_identical(assembler: PromptAssembler):
     assert s1_system == s2_system
 
 
-@pytest.mark.skip(reason="layer-5 forward refs: deepseek_client / json_validator")
 def test_stage2_continuation_prefix_chain_reuses_stage1(assembler: PromptAssembler):
     """DeepSeek-style prefix chain: S2 reuses entire S1 message prefix."""
     frame = _make_frame()
@@ -389,7 +387,6 @@ def test_stage2_prompt_conservative_omits_balanced_only_hints(assembler: PromptA
     assert "次优但可执行" not in user
 
 
-@pytest.mark.skip(reason="layer-5 forward refs: deepseek_client / json_validator")
 def test_incremental_stage1_prompt_includes_previous_record_and_new_bars(
     assembler: PromptAssembler,
 ):
@@ -459,7 +456,6 @@ def test_incremental_stage1_prompt_includes_previous_record_and_new_bars(
     assert "程序结构辅助特征以本消息为准" in incremental_user
 
 
-@pytest.mark.skip(reason="layer-5 forward refs: deepseek_client / json_validator")
 def test_incremental_stage1_normalizes_fenced_previous_response(
     assembler: PromptAssembler,
 ) -> None:
@@ -635,7 +631,6 @@ def test_stage2_prompt_contains_prediction_instruction(assembler: PromptAssemble
     assert "probabilities" in messages_on
 
 
-@pytest.mark.skip(reason="layer-5 forward refs: deepseek_client / json_validator")
 def test_previous_prediction_rendered_in_incremental_mode(assembler: PromptAssembler):
     """With previous_record containing prediction, prompt must show summary (R5.2)."""
     from pa_core.records.schema import AnalysisRecord, RecordMeta
@@ -699,7 +694,6 @@ def test_no_previous_prediction_no_summary(assembler: PromptAssembler):
     assert "上一轮下一根K线预测" not in user
 
 
-@pytest.mark.skip(reason="layer-5 forward refs: deepseek_client / json_validator")
 def test_unpredictable_previous_prediction_renders_note(assembler: PromptAssembler):
     """Unpredictable previous prediction must render note (R5.2)."""
     from pa_core.records.schema import AnalysisRecord, RecordMeta

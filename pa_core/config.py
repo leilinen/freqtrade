@@ -22,3 +22,8 @@ PROMPT_DIR: Path = PACKAGE_ROOT / "prompts"
 # ── Experience library (success/failure cases per cycle_position) ─────────────
 # Directory structure only for now (upstream ships it empty)
 EXPERIENCE_DIR: Path = PACKAGE_ROOT / "experience"
+
+# ── Analysis record JSON output (transitional) ────────────────────────────────
+# PendingWriter drops AnalysisRecord JSON here until layer 6 replaces it with
+# PostgreSQL persistence. Writable inside the dev checkout.
+RECORDS_PENDING_DIR: Path = PACKAGE_ROOT / "records_pending"
