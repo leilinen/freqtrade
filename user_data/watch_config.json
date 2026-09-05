@@ -1,0 +1,55 @@
+{
+    "max_open_trades": 0,
+    "stake_currency": "USDT",
+    "stake_amount": 100,
+    "dry_run": true,
+    "dry_run_wallet": 1000,
+    "trading_mode": "spot",
+    "timeframe": "1h",
+    "strategy": "PriceActionWatch",
+    "dataformat_ohlcv": "feather",
+    "dataformat_trades": "feather",
+    "exchange": {
+        "name": "binance",
+        "key": "",
+        "secret": "",
+        "ccxt_config": {},
+        "ccxt_async_config": {},
+        "pair_whitelist": ["BTC/USDT", "ETH/USDT"],
+        "pair_blacklist": []
+    },
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+    "telegram": {
+        "enabled": false,
+        "token": "",
+        "chat_id": "",
+        "allow_custom_messages": true
+    },
+    "api_server": {
+        "enabled": false,
+        "listen_ip_address": "127.0.0.1",
+        "listen_port": 8080,
+        "username": "freqtrader",
+        "password": "change-me"
+    },
+    "pa_db_url": "postgresql+psycopg://postgres:postgres@localhost:5432/freqtrade_monitor",
+    "pa_llm": {
+        "model": "deepseek-v4-flash",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "",
+        "thinking": true,
+        "reasoning_effort": "high",
+        "analysis_bar_count": 100,
+        "decision_stance": "balanced",
+        "enable_next_bar_prediction": false,
+        "structure_flip_cooldown_bars": 3,
+        "stage1_inject_pattern_briefs": true
+    },
+    "internals": {
+        "process_throttle_secs": 5
+    }
+}
