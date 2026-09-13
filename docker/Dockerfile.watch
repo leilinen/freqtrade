@@ -1,0 +1,19 @@
+# PA watch system image — freqtrade + PriceActionWatch + pa_core.
+#
+# Base: official freqtrade image. Added on top:
+#   - openai         : pa_core LLM calls (two-stage price action analysis)
+#   - psycopg[binary]: PostgreSQL driver for signal / analysis_record tables
+# Not needed (kept out on purpose): ta-lib C library (strategy uses the
+# ported pa_core indicators), mplfinance (chart rendering lands with the
+# telegram plugin stage).
+FROM freqtradeorg/freqtrade:stable
+
+USER root
+
+RUN pip install --no-cache-dir "openai>=1.40" "psycopg[binary]"
+
+# pa_core is part of the repo (packaged in pyproject) — copy it in next to
+# the installed freqtrade so the strategy resolves it.
+COPY --chown=ftuser:ftuser pa_core/ /freqtrade/pa_core/
+
+USER ftuser

@@ -1,0 +1,52 @@
+# PA watch system — single freqtrade process + PostgreSQL.
+#
+# Usage:
+#   cp docker/.env.example docker/.env   # fill in keys, then:
+#   docker compose -f docker/docker-compose-watch.yml --env-file docker/.env up -d --build
+#
+# Secrets go through environment variables (FREQTRADE__SECTION__KEY overrides,
+# see freqtrade/configuration/environment_vars.py) — never into the tracked
+# watch_config.json. The container-internal PG host is "postgres".
+services:
+  freqtrade-watch:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.watch
+    container_name: freqtrade-watch
+    command: >
+      trade
+      --strategy PriceActionWatch
+      --config /freqtrade/user_data/watch_config.json
+      --db-url postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@postgres:5432/freqtrade_monitor
+    volumes:
+      - ../user_data:/freqtrade/user_data
+    environment:
+      - FREQTRADE__PA_LLM__API_KEY=${PA_LLM_API_KEY}
+      - FREQTRADE__PA_LLM__BASE_URL=${PA_LLM_BASE_URL:-https://api.deepseek.com}
+      - FREQTRADE__PA_DB_URL=postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@postgres:5432/freqtrade_monitor
+      - FREQTRADE__TELEGRAM__ENABLED=${TG_ENABLED:-false}
+      - FREQTRADE__TELEGRAM__TOKEN=${TG_TOKEN:-}
+      - FREQTRADE__TELEGRAM__CHAT_ID=${TG_CHAT_ID:-}
+      - TZ=${TZ:-Asia/Shanghai}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    container_name: pa-postgres
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=freqtrade_monitor
+    volumes:
+      - pa_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d freqtrade_monitor"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pa_pgdata:

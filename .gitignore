@@ -120,6 +120,7 @@ target/
 !config_examples/config_freqai.example.json
 
 docker-compose-*.yml
+!docker/docker-compose-watch.yml
 
 # Local agent/project artifacts
 .claude/settings.local.json
