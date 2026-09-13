@@ -16,7 +16,7 @@ pytest.importorskip("freqtrade.strategy", reason="freqtrade deps not installed i
 
 import sys
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_DIR = REPO_ROOT / "user_data" / "strategies"
 sys.path.insert(0, str(STRATEGY_DIR))
 
@@ -141,10 +141,14 @@ def test_populate_entry_trend_live_handles_llm_failure(tmp_path, mocker):
 
 
 def test_order_plan_applies_entry_when_not_watch_only(tmp_path):
-    strategy = PriceActionWatch(dict(CONFIG, pa_db_url=f"sqlite:///{tmp_path}/s.db"))
-    strategy.watch_only.value = False
+    from types import SimpleNamespace
+
+    strategy = PriceActionWatch(
+        dict(CONFIG, pa_db_url=f"sqlite:///{tmp_path}/s.db", pa_llm={"watch_only": False})
+    )
     strategy.dp = _FakeDP()
     strategy.bot_start()
+    assert strategy.watch_only is False  # bot_start reads it from config
 
     decision = {
         "order_type": "限价单",
@@ -153,14 +157,20 @@ def test_order_plan_applies_entry_when_not_watch_only(tmp_path):
         "stop_loss_price": 98.0,
         "take_profit_price": 104.0,
     }
+
+    def _record(dec):
+        return SimpleNamespace(
+            stage2_decision={"decision": dec, "trade_confidence": 60},
+            stage1_diagnosis={"cycle_position": "normal_channel", "direction": "bullish"},
+        )
+
     df = _make_df(200).copy()
-    strategy._apply_decision(df, "BTC/USDT", mocker.sentinel.record, decision)
+    strategy._apply_decision(df, "BTC/USDT", _record(decision), decision)
     assert df.iloc[-1]["enter_long"] == 1
     # watch-only off + short decision
     df2 = _make_df(200).copy()
-    strategy._apply_decision(
-        df2, "BTC/USDT", mocker.sentinel.record, {**decision, "order_direction": "做空"}
-    )
+    short = {**decision, "order_direction": "做空"}
+    strategy._apply_decision(df2, "BTC/USDT", _record(short), short)
     assert df2.iloc[-1].get("enter_short", 0) == 1
 
 

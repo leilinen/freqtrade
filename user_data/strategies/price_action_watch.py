@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 
 from pandas import DataFrame
 
-from freqtrade.strategy import BooleanParameter, IStrategy
+from freqtrade.strategy import IStrategy
 
 from pa_core.config import EXPERIENCE_DIR, PROMPT_DIR
 from pa_core.data_structures import KlineFrame
@@ -45,7 +45,12 @@ from pa_core.util.threading import CancelToken
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ANALYSIS_BARS = 100
-_DEFAULT_DB_URL = "sqlite:///user_data/pa_records.sqlite"
+
+
+def _fallback_db_url(config: dict) -> str:
+    """Local sqlite fallback, anchored at user_data_dir (cwd-independent)."""
+    user_data = config.get("user_data_dir") or "user_data"
+    return f"sqlite:///{user_data}/pa_records.sqlite"
 
 
 def _build_settings(config: dict) -> Settings:
@@ -115,8 +120,10 @@ class PriceActionWatch(IStrategy):
     INTERFACE_VERSION = 3
     timeframe = "1h"
 
-    # Watch-mode guards (zero trades); watch_only=False + config flips to trade.
-    watch_only = BooleanParameter(default=True, load=True)
+    # Watch-mode guard (zero trades). Not a hyperopt parameter on purpose:
+    # freqtrade's Parameter machinery requires a hyperopt space, and this is a
+    # mode switch — config-driven instead ("pa_llm": {"watch_only": false}).
+    watch_only: bool = True
     minimal_roi: dict = {}
     stoploss = -0.99
     use_exit_signal = False
@@ -137,11 +144,27 @@ class PriceActionWatch(IStrategy):
 
     def bot_start(self, **kwargs) -> None:
         self._settings = _build_settings(self.config)
+        self.watch_only = bool(
+            (self.config.get("pa_llm") or {}).get("watch_only", True)
+        )
         self._analysis_bars = self._settings.general.analysis_bar_count
         self.startup_candle_count = self._analysis_bars + INDICATOR_WARMUP_BARS + 10
 
-        db_url = self.config.get("pa_db_url", _DEFAULT_DB_URL)
-        self._store = PgRecordStore(db_url)
+        fallback_url = _fallback_db_url(self.config)
+        db_url = self.config.get("pa_db_url") or fallback_url
+        try:
+            self._store = PgRecordStore(db_url)
+        except Exception as exc:  # noqa: BLE001
+            # PG unavailable at startup must not kill the bot — degrade to
+            # the local sqlite fallback (signals still land, just not in PG).
+            logger.warning(
+                "PgRecordStore(%s) unavailable (%s); falling back to %s",
+                db_url,
+                exc,
+                fallback_url,
+            )
+            db_url = fallback_url
+            self._store = PgRecordStore(db_url)
 
         client = DeepSeekClient(self._settings.provider)
         from pa_core.records.experience_reader import ExperienceReader
@@ -174,7 +197,14 @@ class PriceActionWatch(IStrategy):
                 self._prev_records[pair] = record
                 logger.info("Restored previous analysis for %s", pair)
 
-        mode = "watch" if self.watch_only.value else "TRADE"
+        if not self._settings.provider.api_key.strip():
+            logger.warning(
+                "pa_llm.api_key is empty — every PA analysis will fail "
+                "(crash partials are still recorded). Local OpenAI-compatible "
+                "endpoints without keys may ignore this."
+            )
+
+        mode = "watch" if self.watch_only else "TRADE"
         logger.info(
             "PriceActionWatch started (%s mode, %s bars, %s pairs, db=%s)",
             mode,
@@ -192,6 +222,12 @@ class PriceActionWatch(IStrategy):
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         pair = metadata["pair"]
         runmode = self.dp.runmode
+
+        # Ensure entry columns exist even when no signal ever fires
+        # (a candle without an order plan writes nothing — backtesting
+        # expects the columns to be present).
+        if "enter_long" not in dataframe.columns:
+            dataframe["enter_long"] = 0
 
         if runmode.value in ("live", "dry_run"):
             self._analyze_live(dataframe, pair)
@@ -257,12 +293,48 @@ class PriceActionWatch(IStrategy):
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("%s: PA analysis crashed: %s", pair, exc, exc_info=True)
+            self._save_crash_partial(frame, pair, exc)
             return None
         if record.exception is not None:
             logger.warning(
                 "%s: PA analysis incomplete: %s", pair, record.exception.get("category")
             )
         return record
+
+    def _save_crash_partial(self, frame: KlineFrame, pair: str, exc: Exception) -> None:
+        """Persist an out-of-band crash as a partial record (audit trail).
+
+        two_stage persists its own failure paths; this covers exceptions that
+        escape submit() entirely (e.g. client construction without credentials).
+        """
+        if self._store is None:
+            return
+        from pa_core.records.schema import AnalysisRecord, RecordMeta
+
+        record = AnalysisRecord(
+            meta=RecordMeta(
+                timestamp_local_iso=datetime.now(timezone.utc).isoformat(),
+                timestamp_local_ms=frame.snapshot_ts_local_ms,
+                symbol=pair,
+                timeframe=frame.timeframe,
+                bar_count=len(frame.bars),
+                ai_provider={"model": self._settings.provider.model} if self._settings else {},
+            ),
+            kline_data=[
+                {
+                    "seq": b.seq, "ts_open": b.ts_open, "open": b.open,
+                    "high": b.high, "low": b.low, "close": b.close, "volume": b.volume,
+                }
+                for b in frame.bars
+            ],
+            htf_text="",
+            stage1_messages=[], stage1_response=None, stage1_diagnosis=None,
+            stage2_messages=[], stage2_response=None, stage2_decision=None,
+            strategy_files_used=[], experience_loaded=[],
+            exception={"category": "strategy_exception", "error": str(exc)[:500]},
+            usage_total={},
+        )
+        self._store.save_partial(record, "strategy_exception")
 
     def _apply_decision(
         self, dataframe: DataFrame, pair: str, record: AnalysisRecord, decision: dict | None
@@ -275,7 +347,7 @@ class PriceActionWatch(IStrategy):
             self.dp.send_msg(_signal_text(pair, self.timeframe, record), always_send=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("%s: send_msg failed: %s", pair, exc)
-        if not self.watch_only.value:
+        if not self.watch_only:
             self._set_entry(dataframe, len(dataframe) - 1, decision)
 
     def _set_entry(self, dataframe: DataFrame, row_index: int, decision: dict) -> None:

@@ -154,10 +154,10 @@ def test_two_tables_on_separate_metadata():
     # pa_core tables must not leak into freqtrade's metadata.
     # Skip when freqtrade's own deps are not installed in this env.
     pytest.importorskip("humanize", reason="freqtrade deps not installed")
-    import freqtrade.persistence.models as ft_models
+    from freqtrade.persistence.base import ModelBase
 
     pa_tables = set(PaBase.metadata.tables)
-    ft_tables = set(ft_models.SQLBase.metadata.tables)
+    ft_tables = set(ModelBase.metadata.tables)
     assert "signal" in pa_tables
     assert "analysis_record" in pa_tables
     assert not (pa_tables & ft_tables), "pa_core metadata must stay separate"

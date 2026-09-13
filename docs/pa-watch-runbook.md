@@ -53,14 +53,28 @@ freqtrade backtesting --strategy PriceActionWatch --config user_data/watch_confi
 
 ## 6. 切换实盘（watch → trade）
 
-改三处配置：`dry_run:false`、`max_open_trades:N`、策略参数 `watch_only=false`
-（`user_data/strategies/PriceActionWatch.json` 的 params 文件，或策略类默认值）。
+改三处配置：`dry_run:false`、`max_open_trades:N`、`"pa_llm": {"watch_only": false}`。
+（watch_only 是 config 驱动的模式开关，不是 hyperopt 参数。）
 代码路径不变；signal 表继续记录意图，`trades` 表记录执行，`executed_trade_id` 供对账。
+
+## 6.1 离线回测（无交易所网络）
+
+受限网络环境可用 `tools/bt_offline_driver.py`（monkeypatch 掉市场/费率联网，
+配合 `user_data/watch_config_offline_bt.json` 与本地 feather 数据）：
+
+```bash
+.venv_pa/bin/python tools/bt_offline_driver.py --timerange 20251128-20251129
+```
+
+已验证（2026-09-13，tests/testdata BTC_USDT-5m，LLM 端点指向本地拒连端口模拟失败）：
+289 根K线 → 289 次 PA 分析 → 289 条 strategy_exception partial 记录落库 →
+signal 0 行 → 回测 0 trades → exit=0。全链路降级路径（引擎→适配→LLM失败→落库→统计）不崩。
 
 ## 7. 已知边界
 
-- 本环境（会话内）无法跑完整 freqtrade：策略真实加载/dry-run 需在上述 dev 环境执行。
-  策略文件的 pa_core 符号已通过桩导入冒烟验证；6 个集成测试（`tests/pa_core/test_strategy_integration.py`）
-  在完整环境自动执行（缺依赖时自动 skip）。
+- `.venv_pa`（会话内创建）：Python 3.11.14 + 清华镜像，freqtrade 完整依赖 + openai +
+  psycopg3，**不含 ta-lib C 库**（brew 未装；PA 策略不需要 TA-Lib）。策略加载冒烟、
+  7 个集成测试、离线回测均在此环境验证通过。
+- `pa_core` 已加入 pyproject 打包清单（`pip install -e .` 后任意 cwd 可 import）。
 - `pairlists` 默认 `StaticPairList`（BTC/ETH）。接 PG 动态标的管理时换 `DatabasePairList`（设计文档第3步）。
 - A股标的需 `ashare` 交易所配置（`freqtrade/exchange/ashare.py`），本 config 以 binance/crypto 为例。

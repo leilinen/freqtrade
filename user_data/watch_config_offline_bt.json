@@ -1,0 +1,36 @@
+{
+  "max_open_trades": 0,
+  "stake_currency": "USDT",
+  "stake_amount": 100,
+  "dry_run": true,
+  "fee": 0.0025,
+  "trading_mode": "spot",
+  "timeframe": "5m",
+  "strategy": "PriceActionWatch",
+  "dataformat_ohlcv": "feather",
+  "exchange": {
+    "name": "binance",
+    "key": "",
+    "secret": "",
+    "pair_whitelist": [
+      "BTC/USDT"
+    ],
+    "pair_blacklist": []
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "pa_db_url": "sqlite:///user_data/pa_backtest.sqlite",
+  "pa_llm": {
+    "model": "deepseek-v4-flash",
+    "base_url": "http://127.0.0.1:9/v1",
+    "api_key": "",
+    "analysis_bar_count": 100,
+    "watch_only": true
+  },
+  "internals": {
+    "process_throttle_secs": 5
+  }
+}

@@ -9,6 +9,7 @@ user_data/*
 !user_data/strategies/
 !user_data/strategies/**
 !user_data/watch_config.json
+!user_data/watch_config_offline_bt.json
 !user_data/notebooks
 !user_data/models
 !user_data/freqaimodels
