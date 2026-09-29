@@ -16,4 +16,8 @@ RUN pip install --no-cache-dir "openai>=1.40" "psycopg[binary]"
 # the installed freqtrade so the strategy resolves it.
 COPY --chown=ftuser:ftuser pa_core/ /freqtrade/pa_core/
 
+# The base image installs freqtrade as a package; add the repository root so
+# the sibling pa_core package copied above is importable by user strategies.
+ENV PYTHONPATH=/freqtrade
+
 USER ftuser
