@@ -6,6 +6,20 @@
   "dry_run_wallet": 1000,
   "trading_mode": "spot",
   "timeframe": "1h",
+  "entry_pricing": {
+    "price_side": "same",
+    "use_order_book": false,
+    "price_last_balance": 0.0,
+    "check_depth_of_market": {
+      "enabled": false,
+      "bids_to_ask_delta": 1
+    }
+  },
+  "exit_pricing": {
+    "price_side": "same",
+    "use_order_book": false,
+    "price_last_balance": 0.0
+  },
   "strategy": "PriceActionWatch",
   "dataformat_ohlcv": "feather",
   "dataformat_trades": "feather",
