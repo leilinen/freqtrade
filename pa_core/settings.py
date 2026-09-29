@@ -29,6 +29,9 @@ class AIProviderSettings(BaseModel):
     api_key_encrypted: str = ""
     thinking: bool = True
     reasoning_effort: Literal["low", "medium", "high", "max"] = "high"
+    # Maximum completion budget (visible output plus provider reasoning tokens).
+    # Provider-specific hard caps are still enforced by DeepSeekClient.
+    max_tokens: int = Field(default=384_000, ge=256, le=384_000)
     context_window: int = 2_000_000
 
 

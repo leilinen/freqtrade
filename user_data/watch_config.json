@@ -46,6 +46,7 @@
     "api_key": "",
     "thinking": true,
     "reasoning_effort": "high",
+    "max_tokens": 65536,
     "analysis_bar_count": 100,
     "decision_stance": "balanced",
     "enable_next_bar_prediction": false,

@@ -124,6 +124,14 @@ def test_completion_max_tokens_unknown_gateway_global_cap():
     assert _completion_max_tokens(settings, extra_body={}, effort="max") == 384_000
 
 
+def test_completion_max_tokens_respects_configured_budget():
+    settings = _make_settings()
+    settings.base_url = "https://api.example-proxy.com/v1"
+    settings.model = "glm-5.3-flash"
+    settings.max_tokens = 65_536
+    assert _completion_max_tokens(settings, extra_body={}, effort="high") == 65_536
+
+
 def test_completion_max_tokens_packy_claude_cap():
     settings = _make_settings()
     settings.base_url = "https://www.packyapi.com/v1"

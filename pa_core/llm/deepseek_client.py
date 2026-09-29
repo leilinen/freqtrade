@@ -321,7 +321,7 @@ def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
         cap = mimo_max_output_tokens(settings.model)
     else:
         cap = _PRACTICAL_UNLIMITED_MAX_TOKENS
-    return min(cap, _GLOBAL_MAX_OUTPUT_TOKENS)
+    return min(cap, settings.max_tokens, _GLOBAL_MAX_OUTPUT_TOKENS)
 
 
 def _completion_max_tokens(

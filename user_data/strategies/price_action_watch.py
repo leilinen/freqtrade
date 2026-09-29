@@ -62,6 +62,7 @@ def _build_settings(config: dict) -> Settings:
         api_key=pa.get("api_key", ""),
         thinking=bool(pa.get("thinking", True)),
         reasoning_effort=pa.get("reasoning_effort", "high"),
+        max_tokens=int(pa.get("max_tokens", 384_000)),
     )
     settings = Settings(provider=provider)
     g = settings.general
