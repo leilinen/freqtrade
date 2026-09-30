@@ -4,6 +4,7 @@
   "stake_amount": 100,
   "dry_run": true,
   "dry_run_wallet": 1000,
+  "initial_state": "running",
   "trading_mode": "spot",
   "timeframe": "1h",
   "entry_pricing": {
