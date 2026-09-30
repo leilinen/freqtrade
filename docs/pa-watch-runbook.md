@@ -76,6 +76,10 @@ docker compose -f docker/docker-compose-watch.yml exec freqtrade-watch \
     python /freqtrade/tools/watch_pairs.py list
 ```
 
+Telegram 也可直接增删改（`TG_ENABLED=true` 时，fork 的 telegram RPC 内置命令，同一张表、同一套
+`WatchPairStore`，`authorized_only` 鉴权）：`/list`、`/add <SYMBOL> [显示名]`、`/disable`、`/enable`、
+`/remove`、`/signal [n] [SYMBOL]`。命令清单见 usage guide §5。
+
 语义约定：
 
 - **停用标的用 `disable`，不要 `remove`**：`remove` 是硬删除。删光某 market 的**全部**行属于"冷启动"状态，

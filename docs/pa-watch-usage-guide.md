@@ -147,7 +147,22 @@ WHERE id = (SELECT record_id FROM signal ORDER BY created_at DESC LIMIT 1);
 | `/pause` `/stop` / `/start` | 暂停/停止/恢复分析循环 |
 | `/reload_config` | 重载配置（改 config 文件后免重启） |
 
-> 自定义命令（`/chart` 画图、`/signal` 查库、`/add` `/remove` 动态标的）属于 telegram 插件阶段（设计文档 §5.2），尚未实施。当前改监控标的 = 用 `tools/watch_pairs.py`（或直接 SQL）维护 PG 的 `watch_pair` 表，freqtrade 在 `DatabasePairList` 的 `refresh_period`（默认 60 秒）内自动生效，无需重启或 `/reload_config`。详见 runbook §2.1。
+除原生命令外，fork 在 telegram RPC 里内置了 PA watch 自定义命令（`freqtrade/rpc/telegram.py`，
+经 `Dockerfile.watch` 覆盖进镜像；直连 `pa_db_url`，与 CLI 同一套 `WatchPairStore`）：
+
+| 命令 | 作用 |
+|---|---|
+| `/list`（别名 `/watch`） | 列出 `watch_pair` 全部行（含停用行与显示名） |
+| `/add <SYMBOL> [显示名]` | 新增启用标的，如 `/add SOL/USDT Solana`；A股写 `/add ashare:600519` |
+| `/disable <SYMBOL>` | 停用标的（保留行，推荐） |
+| `/enable <SYMBOL>` | 重新启用 |
+| `/remove <SYMBOL>` | 硬删除（删光某 market 全部行会触发下次启动冷启动播种） |
+| `/signal [n] [SYMBOL]` | 查 `signal` 表最近 n 条（默认 5，上限 20），如 `/signal 10 BTC/USDT` |
+
+- 所有命令走 `authorized_only` 鉴权：仅 `TG_CHAT_ID` 对应会话可用。
+- 增删改在 `DatabasePairList` 的 `refresh_period`（默认 60 秒）内自动生效，无需重启或 `/reload_config`。
+- `SYMBOL` 需与表内精确一致（如 `BTC/USDT`）；`/chart` 画图命令仍未实施（依赖 mplfinance，后续阶段）。
+- 部署外等价操作仍是 `tools/watch_pairs.py`（或直接 SQL），详见 runbook §2.1。
 
 ## 6. 回测
 

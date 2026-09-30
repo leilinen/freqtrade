@@ -22,10 +22,15 @@ RUN pip install --no-cache-dir "openai>=1.40" "psycopg[binary]"
 # constants.py must be patched too: config validation builds the pairlist-method
 # enum from AVAILABLE_PAIRLISTS, so without this the schema rejects
 # DatabasePairList at startup even though the plugin class is present.
+# telegram.py is overlaid for the same reason: the fork adds the PA watch
+# commands (/list /add /remove /enable /disable /signal) backed by pa_core
+# (lazy imports — safe to overlay onto upstream).
 COPY freqtrade/plugins/pairlist/DatabasePairList.py /tmp/DatabasePairList.py
+COPY freqtrade/rpc/telegram.py /tmp/telegram.py
 RUN FT_PKG="$(python3 -c 'import freqtrade, pathlib; print(pathlib.Path(freqtrade.__file__).parent)')" && \
     cp /tmp/DatabasePairList.py "${FT_PKG}/plugins/pairlist/DatabasePairList.py" && \
-    rm /tmp/DatabasePairList.py && \
+    cp /tmp/telegram.py "${FT_PKG}/rpc/telegram.py" && \
+    rm -f /tmp/DatabasePairList.py /tmp/telegram.py && \
     python3 -c 'import pathlib, freqtrade; p = pathlib.Path(freqtrade.__file__).parent / "constants.py"; s = p.read_text(); p.write_text(s if "DatabasePairList" in s else s.replace("AVAILABLE_PAIRLISTS = [", "AVAILABLE_PAIRLISTS = [\n    \"DatabasePairList\",", 1)); print("DatabasePairList in AVAILABLE_PAIRLISTS:", "DatabasePairList" in p.read_text())'
 
 # pa_core is part of the repo (packaged in pyproject) — copy it in next to

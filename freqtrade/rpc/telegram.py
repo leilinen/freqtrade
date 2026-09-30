@@ -139,6 +139,49 @@ def authorized_only(command_handler: Callable[..., Coroutine[Any, Any, None]]):
     return wrapper
 
 
+def _split_market_arg(arg: str) -> tuple[str, str]:
+    """Split an optional market prefix: 'ashare:600519' -> ('600519', 'ashare')."""
+    if ":" in arg:
+        market, _, symbol = arg.partition(":")
+        return symbol.strip(), market.strip()
+    return arg.strip(), "crypto"
+
+
+def _fmt_num(value: Any) -> str:
+    return f"{value:g}" if value is not None else "—"
+
+
+def _format_watch_pairs(rows: list[dict]) -> str:
+    """Reply text for /list — one line per watch pair row."""
+    if not rows:
+        return "📋 watch pair 表为空 — 下次启动将重新播种默认 BTC/ETH"
+    lines = [f"📋 Watch pairs · {len(rows)} 行 · 变更 ≤60s 内生效"]
+    for i, row in enumerate(rows, 1):
+        flag = "✅" if row["enabled"] else "⏸"
+        name = row.get("display_name") or row["symbol"]
+        shown = f" · {name}" if name != row["symbol"] else ""
+        lines.append(f"{i}. {flag} {row['symbol']}{shown} · {row['market']}")
+    return "\n".join(lines)
+
+
+def _format_signals(rows: list[dict]) -> str:
+    """Reply text for /signal — compact per-row summary of the signal ledger."""
+    if not rows:
+        return "📶 signal 表为空 — 模型观望期间不产生记录，属正常"
+    lines = [f"📶 最近 {len(rows)} 条 signal"]
+    for row in rows:
+        when = str(row.get("created_at") or "")[:16].replace("T", " ")
+        lines.append(
+            f"• {row['symbol']} {row['timeframe']} {when} · "
+            f"{row.get('order_direction') or '—'} {row.get('order_type') or '—'} "
+            f"@ {_fmt_num(row.get('entry_price'))} · "
+            f"SL {_fmt_num(row.get('stop_loss_price'))} "
+            f"TP {_fmt_num(row.get('take_profit_price'))} · "
+            f"置信 {row.get('trade_confidence') if row.get('trade_confidence') is not None else '—'}"
+        )
+    return "\n".join(lines)
+
+
 class Telegram(RPCHandler):
     """This class handles all telegram communication"""
 
@@ -221,6 +264,9 @@ class Telegram(RPCHandler):
             r"/version$",
             r"/marketdir (long|short|even|none)$",
             r"/marketdir$",
+            r"/list$",
+            r"/signal$",
+            r"/signal \d+$",
         ]
         # Create keys for generation
         valid_keys_print = [k.replace("$", "") for k in valid_keys]
@@ -308,6 +354,12 @@ class Telegram(RPCHandler):
             CommandHandler("tg_info", self._tg_info),
             CommandHandler("profit_long", self._profit_long),
             CommandHandler("profit_short", self._profit_short),
+            CommandHandler(["list", "watch"], self._watch_list),
+            CommandHandler("add", self._watch_add),
+            CommandHandler("remove", self._watch_remove),
+            CommandHandler("enable", self._watch_enable),
+            CommandHandler("disable", self._watch_disable),
+            CommandHandler(["signal", "signals"], self._watch_signal),
         ]
         callbacks = [
             CallbackQueryHandler(self._status_table, pattern="update_status_table"),
@@ -1870,6 +1922,146 @@ class Telegram(RPCHandler):
         """
         await self.send_blacklist_msg(self._rpc._rpc_blacklist_delete(context.args or []))
 
+    # ── PA watch commands (fork): PG watch pair table + signal ledger ─────────
+
+    def _pa_watch_store(self) -> Any:
+        """WatchPairStore on the configured pa_db_url, or None when unavailable.
+
+        pa_core is only importable in deployments that ship it (watch image,
+        dev env); upstream-only environments get a friendly reply instead.
+        """
+        try:
+            from pa_core.records.watch_pair_store import WatchPairStore
+        except ImportError:
+            return None
+        db_url = self._config.get("pa_db_url")
+        if not db_url:
+            return None
+        return WatchPairStore(db_url)
+
+    async def _watch_mutate(self, action: Callable[[Any], str]) -> None:
+        """Apply a WatchPairStore mutation and reply with its result text."""
+        store = self._pa_watch_store()
+        if store is None:
+            await self._send_msg("⚠️ watch 存储不可用（缺少 pa_core 或 pa db url）")
+            return
+        try:
+            await self._send_msg(action(store))
+        except (ValueError, KeyError) as exc:
+            # WatchPairDuplicateError subclasses ValueError,
+            # WatchPairNotFoundError subclasses KeyError.
+            logger.warning("PA watch command failed: %s", exc)
+            await self._send_msg(f"❌ {exc}")
+
+    @authorized_only
+    async def _watch_list(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /list
+        Shows the watch pair table driving DatabasePairList
+        """
+        store = self._pa_watch_store()
+        if store is None:
+            await self._send_msg("⚠️ watch 存储不可用（缺少 pa_core 或 pa db url）")
+            return
+        await self._send_msg(_format_watch_pairs(store.list_pairs()))
+
+    @authorized_only
+    async def _watch_add(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /add <symbol> [display name]
+        Inserts an enabled row; the whitelist refreshes within refresh_period
+        """
+        if not context.args:
+            await self._send_msg("用法: /add <SYMBOL> [显示名]，例如 /add SOL/USDT Solana")
+            return
+        symbol, market = _split_market_arg(context.args[0])
+        display_name = " ".join(context.args[1:]).strip() or None
+
+        def _add(store: Any) -> str:
+            store.add(symbol, market=market, display_name=display_name)
+            return f"✅ 已添加 {symbol} · {market} · 启用 — 白名单 ≤60s 内生效"
+
+        await self._watch_mutate(_add)
+
+    @authorized_only
+    async def _watch_remove(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /remove <symbol>
+        Hard-deletes the row — for stopping a pair prefer /disable
+        """
+        if not context.args:
+            await self._send_msg("用法: /remove <SYMBOL>（停用建议用 /disable）")
+            return
+        symbol, market = _split_market_arg(context.args[0])
+
+        def _remove(store: Any) -> str:
+            store.remove(symbol, market=market)
+            return f"🗑 已删除 {symbol} · {market}"
+
+        await self._watch_mutate(_remove)
+
+    @authorized_only
+    async def _watch_disable(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /disable <symbol>
+        Keeps the row, drops it from the whitelist
+        """
+        if not context.args:
+            await self._send_msg("用法: /disable <SYMBOL>")
+            return
+        symbol, market = _split_market_arg(context.args[0])
+
+        def _disable(store: Any) -> str:
+            store.set_enabled(symbol, market=market, enabled=False)
+            return f"⏸ 已停用 {symbol} · {market} — 白名单 ≤60s 内生效"
+
+        await self._watch_mutate(_disable)
+
+    @authorized_only
+    async def _watch_enable(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /enable <symbol>
+        Re-enables a disabled row
+        """
+        if not context.args:
+            await self._send_msg("用法: /enable <SYMBOL>")
+            return
+        symbol, market = _split_market_arg(context.args[0])
+
+        def _enable(store: Any) -> str:
+            store.set_enabled(symbol, market=market, enabled=True)
+            return f"▶️ 已启用 {symbol} · {market} — 白名单 ≤60s 内生效"
+
+        await self._watch_mutate(_enable)
+
+    @authorized_only
+    async def _watch_signal(self, update: Update, context: CallbackContext) -> None:
+        """
+        Handler for /signal [n] [symbol]
+        Latest rows from the signal ledger (trade-intent table)
+        """
+        limit, symbol = 5, None
+        if context.args:
+            if context.args[0].isdigit():
+                limit = int(context.args[0])
+                symbol = context.args[1] if len(context.args) > 1 else None
+            else:
+                symbol = context.args[0]
+                if len(context.args) > 1 and context.args[1].isdigit():
+                    limit = int(context.args[1])
+        limit = max(1, min(limit, 20))
+        try:
+            from pa_core.records.pg_store import PgRecordStore
+        except ImportError:
+            await self._send_msg("⚠️ pa_core 不可用")
+            return
+        db_url = self._config.get("pa_db_url")
+        if not db_url:
+            await self._send_msg("⚠️ 未配置 pa db url")
+            return
+        rows = PgRecordStore(db_url).query_signals(symbol=symbol, limit=limit)
+        await self._send_msg(_format_signals(rows))
+
     @authorized_only
     async def _logs(self, update: Update, context: CallbackContext) -> None:
         """
@@ -1959,6 +2151,14 @@ class Telegram(RPCHandler):
             "`the currently set market direction will be output.` \n"
             "*/list_custom_data <trade_id> <key>:* `List custom_data for Trade ID & Key combo.`\n"
             "`If no Key is supplied it will list all key-value pairs found for that Trade ID.`\n"
+            "_PA watch_\n"
+            "------------\n"
+            "*/list:* `Show the watch pair table behind the whitelist`\n"
+            "*/add <pair> [name]:* `Add a pair to the watch list, e.g. /add SOL/USDT Solana`\n"
+            "*/disable <pair>:* `Stop watching a pair (keeps the row)`\n"
+            "*/enable <pair>:* `Re-enable a disabled pair`\n"
+            "*/remove <pair>:* `Hard-delete a pair from the watch list (prefer /disable)`\n"
+            "*/signal [n] [pair]:* `Latest n trade-intent signals from the ledger`\n"
             "_Statistics_\n"
             "------------\n"
             "*/status <trade_id>|[table]:* `Lists all open trades`\n"

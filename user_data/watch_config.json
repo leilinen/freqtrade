@@ -42,7 +42,12 @@
     "enabled": false,
     "token": "",
     "chat_id": "",
-    "allow_custom_messages": true
+    "allow_custom_messages": true,
+    "keyboard": [
+      ["/list", "/signal 5"],
+      ["/whitelist", "/status", "/health"],
+      ["/show_config", "/help"]
+    ]
   },
   "api_server": {
     "enabled": false,
