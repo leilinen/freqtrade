@@ -22,6 +22,8 @@ sys.path.insert(0, str(STRATEGY_DIR))
 
 from freqtrade.enums import RunMode  # noqa: E402
 
+from pa_core.records.watch_pair_store import WatchPairStore  # noqa: E402
+
 from price_action_watch import (  # noqa: E402
     PriceActionWatch,
     _build_settings,
@@ -98,6 +100,29 @@ def test_strategy_instantiates_and_bot_start_builds_pipeline(tmp_path):
     assert strategy._orchestrator is not None
     assert strategy._store is not None
     assert strategy.startup_candle_count == 100 + 50 + 10
+
+
+def test_bot_start_seeds_watch_pair_defaults_on_cold_start(tmp_path):
+    db = f"sqlite:///{tmp_path}/cold.db"
+    strategy = PriceActionWatch(dict(CONFIG, pa_db_url=db))
+    strategy.dp = _FakeDP()
+    strategy.bot_start()
+
+    rows = WatchPairStore(db).list_pairs()
+    assert [r["symbol"] for r in rows] == ["BTC/USDT", "ETH/USDT"]
+    assert all(r["enabled"] for r in rows)
+
+
+def test_bot_start_keeps_existing_watch_pair_rows(tmp_path):
+    db = f"sqlite:///{tmp_path}/warm.db"
+    WatchPairStore(db).add("SOL/USDT")  # non-empty market → no cold-start seeding
+
+    strategy = PriceActionWatch(dict(CONFIG, pa_db_url=db))
+    strategy.dp = _FakeDP()
+    strategy.bot_start()
+
+    rows = WatchPairStore(db).list_pairs()
+    assert [r["symbol"] for r in rows] == ["SOL/USDT"]
 
 
 def test_populate_entry_trend_live_handles_llm_failure(tmp_path, mocker):
@@ -182,3 +207,8 @@ def test_watch_config_json_is_valid_and_watch_safe():
     assert cfg["strategy"] == "PriceActionWatch"
     assert "pa_llm" in cfg and "api_key" in cfg["pa_llm"]
     assert "pa_db_url" in cfg
+    # whitelist comes from the PG watch_pair table; the config carries no
+    # pair_whitelist anymore (cold start seeds defaults into watch_pair)
+    assert cfg["pairlists"][0]["method"] == "DatabasePairList"
+    assert "refresh_period" in cfg["pairlists"][0]
+    assert "pair_whitelist" not in cfg["exchange"]

@@ -72,7 +72,7 @@ freqtrade trade --strategy PriceActionWatch --config user_data/watch_config.json
 | `dry_run` | `true` | 模拟运行（不连真实交易所下单） |
 | `max_open_trades` | `0` | 零交易双保险之一 |
 | `timeframe` | `"1h"` | 分析周期 |
-| `exchange.pair_whitelist` | BTC/ETH | 监控标的（StaticPairList） |
+| `pairlists` | `DatabasePairList` | 白名单从 PG `watch_pair` 表读取（`refresh_period: 60` 秒）；配置无 `pair_whitelist`，冷启动（表空）自动播种 BTC/ETH |
 | `pa_db_url` | PG 连接串 | signal/analysis_record 存储；不可用时自动回退 sqlite |
 | `pa_llm.watch_only` | `true` | **盯盘模式开关**；`false` 时写入场信号列 |
 | `pa_llm.model` / `base_url` / `api_key` | deepseek | LLM 提供方 |
@@ -147,19 +147,21 @@ WHERE id = (SELECT record_id FROM signal ORDER BY created_at DESC LIMIT 1);
 | `/pause` `/stop` / `/start` | 暂停/停止/恢复分析循环 |
 | `/reload_config` | 重载配置（改 config 文件后免重启） |
 
-> 自定义命令（`/chart` 画图、`/signal` 查库、`/add` `/remove` 动态标的）属于 telegram 插件阶段（设计文档 §5.2），尚未实施。当前改监控标的 = 改 `watch_config.json` 的 `pair_whitelist` + `/reload_config`。
+> 自定义命令（`/chart` 画图、`/signal` 查库、`/add` `/remove` 动态标的）属于 telegram 插件阶段（设计文档 §5.2），尚未实施。当前改监控标的 = 用 `tools/watch_pairs.py`（或直接 SQL）维护 PG 的 `watch_pair` 表，freqtrade 在 `DatabasePairList` 的 `refresh_period`（默认 60 秒）内自动生效，无需重启或 `/reload_config`。详见 runbook §2.1。
 
 ## 6. 回测
 
 > LLM 是策略核心：回测时**每根K线都会真实调用一次 LLM**（增量模式）。先小区间试跑再放大。
+> 主配置已切 `DatabasePairList`（不支持回测）且无 `pair_whitelist`——回测请用保留
+> `StaticPairList` 的 `watch_config_offline_bt.json`。
 
 ```bash
 # 下载数据（需交易所网络）
-freqtrade download-data --config user_data/watch_config.json --timerange 20250901-20251201
+freqtrade download-data --config user_data/watch_config_offline_bt.json --timerange 20250901-20251201
 
 # 回测（一周区间先验证）
 freqtrade backtesting --strategy PriceActionWatch \
-  --config user_data/watch_config.json --timerange 20251201-20251208
+  --config user_data/watch_config_offline_bt.json --timerange 20251201-20251208
 ```
 
 Token 消耗参考：1h 周期一天 24 次调用；增量模式下每次约几 K token（首轮全量 ~30K+）。
@@ -193,7 +195,8 @@ python tools/bt_offline_driver.py --timerange 20251128-20251129
 | 长期 `signal` 表 0 行 | LLM 判定均为"不下单"，或全部分析失败 | 先查上一条的 partial 原因分布；确认K线数据在增长 |
 | `Missing credentials` | openai 客户端构造时无 key | 同上，配环境变量 |
 | 回测 `No trades made` | 无密钥降级（预期）或确实无信号 | 看回测日志中 PA 分析次数与 partial 统计 |
-| 启动后白名单为空 | `pair_whitelist` 为空或数据不足 `startup_candle_count`(160) | 补白名单；等K线预热（新标的约 160 根后开始出分析） |
+| 启动后白名单为空 | `watch_pair` 表未初始化/无启用行，或数据不足 `startup_candle_count`(160) | 执行 `watch_pairs.py init --seed-from-config`；等K线预热（新标的约 160 根后开始出分析） |
+| `Failed to load pairs from database`（每周期重复） | `watch_pair` 表不存在或 PG 不可达 | 前者执行 init；后者查 PG 容器。均为仅告警不崩溃，修复后下一周期自动恢复 |
 | 重启后无 `Restored previous analysis` | 上一轮无成功记录（首轮正常）或库被清 | 无需处理；第二轮起自动恢复 |
 
 ## 9. 目录与文档索引
@@ -204,6 +207,7 @@ user_data/watch_config.json                  主配置
 pa_core/                                     PA 策略核心（20,699 行，结构详见 docs/pa-migration-plan.md §5）
 pa_core/prompts/                             32 个 PA 知识文件（决策树/形态规则/通道策略）
 tools/bt_offline_driver.py                   离线回测驱动
+tools/watch_pairs.py                        watch_pair 表运维 CLI（增删改查/初始化）
 docker/                                      部署资产（Dockerfile.watch + compose + .env 模板）
 ```
 

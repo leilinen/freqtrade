@@ -3,6 +3,11 @@
 # Base: official freqtrade image. Added on top:
 #   - openai         : pa_core LLM calls (two-stage price action analysis)
 #   - psycopg[binary]: PostgreSQL driver for signal / analysis_record tables
+#   - DatabasePairList overlay: fork-only pairlist (reads the PG watch_pair
+#     table) — the base image ships upstream freqtrade without it. Only this
+#     file is overlaid (not the whole fork): the fork's config schema still
+#     requires stoploss/minimal_roi, which watch_config.json deliberately
+#     omits, so running the fork's full freqtrade source would break startup.
 # Not needed (kept out on purpose): ta-lib C library (strategy uses the
 # ported pa_core indicators), mplfinance (chart rendering lands with the
 # telegram plugin stage).
@@ -12,9 +17,20 @@ USER root
 
 RUN pip install --no-cache-dir "openai>=1.40" "psycopg[binary]"
 
+# Overlay the fork's DatabasePairList into the installed freqtrade package
+# (dynamic path: the base image's python/site-packages version moves over time).
+COPY freqtrade/plugins/pairlist/DatabasePairList.py /tmp/DatabasePairList.py
+RUN FT_PKG="$(python3 -c 'import freqtrade, pathlib; print(pathlib.Path(freqtrade.__file__).parent)')" && \
+    cp /tmp/DatabasePairList.py "${FT_PKG}/plugins/pairlist/DatabasePairList.py" && \
+    rm /tmp/DatabasePairList.py
+
 # pa_core is part of the repo (packaged in pyproject) — copy it in next to
 # the installed freqtrade so the strategy resolves it.
 COPY --chown=ftuser:ftuser pa_core/ /freqtrade/pa_core/
+
+# Ops CLI for the watch_pair table (runs inside the container via
+# `docker compose exec freqtrade-watch python /freqtrade/tools/watch_pairs.py ...`).
+COPY --chown=ftuser:ftuser tools/ /freqtrade/tools/
 
 # The base image installs freqtrade as a package; add the repository root so
 # the sibling pa_core package copied above is importable by user strategies.

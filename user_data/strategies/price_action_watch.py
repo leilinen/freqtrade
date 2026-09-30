@@ -37,6 +37,11 @@ from pa_core.llm.router import route_strategy_files
 from pa_core.llm.two_stage import TwoStageOrchestrator
 from pa_core.records.pg_store import PgRecordStore
 from pa_core.records.schema import AnalysisRecord
+from pa_core.records.watch_pair_store import (
+    MARKET_ASHARE,
+    MARKET_CRYPTO,
+    WatchPairStore,
+)
 from pa_core.settings import AIProviderSettings, Settings
 from pa_core.snapshot import INDICATOR_WARMUP_BARS
 from pa_core.util.df_adapter import df_to_kline_frame
@@ -166,6 +171,25 @@ class PriceActionWatch(IStrategy):
             )
             db_url = fallback_url
             self._store = PgRecordStore(db_url)
+
+        # Cold start: create watch_pair and seed the default pairs when the
+        # market has no rows (the whitelist itself is owned by DatabasePairList,
+        # reading PG). Targets the primary URL — seeding the sqlite fallback
+        # would not feed the pairlist. Failure is logged, never fatal.
+        primary_url = self.config.get("pa_db_url") or fallback_url
+        exchange_name = (self.config.get("exchange") or {}).get("name", "")
+        market = MARKET_ASHARE if exchange_name == "ashare" else MARKET_CRYPTO
+        try:
+            seeded = WatchPairStore(primary_url).ensure_defaults(market)
+            if seeded:
+                logger.info("Cold start: seeded watch_pair defaults %s", seeded)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "watch_pair ensure_defaults(%s) failed (%s); whitelist stays empty "
+                "until the table is created",
+                market,
+                exc,
+            )
 
         client = DeepSeekClient(self._settings.provider)
         from pa_core.records.experience_reader import ExperienceReader
