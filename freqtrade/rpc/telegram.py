@@ -340,18 +340,12 @@ class Telegram(RPCHandler):
                 logger.info(f"using custom keyboard from config.json: {self._keyboard}")
 
     def _init_telegram_app(self):
-        return (
-            Application.builder()
-            .token(self._config["telegram"]["token"])
-            .post_init(self._post_init)
-            .build()
-        )
+        return Application.builder().token(self._config["telegram"]["token"]).build()
 
-    @staticmethod
-    async def _post_init(application: Application) -> None:
-        """Register the '/' command menu (replaces stale BotFather entries)."""
+    async def _register_command_menu(self) -> None:
+        """Register the '/' command menu; best-effort (never blocks polling)."""
         try:
-            await application.bot.set_my_commands(_bot_command_menu())
+            await self._app.bot.set_my_commands(_bot_command_menu())
             logger.info("Registered telegram command menu (%d commands)", len(_bot_command_menu()))
         except TelegramError as exc:
             logger.warning("Failed to register telegram command menu: %s", exc)
@@ -463,6 +457,11 @@ class Telegram(RPCHandler):
         while attempt < retries:
             try:
                 await self._app.initialize()
+                # freqtrade drives initialize()/start() directly instead of
+                # run_polling(), so PTB never invokes the builder's post_init —
+                # register the '/' command menu here. set_my_commands replaces
+                # the whole list (stale BotFather-era entries disappear).
+                await self._register_command_menu()
                 await self._app.start()
                 break
             except Exception as ex:
