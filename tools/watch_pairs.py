@@ -8,7 +8,7 @@ convenience to pre-create/seed without waiting for a bot start.
 
 Usage (host, from repo root):
     python tools/watch_pairs.py list
-    python tools/watch_pairs.py add SOL/USDT
+    python tools/watch_pairs.py add SOL/USDT [--timeframe 4h] [--display-name Solana]
     python tools/watch_pairs.py disable SOL/USDT && python tools/watch_pairs.py enable SOL/USDT
 
 In the watch container (db-url picked up from FREQTRADE__PA_DB_URL):
@@ -77,7 +77,7 @@ def _print_rows(rows: list[dict]) -> None:
         print("(no rows)")
         return
     header = {"id": "ID", "symbol": "SYMBOL", "market": "MARKET", "enabled": "ENABLED",
-              "display_name": "DISPLAY_NAME", "updated_at": "UPDATED_AT"}
+              "timeframe": "TF", "display_name": "DISPLAY_NAME", "updated_at": "UPDATED_AT"}
     widths = {
         key: max(len(header[key]), *(len(str(row.get(key, ""))) for row in rows))
         for key in header
@@ -87,6 +87,7 @@ def _print_rows(rows: list[dict]) -> None:
     for row in rows:
         enabled = "yes" if row["enabled"] else "NO"
         print(fmt.format(row["id"], row["symbol"], row["market"], enabled,
+                         row.get("timeframe") or "-",
                          row.get("display_name") or "", row.get("updated_at") or ""))
 
 
@@ -132,6 +133,11 @@ def main(argv: list[str] | None = None) -> int:
     p_add = sub.add_parser("add", help="add a symbol (enabled)")
     p_add.add_argument("symbol")
     p_add.add_argument("--display-name", help="human-facing label (default: symbol)")
+    p_add.add_argument(
+        "--timeframe",
+        help="analysis interval for this pair, >= the strategy timeframe "
+        "(e.g. 4h, 1d; default: strategy timeframe from --config)",
+    )
 
     p_remove = sub.add_parser(
         "remove", help="hard-delete a symbol (prefer 'disable' to pause watching)"
@@ -161,8 +167,32 @@ def main(argv: list[str] | None = None) -> int:
             _print_rows(store.list_pairs(market=market, enabled_only=not args.all))
         elif args.command == "add":
             symbol = _check_symbol(args.symbol, market)
-            store.add(symbol, market=market, display_name=args.display_name)
-            print(f"Added {symbol} ({market}, enabled)")
+            timeframe = args.timeframe
+            if timeframe:
+                from freqtrade.exchange import timeframe_to_seconds
+
+                try:
+                    secs = timeframe_to_seconds(timeframe)
+                    main_tf = (
+                        json.loads(Path(args.config).read_text(encoding="utf-8"))
+                        .get("timeframe", "1h")
+                    )
+                    main_secs = timeframe_to_seconds(str(main_tf))
+                except Exception as exc:  # ccxt raises NotSupported for bad units
+                    print(f"error: invalid timeframe {timeframe!r}: {exc}", file=sys.stderr)
+                    return 1
+                if secs < main_secs:
+                    print(
+                        f"error: timeframe {timeframe} is below the strategy "
+                        f"timeframe {main_tf} — only >= is supported",
+                        file=sys.stderr,
+                    )
+                    return 1
+            store.add(
+                symbol, market=market, display_name=args.display_name, timeframe=timeframe
+            )
+            tf_note = f", timeframe {timeframe}" if timeframe else ""
+            print(f"Added {symbol} ({market}, enabled{tf_note})")
         elif args.command == "remove":
             store.remove(_check_symbol(args.symbol, market), market=market)
             print(f"Removed {symbol_ref(args)}")

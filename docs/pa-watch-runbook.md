@@ -66,7 +66,7 @@ INSERT INTO watch_pair (symbol, market, enabled, display_name) VALUES
 ```bash
 # 宿主机（仓库根目录；db-url 取自 watch_config.json 的 pa_db_url 或 --db-url 覆盖）
 python tools/watch_pairs.py list [--all]
-python tools/watch_pairs.py add SOL/USDT [--display-name Solana]
+python tools/watch_pairs.py add SOL/USDT [--timeframe 4h] [--display-name Solana]
 python tools/watch_pairs.py disable SOL/USDT     # 停用（保留行，推荐）
 python tools/watch_pairs.py enable SOL/USDT
 python tools/watch_pairs.py remove SOL/USDT      # 硬删除
@@ -76,8 +76,13 @@ docker compose -f docker/docker-compose-watch.yml exec freqtrade-watch \
     python /freqtrade/tools/watch_pairs.py list
 ```
 
+每标的周期（`watch_pair.timeframe`，NULL = 主周期 1h）：仅支持 ≥ 主周期的间隔
+（2h/4h/1d/1w…，freqtrade informative 机制限制）。策略经 `informative_pairs` 拉取
+对应周期K线，仅在该周期K线收盘时触发分析；`WatchPairStore.__init__` 会对旧表自动
+`ALTER TABLE ... ADD COLUMN timeframe`（无需手工迁移）。修改周期 = `remove` + `add --timeframe`。
+
 Telegram 也可直接增删改（`TG_ENABLED=true` 时，fork 的 telegram RPC 内置命令，同一张表、同一套
-`WatchPairStore`，`authorized_only` 鉴权）：`/list`、`/add <SYMBOL> [显示名]`、`/disable`、`/enable`、
+`WatchPairStore`，`authorized_only` 鉴权）：`/list`、`/add <SYMBOL> [周期] [显示名]`、`/disable`、`/enable`、
 `/remove`、`/signal [n] [SYMBOL]`。命令清单见 usage guide §5。
 
 语义约定：

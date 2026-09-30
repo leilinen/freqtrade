@@ -122,3 +122,47 @@ def test_watch_pair_metadata_separate_from_freqtrade():
 
     assert "watch_pair" in set(PaBase.metadata.tables)
     assert "watch_pair" not in set(ModelBase.metadata.tables)
+
+
+def test_add_and_list_timeframe(store: WatchPairStore):
+    store.add("BTC/USDT")  # NULL -> strategy default
+    store.add("SOL/USDT", timeframe="4h")
+    rows = store.list_pairs()
+    assert rows[0]["timeframe"] is None
+    assert rows[1]["timeframe"] == "4h"
+
+
+def test_timeframe_migration_from_old_schema(tmp_path):
+    """A table created before the timeframe column gets it added in place."""
+    from sqlalchemy import create_engine, text
+
+    db_url = f"sqlite:///{tmp_path}/old_schema.db"
+    engine = create_engine(db_url, future=True)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE watch_pair ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "symbol VARCHAR(32) NOT NULL, "
+                "market VARCHAR(16) NOT NULL DEFAULT 'crypto', "
+                "enabled BOOLEAN NOT NULL DEFAULT 1, "
+                "display_name VARCHAR(64), "
+                "created_at DATETIME, "
+                "updated_at DATETIME"
+                ")"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO watch_pair (symbol, market, enabled, display_name) "
+                "VALUES ('BTC/USDT', 'crypto', 1, 'BTC/USDT')"
+            )
+        )
+    engine.dispose()
+
+    store = WatchPairStore(db_url)  # __init__ runs the migration
+    rows = store.list_pairs()
+    assert rows[0]["symbol"] == "BTC/USDT"
+    assert rows[0]["timeframe"] is None  # existing rows keep the default
+    store.add("SOL/USDT", timeframe="1d")
+    assert store.list_pairs()[1]["timeframe"] == "1d"

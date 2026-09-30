@@ -23,6 +23,7 @@ strategy). Expect long runtimes; incremental mode keeps per-call tokens low.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 
 from pandas import DataFrame
@@ -50,6 +51,10 @@ from pa_core.util.threading import CancelToken
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ANALYSIS_BARS = 100
+
+# Pair-interval mapping refresh TTL — aligned with DatabasePairList's
+# refresh_period, so /add changes apply without a bot restart.
+_PAIR_TF_TTL_SECONDS = 60.0
 
 
 def _fallback_db_url(config: dict) -> str:
@@ -145,6 +150,17 @@ class PriceActionWatch(IStrategy):
         # pair -> latest successful AnalysisRecord (incremental analysis state)
         self._prev_records: dict[str, AnalysisRecord] = {}
         self._analysis_bars = _DEFAULT_ANALYSIS_BARS
+        # Per-pair interval support: watch_pair.timeframe overrides (NULL =
+        # self.timeframe). Kept as a TTL-cached mapping read from the store so
+        # telegram /add changes apply without a restart.
+        self._watch_store: WatchPairStore | None = None
+        self._market: str = MARKET_CRYPTO
+        self._pair_tf: dict[str, str] = {}
+        self._pair_tf_loaded_at: float = 0.0
+        # (pair, timeframe) -> last analysed closed-bar date. The engine's
+        # new-candle dedupe is main-timeframe only, so off-tf pairs track
+        # their own candle closes here.
+        self._last_seen_tf: dict[tuple[str, str], object] = {}
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -178,16 +194,17 @@ class PriceActionWatch(IStrategy):
         # would not feed the pairlist. Failure is logged, never fatal.
         primary_url = self.config.get("pa_db_url") or fallback_url
         exchange_name = (self.config.get("exchange") or {}).get("name", "")
-        market = MARKET_ASHARE if exchange_name == "ashare" else MARKET_CRYPTO
+        self._market = MARKET_ASHARE if exchange_name == "ashare" else MARKET_CRYPTO
         try:
-            seeded = WatchPairStore(primary_url).ensure_defaults(market)
+            self._watch_store = WatchPairStore(primary_url)
+            seeded = self._watch_store.ensure_defaults(self._market)
             if seeded:
                 logger.info("Cold start: seeded watch_pair defaults %s", seeded)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "watch_pair ensure_defaults(%s) failed (%s); whitelist stays empty "
                 "until the table is created",
-                market,
+                self._market,
                 exc,
             )
 
@@ -213,10 +230,12 @@ class PriceActionWatch(IStrategy):
             settings=self._settings,
         )
 
-        # Restore incremental state from PG for every whitelisted pair.
+        # Restore incremental state from PG for every whitelisted pair, keyed
+        # on the pair's own analysis interval.
+        self._refresh_pair_timeframes()
         for pair in self.dp.current_whitelist():
             record = self._store.find_latest_successful(
-                symbol=pair, timeframe=self.timeframe
+                symbol=pair, timeframe=self._pair_timeframe(pair)
             )
             if record is not None:
                 self._prev_records[pair] = record
@@ -265,10 +284,49 @@ class PriceActionWatch(IStrategy):
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe
 
+    def informative_pairs(self):
+        """Declare per-pair intervals above the strategy timeframe.
+
+        freqtrade fetches these as informative data each loop (the rule:
+        informative tf must be >= strategy tf, which _validate_timeframe
+        enforces on the telegram/CLI side too).
+        """
+        self._refresh_pair_timeframes()
+        whitelist = self.dp.current_whitelist()
+        return [
+            (pair, tf)
+            for pair, tf in self._pair_tf.items()
+            if tf != self.timeframe and pair in whitelist
+        ]
+
     # ── PA analysis ────────────────────────────────────────────────────────────
+
+    def _refresh_pair_timeframes(self) -> None:
+        """Reload pair -> interval from watch_pair on a 60s TTL."""
+        if self._watch_store is None:
+            return
+        if self._pair_tf and time.monotonic() - self._pair_tf_loaded_at < _PAIR_TF_TTL_SECONDS:
+            return
+        try:
+            rows = self._watch_store.list_pairs(market=self._market, enabled_only=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("watch_pair timeframe refresh failed: %s", exc)
+            return
+        self._pair_tf = {
+            row["symbol"]: (row["timeframe"] or self.timeframe) for row in rows
+        }
+        self._pair_tf_loaded_at = time.monotonic()
+
+    def _pair_timeframe(self, pair: str) -> str:
+        self._refresh_pair_timeframes()
+        return self._pair_tf.get(pair, self.timeframe)
 
     def _analyze_live(self, dataframe: DataFrame, pair: str) -> None:
         """One incremental two-stage run on the newest closed candle."""
+        tf = self._pair_timeframe(pair)
+        if tf != self.timeframe:
+            self._analyze_live_off_tf(dataframe, pair, tf)
+            return
         frame = df_to_kline_frame(dataframe, pair, self.timeframe, self._analysis_bars)
         if frame is None:
             logger.debug("%s: not enough candles for PA analysis yet", pair)
@@ -278,7 +336,34 @@ class PriceActionWatch(IStrategy):
             decision = (record.stage2_decision or {}).get("decision")
             if record.exception is None:
                 self._prev_records[pair] = record
-            self._apply_decision(dataframe, pair, record, decision)
+            self._apply_decision(dataframe, pair, record, decision, tf)
+
+    def _analyze_live_off_tf(self, dataframe: DataFrame, pair: str, tf: str) -> None:
+        """Analysis for pairs on an interval above the strategy timeframe.
+
+        The engine still calls populate_entry_trend once per new 1h candle;
+        here we skip until THIS pair's tf candle closes (dp.ohlcv returns
+        completed candles only, matching the engine's main-tf semantics).
+        """
+        df_tf = self.dp.ohlcv(pair, tf)
+        if df_tf is None or len(df_tf) == 0:
+            logger.debug("%s: no %s candles available yet", pair, tf)
+            return
+        key = (pair, tf)
+        last_date = df_tf.iloc[-1]["date"]
+        if self._last_seen_tf.get(key) == last_date:
+            return  # this tf's candle has not closed since the last analysis
+        self._last_seen_tf[key] = last_date
+        frame = df_to_kline_frame(df_tf, pair, tf, self._analysis_bars)
+        if frame is None:
+            logger.debug("%s: not enough %s candles for PA analysis yet", pair, tf)
+            return
+        record = self._run_pa(frame, pair, self._prev_records.get(pair))
+        if record is not None:
+            decision = (record.stage2_decision or {}).get("decision")
+            if record.exception is None:
+                self._prev_records[pair] = record
+            self._apply_decision(dataframe, pair, record, decision, tf)
 
     def _analyze_backtest(self, dataframe: DataFrame, pair: str) -> None:
         """Per-candle LLM analysis over history (incremental chain)."""
@@ -362,14 +447,19 @@ class PriceActionWatch(IStrategy):
         self._store.save_partial(record, "strategy_exception")
 
     def _apply_decision(
-        self, dataframe: DataFrame, pair: str, record: AnalysisRecord, decision: dict | None
+        self,
+        dataframe: DataFrame,
+        pair: str,
+        record: AnalysisRecord,
+        decision: dict | None,
+        timeframe: str,
     ) -> None:
         """Record-level effects in live mode: TG push + entry signal."""
         if not _is_order_plan(decision):
             return
         # signal table row is written by PgRecordStore.save_full (order plans only)
         try:
-            self.dp.send_msg(_signal_text(pair, self.timeframe, record), always_send=True)
+            self.dp.send_msg(_signal_text(pair, timeframe, record), always_send=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("%s: send_msg failed: %s", pair, exc)
         if not self.watch_only:

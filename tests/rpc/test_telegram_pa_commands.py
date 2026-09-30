@@ -16,6 +16,7 @@ from freqtrade.rpc.telegram import (
     _format_signals,
     _format_watch_pairs,
     _split_market_arg,
+    _validate_pair_timeframe,
 )
 from freqtrade.persistence import init_db
 from pa_core.records.pg_store import PgRecordStore
@@ -40,6 +41,7 @@ def _ctx(args: list[str]) -> SimpleNamespace:
 def tg(default_conf, tmp_path):
     """Telegram instance with pa stores on sqlite and a capturing send stub."""
     default_conf["telegram"] = {"enabled": True, "token": "t", "chat_id": CHAT_ID}
+    default_conf["timeframe"] = "1h"
     default_conf["pa_db_url"] = f"sqlite:///{tmp_path}/pa_records.db"
     init_db(default_conf["db_url"])  # authorized_only touches Trade.session
 
@@ -67,14 +69,28 @@ def test_split_market_arg():
 def test_format_watch_pairs():
     assert "为空" in _format_watch_pairs([])
     rows = [
-        {"symbol": "BTC/USDT", "enabled": True, "display_name": "Bitcoin", "market": "crypto"},
-        {"symbol": "SOL/USDT", "enabled": False, "display_name": "SOL/USDT", "market": "crypto"},
+        {"symbol": "BTC/USDT", "enabled": True, "display_name": "Bitcoin",
+         "market": "crypto", "timeframe": None},
+        {"symbol": "SOL/USDT", "enabled": False, "display_name": "SOL/USDT",
+         "market": "crypto", "timeframe": "4h"},
     ]
     text = _format_watch_pairs(rows, "1h")
-    assert "2 行" in text and "周期 1h" in text
-    assert "✅ BTC/USDT · Bitcoin" in text
+    assert "2 行" in text and "默认 1h" in text
+    assert "✅ BTC/USDT · 1h · Bitcoin" in text
     sol_line = next(line for line in text.splitlines() if "SOL/USDT" in line)
-    assert "⏸ SOL/USDT" in sol_line and "· SOL/USDT" not in sol_line
+    assert "⏸ SOL/USDT · 4h" in sol_line and "· SOL/USDT" not in sol_line
+
+
+def test_validate_pair_timeframe():
+    _validate_pair_timeframe("1h", {"timeframe": "1h"})  # equal is allowed
+    _validate_pair_timeframe("1d", {"timeframe": "1h"})
+    _validate_pair_timeframe("1d", {})  # missing config -> 1h default
+    with pytest.raises(ValueError, match="低于主周期"):
+        _validate_pair_timeframe("5m", {"timeframe": "1h"})
+    with pytest.raises(ValueError, match="低于主周期"):
+        _validate_pair_timeframe("15m", {"timeframe": "1h"})
+    with pytest.raises(ValueError, match="无效周期"):
+        _validate_pair_timeframe("4x", {"timeframe": "1h"})
 
 
 def test_format_signals():
@@ -105,8 +121,22 @@ def test_watch_add_list_flow(tg):
 
     _run(tg._watch_list(_update(), _ctx([])))
     listing = next(m for m in tg._sent if "Watch pairs" in m)
-    assert "✅ SOL/USDT · Solana" in listing
-    assert "周期" in listing
+    assert "✅ SOL/USDT · 1h · Solana" in listing  # no tf -> default shown
+    assert "默认 1h" in listing
+
+
+def test_watch_add_with_timeframe(tg):
+    _run(tg._watch_add(_update(), _ctx(["DOGE/USDT", "4h", "Doge"])))
+    assert any("已添加 DOGE/USDT · 周期 4h" in m for m in tg._sent)
+    rows = {r["symbol"]: r for r in tg._pa_watch_store().list_pairs()}
+    assert rows["DOGE/USDT"]["timeframe"] == "4h"
+    assert rows["DOGE/USDT"]["display_name"] == "Doge"
+
+
+def test_watch_add_rejects_timeframe_below_main(tg):
+    _run(tg._watch_add(_update(), _ctx(["DOGE/USDT", "5m"])))
+    assert any("❌" in m and "5m" in m for m in tg._sent)
+    assert tg._pa_watch_store().list_pairs() == []  # nothing inserted
 
 
 def test_watch_add_duplicate_reports_error(tg):

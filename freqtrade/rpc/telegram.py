@@ -147,20 +147,43 @@ def _split_market_arg(arg: str) -> tuple[str, str]:
     return arg.strip(), "crypto"
 
 
+_TIMEFRAME_ARG_RE = re.compile(r"^\d+[smhdwM]$")
+
+
+def _validate_pair_timeframe(timeframe: str, config: dict) -> None:
+    """Raise ValueError unless timeframe is valid and >= the strategy timeframe.
+
+    Lower intervals would need informative data below the bot's main
+    timeframe, which freqtrade does not support.
+    """
+    from freqtrade.exchange import timeframe_to_seconds
+
+    try:
+        secs = timeframe_to_seconds(timeframe)
+    except Exception as exc:  # ccxt raises NotSupported for bad units
+        raise ValueError(f"无效周期 {timeframe}（示例: 2h 4h 1d 1w）") from exc
+    main_secs = timeframe_to_seconds(str(config.get("timeframe") or "1h"))
+    if secs < main_secs:
+        raise ValueError(
+            f"周期 {timeframe} 低于主周期（{config.get('timeframe') or '1h'}）— 仅支持相同或更大的周期"
+        )
+
+
 def _fmt_num(value: Any) -> str:
     return f"{value:g}" if value is not None else "—"
 
 
-def _format_watch_pairs(rows: list[dict], timeframe: str = "—") -> str:
-    """Reply text for /list — one line per watch pair row."""
+def _format_watch_pairs(rows: list[dict], default_timeframe: str = "—") -> str:
+    """Reply text for /list — one line per watch pair row with its interval."""
     if not rows:
         return "📋 watch pair 表为空 — 下次启动将重新播种默认 BTC/ETH"
-    lines = [f"📋 Watch pairs · {len(rows)} 行 · 周期 {timeframe} · 变更 ≤60s 内生效"]
+    lines = [f"📋 Watch pairs · {len(rows)} 行 · 默认 {default_timeframe} · 变更 ≤60s 内生效"]
     for i, row in enumerate(rows, 1):
         flag = "✅" if row["enabled"] else "⏸"
+        tf = row.get("timeframe") or default_timeframe
         name = row.get("display_name") or row["symbol"]
         shown = f" · {name}" if name != row["symbol"] else ""
-        lines.append(f"{i}. {flag} {row['symbol']}{shown} · {row['market']}")
+        lines.append(f"{i}. {flag} {row['symbol']} · {tf}{shown} · {row['market']}")
     return "\n".join(lines)
 
 
@@ -1966,22 +1989,31 @@ class Telegram(RPCHandler):
         await self._send_msg(
             _format_watch_pairs(store.list_pairs(), self._config.get("timeframe") or "—")
         )
-
     @authorized_only
     async def _watch_add(self, update: Update, context: CallbackContext) -> None:
         """
-        Handler for /add <symbol> [display name]
-        Inserts an enabled row; the whitelist refreshes within refresh_period
+        Handler for /add <symbol> [timeframe] [display name]
+        Inserts an enabled row; the whitelist refreshes within refresh_period.
+        Changing a pair's interval is /remove + /add with the new timeframe.
         """
         if not context.args:
-            await self._send_msg("用法: /add <SYMBOL> [显示名]，例如 /add SOL/USDT Solana")
+            await self._send_msg(
+                "用法: /add <SYMBOL> [周期] [显示名]，例如 /add SOL/USDT 4h Solana"
+            )
             return
         symbol, market = _split_market_arg(context.args[0])
-        display_name = " ".join(context.args[1:]).strip() or None
+        rest = list(context.args[1:])
+        timeframe: str | None = None
+        if rest and _TIMEFRAME_ARG_RE.match(rest[0]):
+            timeframe = rest.pop(0)
+        display_name = " ".join(rest).strip() or None
 
         def _add(store: Any) -> str:
-            store.add(symbol, market=market, display_name=display_name)
-            return f"✅ 已添加 {symbol} · {market} · 启用 — 白名单 ≤60s 内生效"
+            if timeframe:
+                _validate_pair_timeframe(timeframe, self._config)
+            store.add(symbol, market=market, display_name=display_name, timeframe=timeframe)
+            tf_note = f" · 周期 {timeframe}" if timeframe else ""
+            return f"✅ 已添加 {symbol}{tf_note} · {market} · 启用 — 白名单 ≤60s 内生效"
 
         await self._watch_mutate(_add)
 
@@ -2156,7 +2188,8 @@ class Telegram(RPCHandler):
             "_PA watch_\n"
             "------------\n"
             "*/list:* `Show the watch pair table behind the whitelist`\n"
-            "*/add <pair> [name]:* `Add a pair to the watch list, e.g. /add SOL/USDT Solana`\n"
+            "*/add <pair> [interval] [name]:* `Add a pair to the watch list, "
+            "e.g. /add SOL/USDT 4h Solana`\n"
             "*/disable <pair>:* `Stop watching a pair (keeps the row)`\n"
             "*/enable <pair>:* `Re-enable a disabled pair`\n"
             "*/remove <pair>:* `Hard-delete a pair from the watch list (prefer /disable)`\n"

@@ -22,7 +22,9 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     func,
+    inspect,
     select,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, sessionmaker
 
@@ -51,6 +53,9 @@ class WatchPairRow(PaBase):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # Human-facing label for telegram cards; defaults to the symbol itself.
     display_name: Mapped[Optional[str]] = mapped_column(String(64))
+    # Analysis interval override, e.g. "4h"/"1d"; NULL = strategy default.
+    # Must be >= the strategy timeframe (freqtrade informative-pairs rule).
+    timeframe: Mapped[Optional[str]] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -74,6 +79,7 @@ def _row_to_dict(row: WatchPairRow) -> dict[str, Any]:
         "market": row.market,
         "enabled": bool(row.enabled),
         "display_name": row.display_name,
+        "timeframe": row.timeframe,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
     }
@@ -93,6 +99,22 @@ class WatchPairStore:
         self._session_factory = sessionmaker(bind=self._engine, expire_on_commit=False)
         # Idempotent: creates watch_pair (plus any missing PaBase tables).
         PaBase.metadata.create_all(self._engine)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add missing columns to pre-existing watch_pair tables.
+
+        create_all never alters existing tables (no Alembic here), so
+        deployments created before the timeframe column get it added
+        in place — same inspect-and-ALTER approach as freqtrade's
+        persistence/migrations.py. Nullable, no default: existing rows
+        keep the strategy-default interval.
+        """
+        columns = {c["name"] for c in inspect(self._engine).get_columns("watch_pair")}
+        if "timeframe" not in columns:
+            with self._engine.begin() as conn:
+                conn.execute(text("ALTER TABLE watch_pair ADD COLUMN timeframe VARCHAR(16)"))
+            self._logger.info("watch_pair: added missing timeframe column (migration)")
 
     # ── Reads ──────────────────────────────────────────────────────────────────
 
@@ -115,8 +137,13 @@ class WatchPairStore:
         symbol: str,
         market: str = MARKET_CRYPTO,
         display_name: str | None = None,
+        timeframe: str | None = None,
     ) -> int:
-        """Insert one monitored symbol; returns the row id."""
+        """Insert one monitored symbol; returns the row id.
+
+        ``timeframe`` selects the pair's analysis interval (None = strategy
+        default). Changing an existing pair's interval is remove + add.
+        """
         symbol = symbol.strip()
         if not symbol:
             raise ValueError("symbol must not be empty")
@@ -133,6 +160,7 @@ class WatchPairStore:
                 market=market,
                 enabled=True,
                 display_name=display_name or symbol,
+                timeframe=(timeframe or None),
             )
             session.add(row)
             session.flush()

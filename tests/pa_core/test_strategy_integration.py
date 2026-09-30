@@ -41,9 +41,9 @@ CONFIG = {
 }
 
 
-def _make_df(rows: int = 200) -> pd.DataFrame:
+def _make_df(rows: int = 200, freq: str = "1h") -> pd.DataFrame:
     start = pd.Timestamp("2026-01-01T00:00:00Z")
-    dates = pd.date_range(start=start, periods=rows, freq="1h")
+    dates = pd.date_range(start=start, periods=rows, freq=freq)
     rng = np.random.default_rng(7)
     close = 100 + np.cumsum(rng.standard_normal(rows))
     return pd.DataFrame(
@@ -86,8 +86,15 @@ def test_decision_helpers():
 class _FakeDP:
     runmode = RunMode.DRY_RUN
 
+    def __init__(self, whitelist=None, ohlcv_data=None):
+        self._whitelist = whitelist or ["BTC/USDT"]
+        self._ohlcv = ohlcv_data or {}
+
     def current_whitelist(self):
-        return ["BTC/USDT"]
+        return list(self._whitelist)
+
+    def ohlcv(self, pair, timeframe=None, candle_type=None, copy=True):
+        return self._ohlcv.get((pair, timeframe))
 
     def send_msg(self, message, *, always_send=False):
         pass
@@ -190,12 +197,12 @@ def test_order_plan_applies_entry_when_not_watch_only(tmp_path):
         )
 
     df = _make_df(200).copy()
-    strategy._apply_decision(df, "BTC/USDT", _record(decision), decision)
+    strategy._apply_decision(df, "BTC/USDT", _record(decision), decision, "1h")
     assert df.iloc[-1]["enter_long"] == 1
     # watch-only off + short decision
     df2 = _make_df(200).copy()
     short = {**decision, "order_direction": "做空"}
-    strategy._apply_decision(df2, "BTC/USDT", _record(short), short)
+    strategy._apply_decision(df2, "BTC/USDT", _record(short), short, "1h")
     assert df2.iloc[-1].get("enter_short", 0) == 1
 
 
@@ -212,3 +219,102 @@ def test_watch_config_json_is_valid_and_watch_safe():
     assert cfg["pairlists"][0]["method"] == "DatabasePairList"
     assert "refresh_period" in cfg["pairlists"][0]
     assert "pair_whitelist" not in cfg["exchange"]
+
+
+def _fake_ok_submit(frames: list):
+    """submit() double capturing KlineFrames, returning successful records."""
+
+    def fake_submit(frame, cancel_token, on_event, **kwargs):
+        from pa_core.records.schema import AnalysisRecord, RecordMeta
+
+        frames.append(frame)
+        return AnalysisRecord(
+            meta=RecordMeta(
+                timestamp_local_iso="2026-06-30T15:30:00",
+                timestamp_local_ms=1,
+                symbol=frame.symbol,
+                timeframe=frame.timeframe,
+                bar_count=len(frame.bars),
+                ai_provider={},
+            ),
+            kline_data=[{"ts_open": b.ts_open} for b in frame.bars],
+            htf_text="",
+            stage1_messages=[],
+            stage1_response=None,
+            stage1_diagnosis={"cycle_position": "normal_channel", "direction": "bullish"},
+            stage2_messages=[],
+            stage2_response=None,
+            stage2_decision={"decision": {"order_type": "不下单"}, "trade_confidence": 30},
+            strategy_files_used=[],
+            experience_loaded=[],
+            exception=None,
+            usage_total={},
+        )
+
+    return fake_submit
+
+
+def test_off_timeframe_pair_analyzes_on_own_candle_close(tmp_path, mocker):
+    db = f"sqlite:///{tmp_path}/tf.db"
+    WatchPairStore(db).add("SOL/USDT", timeframe="1d")
+
+    df_1h = _make_df(200, "1h")
+    df_1d = _make_df(120, "1d")
+    dp = _FakeDP(whitelist=["SOL/USDT"], ohlcv_data={("SOL/USDT", "1d"): df_1d})
+    strategy = PriceActionWatch(dict(CONFIG, pa_db_url=db))
+    strategy.dp = dp
+    strategy.bot_start()
+
+    # off-tf pairs are declared as informative; default pairs are not
+    assert strategy.informative_pairs() == [("SOL/USDT", "1d")]
+
+    frames: list = []
+    mocker.patch.object(strategy._orchestrator, "submit", side_effect=_fake_ok_submit(frames))
+
+    strategy.populate_entry_trend(df_1h.copy(), {"pair": "SOL/USDT"})
+    assert len(frames) == 1
+    assert frames[0].timeframe == "1d"
+    assert frames[0].symbol == "SOL/USDT"
+
+    # engine fired again on a new 1h candle, but the 1d bar hasn't closed
+    strategy.populate_entry_trend(df_1h.copy(), {"pair": "SOL/USDT"})
+    assert len(frames) == 1
+
+    # 1d candle closes -> analyze again at 1d
+    dp._ohlcv[("SOL/USDT", "1d")] = _make_df(121, "1d")
+    strategy.populate_entry_trend(df_1h.copy(), {"pair": "SOL/USDT"})
+    assert len(frames) == 2
+    assert frames[1].timeframe == "1d"
+
+
+def test_default_timeframe_pair_still_uses_engine_dataframe(tmp_path, mocker):
+    """Pairs without a timeframe override keep the main-timeframe path."""
+    db = f"sqlite:///{tmp_path}/default.db"
+    WatchPairStore(db).add("BTC/USDT")  # no timeframe -> strategy default
+
+    dp = _FakeDP(whitelist=["BTC/USDT"], ohlcv_data={("BTC/USDT", "1d"): _make_df(10, "1d")})
+    strategy = PriceActionWatch(dict(CONFIG, pa_db_url=db))
+    strategy.dp = dp
+    strategy.bot_start()
+    assert strategy.informative_pairs() == []
+
+    frames: list = []
+    mocker.patch.object(strategy._orchestrator, "submit", side_effect=_fake_ok_submit(frames))
+    strategy.populate_entry_trend(_make_df(200, "1h").copy(), {"pair": "BTC/USDT"})
+    assert len(frames) == 1
+    assert frames[0].timeframe == "1h"
+
+
+def test_no_off_tf_candles_skips_analysis(tmp_path, mocker):
+    db = f"sqlite:///{tmp_path}/nocandles.db"
+    WatchPairStore(db).add("SOL/USDT", timeframe="1d")
+
+    dp = _FakeDP(whitelist=["SOL/USDT"])  # ohlcv returns None (not refreshed yet)
+    strategy = PriceActionWatch(dict(CONFIG, pa_db_url=db))
+    strategy.dp = dp
+    strategy.bot_start()
+
+    frames: list = []
+    mocker.patch.object(strategy._orchestrator, "submit", side_effect=_fake_ok_submit(frames))
+    strategy.populate_entry_trend(_make_df(200, "1h").copy(), {"pair": "SOL/USDT"})
+    assert frames == []

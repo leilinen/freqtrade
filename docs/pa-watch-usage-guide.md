@@ -152,8 +152,8 @@ WHERE id = (SELECT record_id FROM signal ORDER BY created_at DESC LIMIT 1);
 
 | 命令 | 作用 |
 |---|---|
-| `/list`（别名 `/watch`） | 列出 `watch_pair` 全部行（含停用行、显示名与分析周期） |
-| `/add <SYMBOL> [显示名]` | 新增启用标的，如 `/add SOL/USDT Solana`；A股写 `/add ashare:600519` |
+| `/list`（别名 `/watch`） | 列出 `watch_pair` 全部行（含停用行、显示名与各标的周期） |
+| `/add <SYMBOL> [周期] [显示名]` | 新增启用标的，如 `/add SOL/USDT 4h Solana`；不写周期 = 主周期（1h）；A股写 `/add ashare:600519 1d` |
 | `/disable <SYMBOL>` | 停用标的（保留行，推荐） |
 | `/enable <SYMBOL>` | 重新启用 |
 | `/remove <SYMBOL>` | 硬删除（删光某 market 全部行会触发下次启动冷启动播种） |
@@ -161,6 +161,9 @@ WHERE id = (SELECT record_id FROM signal ORDER BY created_at DESC LIMIT 1);
 
 - 所有命令走 `authorized_only` 鉴权：仅 `TG_CHAT_ID` 对应会话可用。
 - 增删改在 `DatabasePairList` 的 `refresh_period`（默认 60 秒）内自动生效，无需重启或 `/reload_config`。
+- **每标的周期**：`/add` 的可选周期参数决定该标的的分析间隔（写入 `watch_pair.timeframe`，NULL = 主周期）。
+  仅支持 **≥ 主周期（1h）** 的周期（如 2h/4h/1d/1w）— freqtrade 的 informative 机制不支持低于主周期的数据。
+  修改已有标的周期 = `/remove` 后 `/add` 带新周期；周期变更后首轮为全量分析（无增量历史）。
 - `SYMBOL` 需与表内精确一致（如 `BTC/USDT`）；`/chart` 画图命令仍未实施（依赖 mplfinance，后续阶段）。
 - 部署外等价操作仍是 `tools/watch_pairs.py`（或直接 SQL），详见 runbook §2.1。
 
