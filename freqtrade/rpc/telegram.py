@@ -21,6 +21,7 @@ from typing import Any, Literal
 
 from tabulate import tabulate
 from telegram import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -205,6 +206,31 @@ def _format_signals(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _bot_command_menu() -> list[BotCommand]:
+    """Curated '/' command menu: PA watch commands plus the native commands
+    that matter in watch mode. set_my_commands replaces the whole list, so
+    stale BotFather-era entries (e.g. pa_*) disappear on startup."""
+    return [
+        BotCommand("list", "查看监控标的（含周期）"),
+        BotCommand("add", "添加标的，如 /add SOL/USDT 4h Solana"),
+        BotCommand("remove", "删除标的"),
+        BotCommand("disable", "停用标的（保留行）"),
+        BotCommand("enable", "启用标的"),
+        BotCommand("signal", "最近下单计划信号"),
+        BotCommand("whitelist", "当前白名单"),
+        BotCommand("status", "持仓（watch 模式为空）"),
+        BotCommand("health", "运行健康状态"),
+        BotCommand("show_config", "当前配置"),
+        BotCommand("logs", "最近日志"),
+        BotCommand("pause", "暂停分析"),
+        BotCommand("start", "恢复分析"),
+        BotCommand("stop", "停止"),
+        BotCommand("reload_config", "重载配置"),
+        BotCommand("version", "版本"),
+        BotCommand("help", "帮助"),
+    ]
+
+
 class Telegram(RPCHandler):
     """This class handles all telegram communication"""
 
@@ -314,7 +340,21 @@ class Telegram(RPCHandler):
                 logger.info(f"using custom keyboard from config.json: {self._keyboard}")
 
     def _init_telegram_app(self):
-        return Application.builder().token(self._config["telegram"]["token"]).build()
+        return (
+            Application.builder()
+            .token(self._config["telegram"]["token"])
+            .post_init(self._post_init)
+            .build()
+        )
+
+    @staticmethod
+    async def _post_init(application: Application) -> None:
+        """Register the '/' command menu (replaces stale BotFather entries)."""
+        try:
+            await application.bot.set_my_commands(_bot_command_menu())
+            logger.info("Registered telegram command menu (%d commands)", len(_bot_command_menu()))
+        except TelegramError as exc:
+            logger.warning("Failed to register telegram command menu: %s", exc)
 
     def _init(self) -> None:
         """

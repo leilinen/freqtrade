@@ -13,6 +13,7 @@ import pytest
 
 from freqtrade.rpc.telegram import (
     Telegram,
+    _bot_command_menu,
     _format_signals,
     _format_watch_pairs,
     _split_market_arg,
@@ -214,3 +215,13 @@ def test_watch_store_unavailable_reply(mocker, default_conf):
     instance._send_msg = _capture
     _run(instance._watch_list(_update(), _ctx([])))
     assert any("不可用" in m for m in sent)
+
+
+def test_bot_command_menu():
+    """'/' menu: PA watch commands present, no stale pa_* entries, curated."""
+    menu = _bot_command_menu()
+    names = [c.command for c in menu]
+    assert {"list", "add", "remove", "enable", "disable", "signal"} <= set(names)
+    assert not any(n.startswith("pa_") for n in names)
+    assert all(c.description for c in menu)
+    assert len(menu) <= 20
