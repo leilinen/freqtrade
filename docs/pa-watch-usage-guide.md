@@ -152,7 +152,7 @@ WHERE id = (SELECT record_id FROM signal ORDER BY created_at DESC LIMIT 1);
 
 | 命令 | 作用 |
 |---|---|
-| `/list`（别名 `/watch`） | 列出 `watch_pair` 全部行（含停用行与显示名） |
+| `/list`（别名 `/watch`） | 列出 `watch_pair` 全部行（含停用行、显示名与分析周期） |
 | `/add <SYMBOL> [显示名]` | 新增启用标的，如 `/add SOL/USDT Solana`；A股写 `/add ashare:600519` |
 | `/disable <SYMBOL>` | 停用标的（保留行，推荐） |
 | `/enable <SYMBOL>` | 重新启用 |

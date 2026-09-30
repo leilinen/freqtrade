@@ -151,11 +151,11 @@ def _fmt_num(value: Any) -> str:
     return f"{value:g}" if value is not None else "—"
 
 
-def _format_watch_pairs(rows: list[dict]) -> str:
+def _format_watch_pairs(rows: list[dict], timeframe: str = "—") -> str:
     """Reply text for /list — one line per watch pair row."""
     if not rows:
         return "📋 watch pair 表为空 — 下次启动将重新播种默认 BTC/ETH"
-    lines = [f"📋 Watch pairs · {len(rows)} 行 · 变更 ≤60s 内生效"]
+    lines = [f"📋 Watch pairs · {len(rows)} 行 · 周期 {timeframe} · 变更 ≤60s 内生效"]
     for i, row in enumerate(rows, 1):
         flag = "✅" if row["enabled"] else "⏸"
         name = row.get("display_name") or row["symbol"]
@@ -1963,7 +1963,9 @@ class Telegram(RPCHandler):
         if store is None:
             await self._send_msg("⚠️ watch 存储不可用（缺少 pa_core 或 pa db url）")
             return
-        await self._send_msg(_format_watch_pairs(store.list_pairs()))
+        await self._send_msg(
+            _format_watch_pairs(store.list_pairs(), self._config.get("timeframe") or "—")
+        )
 
     @authorized_only
     async def _watch_add(self, update: Update, context: CallbackContext) -> None:

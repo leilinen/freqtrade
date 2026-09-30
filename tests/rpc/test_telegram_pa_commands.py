@@ -70,8 +70,8 @@ def test_format_watch_pairs():
         {"symbol": "BTC/USDT", "enabled": True, "display_name": "Bitcoin", "market": "crypto"},
         {"symbol": "SOL/USDT", "enabled": False, "display_name": "SOL/USDT", "market": "crypto"},
     ]
-    text = _format_watch_pairs(rows)
-    assert "2 行" in text
+    text = _format_watch_pairs(rows, "1h")
+    assert "2 行" in text and "周期 1h" in text
     assert "✅ BTC/USDT · Bitcoin" in text
     sol_line = next(line for line in text.splitlines() if "SOL/USDT" in line)
     assert "⏸ SOL/USDT" in sol_line and "· SOL/USDT" not in sol_line
@@ -106,6 +106,7 @@ def test_watch_add_list_flow(tg):
     _run(tg._watch_list(_update(), _ctx([])))
     listing = next(m for m in tg._sent if "Watch pairs" in m)
     assert "✅ SOL/USDT · Solana" in listing
+    assert "周期" in listing
 
 
 def test_watch_add_duplicate_reports_error(tg):
