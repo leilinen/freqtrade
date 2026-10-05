@@ -132,7 +132,9 @@ def _signal_text(pair: str, timeframe: str, record: AnalysisRecord) -> str:
         f"预估胜率: {decision.get('estimated_win_rate', '—')}%",
         f"原因: {decision.get('reasoning') or '—'}",
     ]
-    return "\n".join(lines)
+    # Telegram parses RPC messages as markdown: escape underscores so pair
+    # names like BTC/USDT:USDT don't render as italics.
+    return "\n".join(lines).replace("_", "\\_")
 
 
 class PriceActionWatch(IStrategy):
@@ -454,7 +456,12 @@ class PriceActionWatch(IStrategy):
             exception={"category": "strategy_exception", "error": str(exc)[:500]},
             usage_total={},
         )
-        self._store.save_partial(record, "strategy_exception")
+        try:
+            self._store.save_partial(record, "strategy_exception")
+        except Exception:  # noqa: BLE001
+            # The store is likely the reason submit() crashed (e.g. PG just
+            # died); don't let the audit write kill the analysis loop too.
+            logger.warning("%s: crash-partial persist failed too", pair, exc_info=True)
 
     def _apply_decision(
         self,
