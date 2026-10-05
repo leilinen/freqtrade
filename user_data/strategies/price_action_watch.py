@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pandas import DataFrame
 
@@ -106,6 +106,14 @@ def _direction_sign(decision: dict) -> int:
     return 0
 
 
+def _utc8_time_str(ts_ms: int | None) -> str:
+    """Analysis timestamp rendered as UTC+8, independent of the host timezone."""
+    if not ts_ms:
+        return "—"
+    tz8 = timezone(timedelta(hours=8))
+    return datetime.fromtimestamp(ts_ms / 1000, tz=tz8).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _signal_text(pair: str, timeframe: str, record: AnalysisRecord) -> str:
     """Telegram text for an order-plan decision (dp.send_msg, always_send=True)."""
     decision = (record.stage2_decision or {}).get("decision") or {}
@@ -113,6 +121,7 @@ def _signal_text(pair: str, timeframe: str, record: AnalysisRecord) -> str:
     s2 = record.stage2_decision or {}
     lines = [
         f"📊 {pair} {timeframe} PA信号",
+        f"时间: {_utc8_time_str(record.meta.timestamp_local_ms)} (UTC+8)",
         f"周期: {s1.get('cycle_position', '—')} | 方向: {s1.get('direction', '—')}",
         f"决策: {decision.get('order_direction', '—')} "
         f"{decision.get('order_type', '—')} @ {decision.get('entry_price', '—')}",
@@ -121,6 +130,7 @@ def _signal_text(pair: str, timeframe: str, record: AnalysisRecord) -> str:
         f"TP2: {decision.get('take_profit_price_2', '—')}",
         f"置信度: {s2.get('trade_confidence', '—')} | "
         f"预估胜率: {decision.get('estimated_win_rate', '—')}%",
+        f"原因: {decision.get('reasoning') or '—'}",
     ]
     return "\n".join(lines)
 
